@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config CXLFORK
+	tristate "CXLfork checkpoint/restore prototype"
+	depends on MMU && X86_64
+	help
+	  Build the CXLfork prototype device. It checkpoints process state
+	  into a shared CXL memory window and restores it from remote VMs.
