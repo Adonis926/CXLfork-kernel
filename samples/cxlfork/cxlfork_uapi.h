@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 
+/*
+ * CXLfork 用户态 ABI 的 standalone 拷贝：
+ * - 供 benchmark 在普通用户态环境直接编译，不依赖内核 UAPI include 路径。
+ * - 字段布局需要和 include/uapi/linux/cxlfork.h 保持一致。
+ */
 #define CXLFORK_DEVICE "/dev/cxlfork"
 #define CXLFORK_MAX_REGIONS 64
 #define CXLFORK_MAX_FDS 32
@@ -12,11 +17,19 @@
 #define CXLFORK_MAX_RLIMITS 16
 #define CXLFORK_SIGSET_WORDS 2
 
+/* namespace/global state 的采集方式标记，用于说明哪些命名空间是序列化还是继承。 */
 #define CXLFORK_NS_F_MOUNT_SERIALIZED 0x1U
 #define CXLFORK_NS_F_PID_SERIALIZED 0x2U
 #define CXLFORK_NS_F_NET_INHERITED 0x4U
 #define CXLFORK_NS_F_CGROUP_INHERITED 0x8U
 
+/*
+ * restore/tiering flags：
+ * - MAP_READONLY：只读映射 CXL 页面。
+ * - PRIVATE_COW/MOA：访问时迁移到本地私有页。
+ * - SHARED_COW/MOW：写时迁移，读路径保留共享 CXL 映射。
+ * - APPLY_* / REOPEN_FDS：控制是否应用 mm/thread/global/fd 状态。
+ */
 #define CXLFORK_F_MAP_READONLY 0x1ULL
 #define CXLFORK_F_PRIVATE_COW 0x2ULL
 #define CXLFORK_F_SHARED_COW 0x4ULL
@@ -33,6 +46,7 @@
 #define CXLFORK_COMM_LEN 16
 
 struct cxlfork_region {
+	/* 对外暴露的 VMA/region 摘要，便于 benchmark 记录页分类。 */
 	uint64_t start;
 	uint64_t length;
 	uint64_t prot;
@@ -44,6 +58,7 @@ struct cxlfork_region {
 };
 
 struct cxlfork_mm_state {
+	/* mm_struct 中和进程地址空间相关的可观测元数据。 */
 	uint64_t start_code;
 	uint64_t end_code;
 	uint64_t start_data;
@@ -63,6 +78,7 @@ struct cxlfork_mm_state {
 
 
 struct cxlfork_task_state {
+	/* task/cred/capability 摘要，用来模拟跨 OS 任务状态迁移成本。 */
 	uint32_t pid;
 	uint32_t tgid;
 	uint32_t ppid;
@@ -92,6 +108,7 @@ struct cxlfork_task_state {
 };
 
 struct cxlfork_fd_state {
+	/* 文件描述符快照；当前原型记录 path/pos/flag 并在 restore 时尝试重开。 */
 	uint32_t fd;
 	uint32_t flags;
 	uint64_t pos;
@@ -101,6 +118,7 @@ struct cxlfork_fd_state {
 };
 
 struct cxlfork_thread_state {
+	/* x86-64 线程寄存器/TLS 摘要，当前主要用于记录与可选 apply。 */
 	uint64_t ip;
 	uint64_t sp;
 	uint64_t flags;
@@ -116,11 +134,13 @@ struct cxlfork_thread_state {
 };
 
 struct cxlfork_rlimit_state {
+	/* rlimit 快照，属于 global state 的一部分。 */
 	uint64_t rlim_cur;
 	uint64_t rlim_max;
 };
 
 struct cxlfork_namespace_state {
+	/* namespace 身份和序列化/继承标记。 */
 	uint64_t mnt_ns;
 	uint64_t pid_ns;
 	uint64_t net_ns;
@@ -130,6 +150,7 @@ struct cxlfork_namespace_state {
 };
 
 struct cxlfork_global_state {
+	/* cwd/root/umask/signal/rlimit/namespace 等进程全局状态。 */
 	uint32_t umask;
 	uint32_t nr_rlimits;
 	uint64_t sas_ss_sp;
@@ -144,6 +165,10 @@ struct cxlfork_global_state {
 };
 
 struct cxlfork_checkpoint {
+	/*
+	 * prepare 输入/输出：
+	 * 输入 key、scan_start/scan_end 和 flags；输出各类元数据构建耗时与页统计。
+	 */
 	uint64_t key;
 	uint64_t scan_start;
 	uint64_t scan_end;
@@ -180,6 +205,10 @@ struct cxlfork_checkpoint {
 };
 
 struct cxlfork_restore {
+	/*
+	 * resume 输入/输出：
+	 * 输入 key、flags 和 tiering_hot_stride_pages；输出 restore/attach/validate breakdown。
+	 */
 	uint64_t key;
 	uint64_t flags;
 	uint64_t nr_regions;
@@ -227,6 +256,7 @@ struct cxlfork_restore {
 };
 
 struct cxlfork_stats {
+	/* 查询某个 key 对应 slot 的当前状态，faults 是 fault handler 累计计数。 */
 	uint64_t key;
 	uint64_t ready;
 	uint64_t slot;
@@ -240,10 +270,12 @@ struct cxlfork_stats {
 };
 
 struct cxlfork_release {
+	/* 释放某个 key 对应 slot，下一轮 prepare 前通常先调用。 */
 	uint64_t key;
 };
 
 #define CXLFORK_IOC_MAGIC 'C'
+/* CHECKPOINT/RESTORE 是通用接口；FORK_PREPARE/FORK_RESUME 是论文复现主路径使用的别名。 */
 #define CXLFORK_CHECKPOINT _IOWR(CXLFORK_IOC_MAGIC, 1, struct cxlfork_checkpoint)
 #define CXLFORK_RESTORE _IOWR(CXLFORK_IOC_MAGIC, 2, struct cxlfork_restore)
 #define CXLFORK_STATS _IOWR(CXLFORK_IOC_MAGIC, 3, struct cxlfork_stats)

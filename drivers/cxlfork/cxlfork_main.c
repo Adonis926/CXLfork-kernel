@@ -38,8 +38,15 @@
 
 #include "cxlfork.h"
 
+/*
+ * CXLfork 内核原型：
+ * - 通过启动参数 cxlfork.cxl_phys/cxlfork.cxl_size 映射共享 CXL/NVDIMM 物理窗口。
+ * - VM0 执行 prepare，把进程页面和 OS metadata 写入 CXL slot。
+ * - VM1 执行 resume，从相同 slot 恢复 VMA/PTE/状态并运行 workload。
+ */
 #define CXLFORK_REGION_PGOFF_STEP (CXLFORK_SLOT_BYTES >> PAGE_SHIFT)
 
+/* 共享 CXL window 的物理参数，必须和 QEMU kernel cmdline 中的参数一致。 */
 static phys_addr_t cxl_phys = 0x484000000ULL;
 module_param(cxl_phys, ullong, 0444);
 MODULE_PARM_DESC(cxl_phys, "base physical address of shared CXL memory");
@@ -55,6 +62,7 @@ static void __iomem *cxlfork_cxl;
 static DEFINE_MUTEX(cxlfork_lock);
 
 struct cxlfork_file_state {
+	/* 每个打开的 /dev/cxlfork fd 保存一次 mmap/restore 的临时上下文。 */
 	u64 mmap_key;
 	u64 mmap_flags;
 	u64 tiering_hot_stride_pages;
@@ -63,6 +71,7 @@ struct cxlfork_file_state {
 };
 
 struct cxlfork_mapping {
+	/* 绑定到用户 VMA 的状态，fault handler 用它定位 key、region 和 tiering policy。 */
 	u64 key;
 	u64 region_idx;
 	u64 flags;
@@ -72,6 +81,7 @@ struct cxlfork_mapping {
 
 static void *cxl_ptr(u64 off)
 {
+	/* CXL 内部对象统一保存 offset，访问时再转换为内核虚拟地址。 */
 	if (off >= cxl_size)
 		return NULL;
 	return (void __force *)((char __iomem *)cxlfork_cxl + off);
@@ -96,6 +106,7 @@ static struct cxlfork_desc *slot_desc(u64 slot)
 
 static int key_to_slot(u64 key)
 {
+	/* 当前原型用 key 取模选择 slot，实验脚本需避免活跃 key 复用。 */
 	u64 slot = key % CXLFORK_MAX_SLOTS;
 	u64 off = slot_offset(slot);
 
@@ -106,6 +117,7 @@ static int key_to_slot(u64 key)
 
 static pgprot_t prot_from_uapi(u64 prot, bool readonly)
 {
+	/* 把 checkpoint 记录的 PROT_* 转换成 restore/mmap 使用的 pgprot。 */
 	pgprot_t pgprot = PAGE_READONLY;
 
 	if (prot & PROT_EXEC)
@@ -137,6 +149,7 @@ static u64 cxlfork_cap_to_u64(kernel_cap_t cap)
 static void cxlfork_capture_task_state(struct cxlfork_task_state *st,
 				       bool full_private_state)
 {
+	/* 采集 task_struct/cred/capability 摘要，模拟跨 OS task metadata 迁移。 */
 	const struct cred *cred;
 
 	memset(st, 0, sizeof(*st));
@@ -173,6 +186,7 @@ static void cxlfork_capture_task_state(struct cxlfork_task_state *st,
 
 static u64 cxlfork_make_cxl_pteval(u64 orig_pteval, u64 cxl_offset)
 {
+	/* 根据原始 PTE 权限构造指向 CXL 页面副本的新 PTE。 */
 	unsigned long pfn = (cxl_phys + cxl_offset) >> PAGE_SHIFT;
 	pte_t orig = __pte(orig_pteval);
 	pte_t cxl = pfn_pte(pfn, __pgprot(pte_flags(orig)));
@@ -188,6 +202,7 @@ static u64 cxlfork_make_cxl_pteval(u64 orig_pteval, u64 cxl_offset)
 static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
 				    u64 *pteval)
 {
+	/* checkpoint 阶段读取源进程叶子 PTE，用于构建 leaf PTE image。 */
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
@@ -225,6 +240,7 @@ static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
 
 static u64 cxlfork_pt_table_entry(u64 child_offset)
 {
+	/* 页表树内部节点条目：指向 CXL 中的下一级页表页镜像。 */
 	unsigned long pfn = (cxl_phys + child_offset) >> PAGE_SHIFT;
 
 	return pte_val(pfn_pte(pfn, __pgprot(_PAGE_TABLE)));
@@ -233,6 +249,7 @@ static u64 cxlfork_pt_table_entry(u64 child_offset)
 static int cxlfork_pt_tree_alloc_page(struct cxlfork_desc *desc, u64 *data_off,
 				      u64 *page_off, bool metadata)
 {
+	/* 从当前 slot 的线性 data_off 分配一页，作为页表树或元数据对象。 */
 	u64 end = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES;
 	void *page;
 
@@ -276,6 +293,7 @@ static int cxlfork_pt_tree_child(struct cxlfork_desc *desc, u64 *data_off,
 static int cxlfork_pt_tree_insert_leaf(struct cxlfork_desc *desc, u64 *data_off,
 				       unsigned long addr, u64 leaf_pte_page_offset)
 {
+	/* 按 VA 页表索引在 CXL 上构建最小页表树，叶子指向 PTE page image。 */
 	u64 *pgd = cxl_ptr(desc->pt_tree_root_offset);
 	u64 *p4d, *pud, *pmd;
 	u64 pgd_idx = pgd_index(addr);
@@ -306,6 +324,7 @@ static int cxlfork_pt_tree_insert_leaf(struct cxlfork_desc *desc, u64 *data_off,
 static int cxlfork_pt_tree_walk(const struct cxlfork_desc *desc,
 				unsigned long addr, u64 **pte_page)
 {
+	/* restore/fault 路径按 VA 在 CXL 页表树里查找对应的 PTE page image。 */
 	u64 *pgd = cxl_ptr(desc->pt_tree_root_offset);
 	u64 *p4d, *pud, *pmd;
 	u64 raw;
@@ -347,6 +366,7 @@ static int cxlfork_pt_tree_walk(const struct cxlfork_desc *desc,
 static void cxlfork_capture_mm_state(struct cxlfork_mm_state *st,
 				     struct mm_struct *mm)
 {
+	/* 采集 mm_struct 中的地址空间边界和 auxv，restore 可选择写回。 */
 	memset(st, 0, sizeof(*st));
 	st->start_code = mm->start_code;
 	st->end_code = mm->end_code;
@@ -368,6 +388,7 @@ static void cxlfork_capture_mm_state(struct cxlfork_mm_state *st,
 
 static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 {
+	/* 遍历当前进程打开的 fd，记录 path/pos/flag；这是跨 OS 重开 fd 的模拟成本来源。 */
 	struct file *files[CXLFORK_MAX_FDS];
 	unsigned int fds[CXLFORK_MAX_FDS];
 	struct files_struct *files_struct = current->files;
@@ -425,6 +446,7 @@ static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 
 static void cxlfork_path_to_state(const struct path *path, u8 *dst, size_t len)
 {
+	/* 把 kernel path 解析成稳定字符串，写入 CXL state image。 */
 	char *path_buf;
 	char *resolved;
 
@@ -442,6 +464,7 @@ static void cxlfork_path_to_state(const struct path *path, u8 *dst, size_t len)
 
 static void cxlfork_capture_namespace_state(struct cxlfork_namespace_state *st)
 {
+	/* namespace 这里只记录身份和策略；net/cgroup 在当前原型中视为继承。 */
 	struct nsproxy *nsproxy = current->nsproxy;
 	struct pid_namespace *pid_ns;
 
@@ -471,6 +494,7 @@ static void cxlfork_capture_namespace_state(struct cxlfork_namespace_state *st)
 
 static void cxlfork_capture_global_state(struct cxlfork_desc *desc)
 {
+	/* 采集 cwd/root/umask/rlimit/signal/namespace 等进程全局状态。 */
 	struct cxlfork_global_state *st = &desc->global_state;
 	struct path path;
 	unsigned int i;
@@ -512,6 +536,7 @@ static void cxlfork_capture_global_state(struct cxlfork_desc *desc)
 
 static void cxlfork_capture_thread_state(struct cxlfork_thread_state *st)
 {
+	/* 采集 x86-64 寄存器和 FS/GS base，主要用于记录和可选 TLS 恢复。 */
 	struct pt_regs *regs = task_pt_regs(current);
 
 	memset(st, 0, sizeof(*st));
@@ -533,6 +558,7 @@ static void cxlfork_capture_thread_state(struct cxlfork_thread_state *st)
 
 static void cxlfork_apply_thread_state(const struct cxlfork_desc *desc)
 {
+	/* 可选恢复用户寄存器；benchmark 默认更关注 mmap/PTE 路径。 */
 	struct pt_regs *regs = task_pt_regs(current);
 	const struct cxlfork_thread_state *st = &desc->thread_state;
 
@@ -552,6 +578,7 @@ static void cxlfork_apply_thread_state(const struct cxlfork_desc *desc)
 
 static void cxlfork_apply_tls_state(const struct cxlfork_desc *desc)
 {
+	/* 可选恢复 TLS 的 FS base，模拟线程私有状态迁移。 */
 	const struct cxlfork_thread_state *st = &desc->thread_state;
 
 	if (!st->fsbase)
@@ -564,6 +591,7 @@ static void cxlfork_apply_tls_state(const struct cxlfork_desc *desc)
 static void cxlfork_copy_mm_state_to_checkpoint(struct cxlfork_checkpoint *op,
 						const struct cxlfork_desc *desc)
 {
+	/* 把 desc 内部统计回填给用户态 prepare 结构，脚本据此写 CSV。 */
 	op->task_state = desc->task_state;
 	op->mm_state = desc->mm_state;
 	op->thread_state = desc->thread_state;
@@ -590,6 +618,7 @@ static void cxlfork_copy_mm_state_to_checkpoint(struct cxlfork_checkpoint *op,
 static void cxlfork_copy_mm_state_to_restore(struct cxlfork_restore *op,
 					     const struct cxlfork_desc *desc)
 {
+	/* 把 desc 内部统计回填给用户态 restore 结构，脚本据此写 CSV。 */
 	op->task_state = desc->task_state;
 	op->mm_state = desc->mm_state;
 	op->thread_state = desc->thread_state;
@@ -615,6 +644,7 @@ static void cxlfork_copy_mm_state_to_restore(struct cxlfork_restore *op,
 
 static void cxlfork_apply_mm_state(const struct cxlfork_desc *desc)
 {
+	/* 根据 flags 可选写回 mm_struct 的可观测字段。 */
 	struct mm_struct *mm = current->mm;
 	const struct cxlfork_mm_state *st = &desc->mm_state;
 
@@ -645,6 +675,7 @@ static void cxlfork_apply_mm_state(const struct cxlfork_desc *desc)
 
 static void cxlfork_apply_global_fs_state(const struct cxlfork_global_state *st)
 {
+	/* 尝试把 cwd/root/umask 应用到当前进程，失败时保持当前环境。 */
 	struct path path;
 
 	if (!current->fs)
@@ -686,6 +717,7 @@ static void cxlfork_apply_global_fs_state(const struct cxlfork_global_state *st)
 
 static void cxlfork_apply_global_state(const struct cxlfork_desc *desc)
 {
+	/* 应用 rlimit/signal/fs 等全局状态，作为 FULL_PRIVATE_STATE 的一部分。 */
 	const struct cxlfork_global_state *st = &desc->global_state;
 	unsigned int i;
 
@@ -714,6 +746,7 @@ static void cxlfork_apply_global_state(const struct cxlfork_desc *desc)
 
 static u64 cxlfork_reopen_fd_state(const struct cxlfork_desc *desc)
 {
+	/* 按记录的 path/flags 重新打开 fd；无法打开的 fd 会被跳过并体现在计数中。 */
 	u64 restored = 0;
 	u64 i;
 
@@ -747,6 +780,7 @@ static u64 cxlfork_reopen_fd_state(const struct cxlfork_desc *desc)
 static bool checkpoint_vma_allowed(struct vm_area_struct *vma,
 				   const struct cxlfork_checkpoint *op)
 {
+	/* 只 checkpoint 普通可读 VMA；IO/hugepage/dontdump 等区域不进入最小闭环。 */
 	if (!(vma->vm_flags & VM_READ))
 		return false;
 	if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_HUGETLB | VM_DONTDUMP))
@@ -765,6 +799,7 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 				    struct cxlfork_region_desc *r,
 				    struct cxlfork_desc *desc)
 {
+	/* 把源进程一页复制到 CXL slot，同时统计 anon/clean file/dirty file 页类型。 */
 	struct page *page = NULL;
 	void *src;
 	void *dst;
@@ -802,6 +837,7 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 
 static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 *data_off)
 {
+	/* 将 desc->ptes 扁平化到 CXL，供 restore 端验证和 fault 查找。 */
 	struct cxlfork_leaf_pte_image *image;
 	u64 image_bytes;
 	u64 i;
@@ -844,6 +880,7 @@ static void cxlfork_vma_tree_link(struct cxlfork_vma_node_image *nodes,
 					  u64 nodes_offset, long lo, long hi,
 					  long parent, u64 *root_offset)
 {
+	/* 把按地址排序的 VMA 数组连成平衡二叉树，方便 restore 端按 VA 校验/查找。 */
 	long mid;
 	struct cxlfork_vma_node_image *node;
 
@@ -869,6 +906,7 @@ static void cxlfork_vma_tree_link(struct cxlfork_vma_node_image *nodes,
 
 static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 *data_off)
 {
+	/* 在 CXL 中生成 VMA tree image，是论文中 OS metadata 序列化的一部分。 */
 	struct cxlfork_vma_tree_image *tree;
 	struct cxlfork_vma_node_image *nodes;
 	u64 tree_offset;
@@ -931,6 +969,7 @@ static int cxlfork_validate_vma_tree_node(const struct cxlfork_desc *desc,
 					  u64 max_start, u64 parent_offset,
 					  u64 *visited)
 {
+	/* restore 端递归校验 VMA tree 与 region table 是否一致。 */
 	const struct cxlfork_vma_node_image *node;
 	const struct cxlfork_region_desc *r;
 
@@ -965,6 +1004,7 @@ static int cxlfork_validate_vma_tree_node(const struct cxlfork_desc *desc,
 static int cxlfork_validate_vma_tree_image(const struct cxlfork_desc *desc,
 					   u64 *validate_ns)
 {
+	/* 统计 VMA tree 校验时间，对应 CSV 的 vma_tree_validate_ns。 */
 	const struct cxlfork_vma_tree_image *tree;
 	u64 start_ns = ktime_get_ns();
 	u64 visited = 0;
@@ -996,6 +1036,7 @@ static int cxlfork_validate_vma_tree_image(const struct cxlfork_desc *desc,
 
 static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 *data_off)
 {
+	/* 构建完整 state image：task/mm/thread/global/fd/region 的 CXL 常驻副本。 */
 	struct cxlfork_state_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 image_off = *data_off;
@@ -1049,6 +1090,7 @@ static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 *data_off)
 
 static void cxlfork_patch_state_image_rebase_offset(struct cxlfork_desc *desc)
 {
+	/* rebase image 在 state image 之后生成，这里回填其 offset。 */
 	struct cxlfork_state_image *image;
 
 	if (!desc->state_image_offset || !desc->private_rebase_offset)
@@ -1062,6 +1104,7 @@ static void cxlfork_patch_state_image_rebase_offset(struct cxlfork_desc *desc)
 static int cxlfork_validate_state_image(const struct cxlfork_desc *desc,
 					u64 *validate_ns)
 {
+	/* restore 端校验 state image 的 magic、offset 和 region 内容。 */
 	const struct cxlfork_state_image *image;
 	u64 start_ns = ktime_get_ns();
 	u64 state_bytes = desc->state_image_pages * PAGE_SIZE;
@@ -1139,6 +1182,7 @@ static void cxlfork_private_ptr_set(struct cxlfork_private_rebase_image *image,
                                     u64 *idx, u64 id, u64 cxl_offset,
                                     u64 bytes, u64 entries)
 {
+	/* 记录一个 CXL 内部对象的 offset/phys/长度，模拟远端重定位表。 */
 	struct cxlfork_private_ptr *ptr;
 
 	if (*idx >= CXLFORK_MAX_PRIVATE_PTRS || !bytes)
@@ -1153,6 +1197,7 @@ static void cxlfork_private_ptr_set(struct cxlfork_private_rebase_image *image,
 
 static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 {
+	/* 把 leaf PTE 合并成按 PMD 覆盖的页表页镜像，供 restore/fault 快速 attach。 */
 	struct cxlfork_pt_page_image *meta;
 	struct cxlfork_pt_tree_image *tree;
 	u64 meta_bytes;
@@ -1252,6 +1297,7 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 static int cxlfork_validate_pt_page_image(const struct cxlfork_desc *desc,
 						  u64 *validate_ns)
 {
+	/* 校验 PTE page image 和 CXL 页表树，对应 CSV 的 pt_page_image_validate_ns。 */
 	const struct cxlfork_pt_page_image *meta;
 	const struct cxlfork_pt_tree_image *tree;
 	u64 start_ns = ktime_get_ns();
@@ -1314,6 +1360,7 @@ static int cxlfork_validate_pt_page_image(const struct cxlfork_desc *desc,
 static int cxlfork_build_private_rebase_image(struct cxlfork_desc *desc,
                                               u64 *data_off)
 {
+	/* 构建 private rebase image，用于量化跨 OS 恢复时需要重定位的内部对象集合。 */
 	struct cxlfork_private_rebase_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 idx = 0;
@@ -1377,6 +1424,7 @@ static int cxlfork_build_private_rebase_image(struct cxlfork_desc *desc,
 static int cxlfork_validate_private_rebase_image(const struct cxlfork_desc *desc,
                                                  u64 *validate_ns)
 {
+	/* 校验 rebase 表中每个对象仍落在合法 CXL window 内。 */
 	const struct cxlfork_private_rebase_image *image;
 	u64 start_ns = ktime_get_ns();
 	u64 i;
@@ -1407,6 +1455,7 @@ static int cxlfork_validate_private_rebase_image(const struct cxlfork_desc *desc
 
 static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 {
+	/* prepare 主路径：扫描 VMA -> 复制页面 -> 构建 PTE/VMA/state/rebase 镜像 -> ready。 */
 	struct cxlfork_checkpoint *op;
 	struct cxlfork_desc *desc;
 	struct mm_struct *mm;
@@ -1613,6 +1662,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			      struct cxlfork_region_desc *r,
 			      bool readonly)
 {
+	/* 非 COW 路径：直接把 CXL 物理页 remap 到目标进程地址。 */
 	unsigned long addr = r->start;
 	unsigned long mapped;
 	u64 i;
@@ -1665,6 +1715,7 @@ static int cxlfork_map_region_cow(struct file *file,
 				  const struct cxlfork_region_desc *r,
 				  u64 region_idx)
 {
+	/* COW/tiering 路径：先 mmap /dev/cxlfork，后续 fault 决定共享还是复制。 */
 	unsigned long mapped;
 
 	mapped = vm_mmap(file, r->start, r->length,
@@ -1703,6 +1754,7 @@ static int cxlfork_find_pt_page_pfn(const struct cxlfork_desc *desc,
 					    unsigned long addr,
 					    unsigned long *pfn_out)
 {
+	/* 通过 CXL 页表树找到某个 VA 对应的 CXL PFN。 */
 	u64 *ptes;
 	u64 raw;
 	int ret;
@@ -1722,6 +1774,7 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 				       const struct cxlfork_region_desc *r,
 				       u64 *validate_ns)
 {
+	/* MoW 读共享路径：先校验 PTE image，再批量安装只读 CXL PFN 映射。 */
 	const struct cxlfork_leaf_pte_image *image;
 	u64 validate_start = ktime_get_ns();
 	u64 install_start;
@@ -1802,6 +1855,7 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 
 static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 {
+	/* COW/tiering fault 主路径：MoW 读共享、MoA 首次访问复制、hybrid 按热页/写入复制。 */
 	struct cxlfork_mapping *mapping = vmf->vma->vm_private_data;
 	struct cxlfork_desc *desc;
 	struct cxlfork_region_desc *r;
@@ -1893,6 +1947,7 @@ copy_local:
 
 static void cxlfork_vma_open(struct vm_area_struct *vma)
 {
+	/* VMA 被复制/拆分时维护 mapping 引用计数。 */
 	struct cxlfork_mapping *mapping = vma->vm_private_data;
 
 	if (mapping)
@@ -1901,6 +1956,7 @@ static void cxlfork_vma_open(struct vm_area_struct *vma)
 
 static void cxlfork_vma_close(struct vm_area_struct *vma)
 {
+	/* 最后一个 VMA 关闭时释放 mapping 上下文。 */
 	struct cxlfork_mapping *mapping = vma->vm_private_data;
 
 	if (!mapping)
@@ -1918,6 +1974,7 @@ static const struct vm_operations_struct cxlfork_vm_ops = {
 
 static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	/* restore 时由 vm_mmap(file, ...) 进入；vm_pgoff 编码 region_idx。 */
 	struct cxlfork_file_state *state = file->private_data;
 	struct cxlfork_desc *desc;
 	struct cxlfork_region_desc *r;
@@ -1983,6 +2040,7 @@ out_unlock:
 static int cxlfork_ioctl_restore(struct file *file,
 				 struct cxlfork_restore __user *uarg)
 {
+	/* resume 主路径：校验 CXL 镜像 -> mmap regions -> 可选应用 OS metadata -> 回填 breakdown。 */
 	struct cxlfork_restore *op;
 	struct cxlfork_file_state *state = file->private_data;
 	struct cxlfork_desc *desc = NULL;
@@ -2162,6 +2220,7 @@ out_free:
 
 static int cxlfork_ioctl_stats(struct cxlfork_stats __user *uarg)
 {
+	/* benchmark 用它读取 faults 计数，比较 MoW/MoA/hybrid 的访问行为。 */
 	struct cxlfork_stats st;
 	struct cxlfork_desc *desc;
 	int slot;
@@ -2194,6 +2253,7 @@ static int cxlfork_ioctl_stats(struct cxlfork_stats __user *uarg)
 
 static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
 {
+	/* 清空指定 key 的 slot，下一次 prepare 会重新写入完整镜像。 */
 	struct cxlfork_release rel;
 	struct cxlfork_desc *desc;
 	int slot;
@@ -2214,6 +2274,7 @@ static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
 
 static int cxlfork_open(struct inode *inode, struct file *file)
 {
+	/* 为每个 fd 分配 restore/mmap 临时状态。 */
 	struct cxlfork_file_state *state;
 
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
@@ -2232,6 +2293,7 @@ static int cxlfork_release_file(struct inode *inode, struct file *file)
 
 static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	/* ioctl 分发：FORK_PREPARE/FORK_RESUME 是当前复现主线使用的接口。 */
 	switch (cmd) {
 	case CXLFORK_CHECKPOINT:
 	case CXLFORK_FORK_PREPARE:
@@ -2259,6 +2321,7 @@ static const struct file_operations cxlfork_fops = {
 
 static int __init cxlfork_init(void)
 {
+	/* 模块初始化：映射共享 CXL window，并注册 /dev/cxlfork 字符设备。 */
 	int ret;
 
 	if (cxl_size < CXLFORK_DATA_OFFSET + CXLFORK_SLOT_BYTES)

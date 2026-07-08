@@ -5,19 +5,26 @@
 #include <linux/types.h>
 #include "../../include/uapi/linux/cxlfork.h"
 
+/*
+ * CXLfork 内核内部格式说明：
+ * - 每个 key 映射到共享 CXL window 中的一个 slot。
+ * - slot 头部是 cxlfork_desc，后面顺序放置状态镜像、VMA/PTE 镜像和页面数据。
+ * - 这些结构会被 VM0 checkpoint 写入，再由 VM1 restore 读取，因此字段布局要保持稳定。
+ */
 #define CXLFORK_NAME "cxlfork"
 #define CXLFORK_DESC_MAGIC 0x43584c464f524b31ULL /* "CXLFORK1" */
 #define CXLFORK_DESC_VERSION 1
-#define CXLFORK_DATA_OFFSET SZ_2M
-#define CXLFORK_MAX_SLOTS 16
-#define CXLFORK_SLOT_BYTES SZ_128M
-#define CXLFORK_MAX_REGIONS 64
-#define CXLFORK_MAX_PTES 32768
-#define CXLFORK_MAX_PRIVATE_PTRS 12
-#define CXLFORK_MAX_PT_PAGE_IMAGES 1024
+#define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
+#define CXLFORK_MAX_SLOTS 16               /* key%MAX_SLOTS 选择 slot，当前原型不做动态扩容。 */
+#define CXLFORK_SLOT_BYTES SZ_128M         /* 单个 checkpoint slot 的最大容量。 */
+#define CXLFORK_MAX_REGIONS 64             /* 一次 checkpoint 最多记录的 VMA/region 数。 */
+#define CXLFORK_MAX_PTES 32768             /* 一次 checkpoint 最多记录的叶子 PTE 数。 */
+#define CXLFORK_MAX_PRIVATE_PTRS 12        /* rebase image 中可跟踪的内部指针数量。 */
+#define CXLFORK_MAX_PT_PAGE_IMAGES 1024    /* 页表页镜像上限，用于直接 PTE attach 实验。 */
 #define CXLFORK_PT_TREE_MAGIC 0x43584c5054545245ULL /* "CXLPTTRE" */
 #define CXLFORK_VMA_TREE_MAGIC 0x43584c564d415452ULL /* "CXLVMATR" */
 
+/* private_rebase_image 中的指针类型编号，restore 时用来定位 CXL 内部对象。 */
 #define CXLFORK_PTR_STATE_IMAGE 1
 #define CXLFORK_PTR_LEAF_PTE_IMAGE 2
 #define CXLFORK_PTR_PAGE_DATA 3
@@ -29,6 +36,7 @@
 #define CXLFORK_PTR_VMA_TREE_IMAGE 9
 
 struct cxlfork_region_desc {
+	/* checkpointed VMA 的范围、权限和页分类统计。 */
 	u64 start;
 	u64 length;
 	u64 prot;
@@ -41,6 +49,7 @@ struct cxlfork_region_desc {
 };
 
 struct cxlfork_pte_desc {
+	/* 单个用户页的 VA、CXL 页面副本偏移，以及原始/CXL PTE 值。 */
 	u64 va;
 	u64 cxl_offset;
 	u64 orig_pteval;
@@ -48,6 +57,7 @@ struct cxlfork_pte_desc {
 };
 
 struct cxlfork_leaf_pte_image {
+	/* 扁平叶子 PTE 镜像，供 restore 端验证和 attach。 */
 	u64 va;
 	u64 cxl_offset;
 	u64 orig_pteval;
@@ -55,6 +65,7 @@ struct cxlfork_leaf_pte_image {
 };
 
 struct cxlfork_pt_page_image {
+	/* 重建页表页的 CXL 镜像描述，用于衡量 direct PTE install 路径。 */
 	u64 va_base;
 	u64 pte_index_base;
 	u64 nr_ptes;
@@ -63,6 +74,7 @@ struct cxlfork_pt_page_image {
 
 
 struct cxlfork_vma_node_image {
+	/* 将 VMA 列表组织成可在 CXL 上遍历的二叉树节点。 */
 	u64 start;
 	u64 end;
 	u64 prot;
@@ -79,6 +91,7 @@ struct cxlfork_vma_node_image {
 };
 
 struct cxlfork_vma_tree_image {
+	/* VMA tree 的根对象，保存节点数组和 region table 的偏移。 */
 	u64 magic;
 	u64 version;
 	u64 key;
@@ -89,6 +102,7 @@ struct cxlfork_vma_tree_image {
 };
 
 struct cxlfork_pt_tree_image {
+	/* 页表树根对象，保存 leaf PTE image、页表页镜像和原始 PTE table 的位置。 */
 	u64 magic;
 	u64 version;
 	u64 key;
@@ -101,6 +115,7 @@ struct cxlfork_pt_tree_image {
 };
 
 struct cxlfork_state_image {
+	/* CXL 上的完整进程状态镜像；字段 offset 都是相对 CXL window 的偏移。 */
 	u64 magic;
 	u64 version;
 	u64 key;
@@ -136,6 +151,7 @@ struct cxlfork_state_image {
 };
 
 struct cxlfork_private_ptr {
+	/* 一个需要在远端解释/重定位的内部对象指针。 */
 	u64 id;
 	u64 cxl_offset;
 	u64 cxl_phys;
@@ -144,6 +160,7 @@ struct cxlfork_private_ptr {
 };
 
 struct cxlfork_private_rebase_image {
+	/* 把 kernel 私有对象转换成 CXL offset/phys，模拟跨 OS restore 的 rebase 成本。 */
 	u64 magic;
 	u64 version;
 	u64 key;
@@ -154,6 +171,7 @@ struct cxlfork_private_rebase_image {
 };
 
 struct cxlfork_desc {
+	/* 每个 slot 的主描述符；既是索引入口，也是 benchmark breakdown 的来源。 */
 	u64 magic;
 	u64 version;
 	u64 key;

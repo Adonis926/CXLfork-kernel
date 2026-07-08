@@ -3,5 +3,7 @@ config CXLFORK
 	tristate "CXLfork checkpoint/restore prototype"
 	depends on MMU && X86_64
 	help
+	  CXLfork 主线复现需要开启该配置；内建为 y 时 VM 启动后直接出现
+	  /dev/cxlfork，编译为 m 时需要手动 insmod cxlfork.ko。
 	  Build the CXLfork prototype device. It checkpoints process state
 	  into a shared CXL memory window and restores it from remote VMs.
