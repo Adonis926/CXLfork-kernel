@@ -6487,6 +6487,10 @@ void __mt_destroy(struct maple_tree *mt)
 	void *root = mt_root_locked(mt);
 
 	rcu_assign_pointer(mt->ma_root, NULL);
+	if (mt->ma_flags & MT_FLAGS_CXLFORK_CXL_NODES) {
+		mt->ma_flags = 0;
+		return;
+	}
 	if (xa_is_node(root))
 		mte_destroy_walk(root, mt);
 

@@ -11,6 +11,7 @@
 #include <linux/fs_struct.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
+#include <linux/maple_tree.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -49,6 +50,13 @@
  * - VM1 执行 resume，从相同 slot 恢复 VMA/PTE/状态并运行 workload。
  */
 #define CXLFORK_REGION_PGOFF_STEP (CXLFORK_SLOT_BYTES >> PAGE_SHIFT)
+#define CXLFORK_VMA_MAPLE_SCRATCH_BYTES SZ_2M
+#define CXLFORK_MAPLE_ROOT_NODE 0x02UL
+#define CXLFORK_MAPLE_ENODE_NULL 0x04UL
+#define CXLFORK_MAPLE_ENODE_TYPE_SHIFT 0x03UL
+#define CXLFORK_MA_ROOT_PARENT 1UL
+#define CXLFORK_MAPLE_PARENT_RANGE64 0x06UL
+#define CXLFORK_MAPLE_PARENT_SLOT_SHIFT 3
 
 /* 共享 CXL window 的物理参数，必须和 QEMU kernel cmdline 中的参数一致。 */
 static phys_addr_t cxl_phys = 0x484000000ULL;
@@ -180,6 +188,137 @@ static bool cxl_range_valid(u64 off, u64 bytes)
 	if (!bytes || off >= cxl_size || bytes > cxl_size - off)
 		return false;
 	return cxl_ptr(off) && cxl_ptr(off + bytes - 1);
+}
+
+static enum maple_type cxlfork_mte_type(const void *entry)
+{
+	return ((unsigned long)entry >> CXLFORK_MAPLE_ENODE_TYPE_SHIFT) &
+		MAPLE_NODE_TYPE_MASK;
+}
+
+static struct maple_node *cxlfork_mte_node(const void *entry)
+{
+	return (struct maple_node *)((unsigned long)entry & ~MAPLE_NODE_MASK);
+}
+
+static void *cxlfork_mt_mk_node(const struct maple_node *node,
+				enum maple_type type)
+{
+	return (void *)((unsigned long)node |
+			((unsigned long)type << CXLFORK_MAPLE_ENODE_TYPE_SHIFT) |
+			CXLFORK_MAPLE_ENODE_NULL);
+}
+
+static void *cxlfork_mte_mk_root(const void *node)
+{
+	return (void *)((unsigned long)node | CXLFORK_MAPLE_ROOT_NODE);
+}
+
+static bool cxlfork_mte_is_node(const void *entry)
+{
+	return entry && cxlfork_mte_type(entry) != maple_dense;
+}
+
+static void __rcu **cxlfork_ma_slots(struct maple_node *node, enum maple_type type)
+{
+	switch (type) {
+	case maple_arange_64:
+		return node->ma64.slot;
+	case maple_range_64:
+	case maple_leaf_64:
+		return node->mr64.slot;
+	default:
+		return NULL;
+	}
+}
+
+static unsigned int cxlfork_ma_slot_count(enum maple_type type)
+{
+	switch (type) {
+	case maple_arange_64:
+		return MAPLE_ARANGE64_SLOTS;
+	case maple_range_64:
+	case maple_leaf_64:
+		return MAPLE_RANGE64_SLOTS;
+	default:
+		return 0;
+	}
+}
+
+static void cxlfork_maple_set_root_parent(struct maple_tree *mt,
+					  struct maple_node *node)
+{
+	node->parent = (struct maple_pnode *)((unsigned long)mt |
+					     CXLFORK_MA_ROOT_PARENT);
+}
+
+static void cxlfork_maple_set_parent(struct maple_node *child,
+				     const struct maple_node *parent,
+				     unsigned int slot)
+{
+	unsigned long val = (unsigned long)parent;
+
+	val &= ~MAPLE_NODE_MASK;
+	val |= (slot << CXLFORK_MAPLE_PARENT_SLOT_SHIFT) |
+		CXLFORK_MAPLE_PARENT_RANGE64;
+	child->parent = (struct maple_pnode *)val;
+}
+
+struct cxlfork_maple_copy_ctx {
+	u64 next;
+	u64 end;
+	u64 nodes;
+};
+
+static int cxlfork_copy_maple_node_to_cxl(struct cxlfork_maple_copy_ctx *ctx,
+					  void *old_entry, void **new_entry,
+					  struct maple_node *new_parent,
+					  unsigned int parent_slot)
+{
+	struct maple_node *old_node = cxlfork_mte_node(old_entry);
+	struct maple_node *new_node;
+	enum maple_type type = cxlfork_mte_type(old_entry);
+	void __rcu **slots;
+	unsigned int i;
+	u64 node_off;
+
+	if (type != maple_leaf_64 && type != maple_range_64 &&
+	    type != maple_arange_64)
+		return -EOPNOTSUPP;
+	if (ctx->next + sizeof(*new_node) > ctx->end)
+		return -ENOSPC;
+	node_off = ALIGN(ctx->next, MAPLE_NODE_MASK + 1);
+	if (node_off + sizeof(*new_node) > ctx->end)
+		return -ENOSPC;
+	new_node = cxl_ptr(node_off);
+	if (!new_node)
+		return -ENOSPC;
+	memcpy(new_node, old_node, sizeof(*new_node));
+	ctx->next = node_off + sizeof(*new_node);
+	ctx->nodes++;
+
+	*new_entry = cxlfork_mt_mk_node(new_node, type);
+	if (new_parent)
+		cxlfork_maple_set_parent(new_node, new_parent, parent_slot);
+
+	if (type == maple_leaf_64)
+		return 0;
+
+	slots = cxlfork_ma_slots(new_node, type);
+	for (i = 0; i < cxlfork_ma_slot_count(type); i++) {
+		void *child = rcu_dereference_protected(slots[i], true);
+		void *new_child;
+		int ret;
+
+		if (!cxlfork_mte_is_node(child))
+			continue;
+		ret = cxlfork_copy_maple_node_to_cxl(ctx, child, &new_child,
+						     new_node, i);
+		if (ret)
+			return ret;
+		rcu_assign_pointer(slots[i], new_child);
+	}
+	return 0;
 }
 
 static bool cxlfork_phys_in_window(phys_addr_t phys)
@@ -2247,6 +2386,87 @@ out_unlock:
 	return ret;
 }
 
+static int cxlfork_probe_cxl_vma_maple(struct cxlfork_desc *desc,
+				       unsigned long address,
+				       struct cxlfork_inspect_v2 *inspect)
+{
+	struct cxlfork_maple_copy_ctx ctx;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	void *old_root;
+	void *new_root;
+	unsigned int old_flags;
+	bool attached = false;
+	u64 start_ns = ktime_get_ns();
+	u64 scratch = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES -
+		CXLFORK_VMA_MAPLE_SCRATCH_BYTES;
+	u64 used_end = slot_offset(desc->slot) + desc->image_bytes;
+	int ret;
+
+	if (used_end > scratch)
+		return -ENOSPC;
+	if (!cxl_range_valid(scratch, CXLFORK_VMA_MAPLE_SCRATCH_BYTES))
+		return -ENOSPC;
+
+	memset(cxl_ptr(scratch), 0, CXLFORK_VMA_MAPLE_SCRATCH_BYTES);
+	ctx.next = scratch;
+	ctx.end = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES;
+	ctx.nodes = 0;
+
+	mmap_write_lock(mm);
+	mtree_lock(&mm->mm_mt);
+	old_root = rcu_dereference_protected(mm->mm_mt.ma_root, true);
+	old_flags = mm->mm_mt.ma_flags;
+	if (old_flags & MT_FLAGS_CXLFORK_CXL_NODES) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	if (!old_root || !((unsigned long)old_root & CXLFORK_MAPLE_ROOT_NODE)) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	ret = cxlfork_copy_maple_node_to_cxl(&ctx,
+					     (void *)((unsigned long)old_root &
+						      ~CXLFORK_MAPLE_ROOT_NODE),
+					     &new_root, NULL, 0);
+	if (ret)
+		goto out_unlock;
+	cxlfork_maple_set_root_parent(&mm->mm_mt, cxlfork_mte_node(new_root));
+	rcu_assign_pointer(mm->mm_mt.ma_root, cxlfork_mte_mk_root(new_root));
+	mm->mm_mt.ma_flags = old_flags | MT_FLAGS_CXLFORK_CXL_NODES;
+	attached = true;
+	mtree_unlock(&mm->mm_mt);
+
+	vma = find_vma(mm, address);
+
+	mtree_lock(&mm->mm_mt);
+	rcu_assign_pointer(mm->mm_mt.ma_root, old_root);
+	mm->mm_mt.ma_flags = old_flags;
+	desc->vma_maple_nodes = ctx.nodes;
+	desc->vma_maple_root_offset =
+		(char *)cxlfork_mte_node(new_root) - (char *)cxl_ptr(0);
+	desc->vma_maple_attach_ns = ktime_get_ns() - start_ns;
+	inspect->vma_maple_root_pfn =
+		(cxl_phys + desc->vma_maple_root_offset) >> PAGE_SHIFT;
+	inspect->vma_maple_nodes = desc->vma_maple_nodes;
+	if (vma) {
+		inspect->vma_lookup_start = vma->vm_start;
+		inspect->vma_lookup_end = vma->vm_end;
+	}
+	inspect->flags |= CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID;
+	ret = 0;
+
+out_unlock:
+	if (attached) {
+		rcu_assign_pointer(mm->mm_mt.ma_root, old_root);
+		mm->mm_mt.ma_flags = old_flags;
+	}
+	mtree_unlock(&mm->mm_mt);
+	mmap_write_unlock(mm);
+	return ret;
+}
+
 static int cxlfork_map_region_cow(struct file *file,
 				  const struct cxlfork_region_desc *r,
 				  u64 region_idx, bool private_cow)
@@ -2682,6 +2902,9 @@ static int cxlfork_ioctl_restore(struct file *file,
 	desc->private_rebase_validate_ns = 0;
 	desc->direct_pte_install_ns = 0;
 	desc->direct_pte_install_pages = 0;
+	desc->vma_maple_attach_ns = 0;
+	desc->vma_maple_nodes = 0;
+	desc->vma_maple_root_offset = 0;
 	readonly = op->flags & CXLFORK_F_MAP_READONLY;
 	private_cow = op->flags & CXLFORK_F_PRIVATE_COW;
 	shared_cow = op->flags & CXLFORK_F_SHARED_COW;
@@ -2861,6 +3084,7 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
@@ -2966,6 +3190,7 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 			inspect.shared_leaf_pfn = leaf_pfn;
 			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
 		}
+		cxlfork_probe_cxl_vma_maple(desc, address, &inspect);
 		mmap_read_lock(current->mm);
 		ret = cxlfork_read_pmd_snapshot(current->mm, address,
 						&inspect.current_pmd,
@@ -3167,6 +3392,7 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 			inspect.shared_leaf_pfn = leaf_pfn;
 			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
 		}
+		cxlfork_probe_cxl_vma_maple(desc, address, &inspect);
 		mmap_read_lock(current->mm);
 		ret = cxlfork_read_pmd_snapshot(current->mm, address,
 						&inspect.current_pmd,

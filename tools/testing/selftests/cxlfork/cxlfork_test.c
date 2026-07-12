@@ -88,14 +88,14 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
 
-	forbidden = CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
-		CXLFORK_CAP_FULL_PRIVATE_STATE |
+	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID;
 	ok = !(caps.capabilities & forbidden);
 	tap(ok, nr++, "unimplemented paper mechanisms are not advertised");
@@ -253,6 +253,7 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	struct cxlfork_inspect_v2 after_second;
 	uint64_t hash;
 	unsigned char *first;
+	size_t page = getpagesize();
 	int fd;
 
 	if (!strcmp(policy, "mow"))
@@ -282,6 +283,15 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	}
 	if (hash != before.page_checksum) {
 		fprintf(stderr, "restored checksum mismatch\n");
+		return 1;
+	}
+	if (!(before.flags & CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID) ||
+	    !before.vma_maple_root_pfn ||
+	    !before.vma_maple_nodes ||
+	    before.vma_lookup_start > op.regions[0].start ||
+	    before.vma_lookup_end < op.regions[0].start + page) {
+		fprintf(stderr, "%s restore did not attach a CXL Maple VMA node\n",
+			policy);
 		return 1;
 	}
 	if (!strcmp(policy, "readonly") || !strcmp(policy, "mow")) {
@@ -361,6 +371,8 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       " after_pfn=%" PRIu64 " second_pfn=%" PRIu64
 	       " shared_leaf_pfn=%" PRIu64 " current_pmd_pfn=%" PRIu64
 	       " after_pmd_pfn=%" PRIu64 " second_pmd_pfn=%" PRIu64
+	       " vma_root_pfn=%" PRIu64 " vma_nodes=%" PRIu64
+	       " vma_lookup=%" PRIx64 "-%" PRIx64
 	       " verify=ok\n",
 	       key, policy, (uint64_t)op.nr_regions, (uint64_t)op.total_pages,
 	       hash, (uint64_t)before.shared_pfn,
@@ -369,7 +381,11 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       (uint64_t)before.shared_leaf_pfn,
 	       (uint64_t)before.current_pmd_pfn,
 	       (uint64_t)after.current_pmd_pfn,
-	       (uint64_t)after_second.current_pmd_pfn);
+	       (uint64_t)after_second.current_pmd_pfn,
+	       (uint64_t)before.vma_maple_root_pfn,
+	       (uint64_t)before.vma_maple_nodes,
+	       (uint64_t)before.vma_lookup_start,
+	       (uint64_t)before.vma_lookup_end);
 	close(fd);
 	return 0;
 }
@@ -448,14 +464,19 @@ static int inspect_snapshot(uint64_t key, uint64_t address)
 	       " observed_page_checksum=%" PRIu64 " leaf_checksum=%" PRIu64
 	       " observed_leaf_checksum=%" PRIu64 " shared_pfn=%" PRIu64
 	       " current_pfn=%" PRIu64 " shared_leaf_pfn=%" PRIu64
-	       " current_pmd_pfn=%" PRIu64 " flags=%" PRIu64 "\n",
+	       " current_pmd_pfn=%" PRIu64 " vma_root_pfn=%" PRIu64
+	       " vma_nodes=%" PRIu64 " vma_lookup=%" PRIx64 "-%" PRIx64
+	       " flags=%" PRIu64 "\n",
 	       (uint64_t)op.key, (uint64_t)op.generation, op.slot, op.state,
 	       op.reader_count, (uint64_t)op.nr_regions,
 	       (uint64_t)op.total_pages, (uint64_t)op.page_checksum,
 	       (uint64_t)op.observed_page_checksum, (uint64_t)op.leaf_checksum,
 	       (uint64_t)op.observed_leaf_checksum, (uint64_t)op.shared_pfn,
 	       (uint64_t)op.current_pfn, (uint64_t)op.shared_leaf_pfn,
-	       (uint64_t)op.current_pmd_pfn, (uint64_t)op.flags);
+	       (uint64_t)op.current_pmd_pfn, (uint64_t)op.vma_maple_root_pfn,
+	       (uint64_t)op.vma_maple_nodes,
+	       (uint64_t)op.vma_lookup_start, (uint64_t)op.vma_lookup_end,
+	       (uint64_t)op.flags);
 	close(fd);
 	return 0;
 }

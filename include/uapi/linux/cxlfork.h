@@ -69,6 +69,7 @@
 #define CXLFORK_INSPECT_F_CHECKSUM_MISMATCH (1ULL << 3)
 #define CXLFORK_INSPECT_F_SHARED_LEAF_VALID (1ULL << 4)
 #define CXLFORK_INSPECT_F_CURRENT_PMD_VALID (1ULL << 5)
+#define CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID (1ULL << 6)
 
 enum cxlfork_slot_state_v2 {
 	CXLFORK_SLOT_FREE = 0,
@@ -133,6 +134,10 @@ struct cxlfork_inspect_v2 {
 	__u64 shared_leaf_pfn;
 	__u64 current_pmd;
 	__u64 current_pmd_pfn;
+	__u64 vma_maple_root_pfn;
+	__u64 vma_maple_nodes;
+	__u64 vma_lookup_start;
+	__u64 vma_lookup_end;
 };
 
 struct cxlfork_region {

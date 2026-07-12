@@ -226,6 +226,9 @@ struct cxlfork_desc {
 	u64 vma_tree_pages;
 	u64 vma_tree_build_ns;
 	u64 vma_tree_validate_ns;
+	u64 vma_maple_attach_ns;
+	u64 vma_maple_nodes;
+	u64 vma_maple_root_offset;
 	u64 global_detach_ns;
 	u64 global_attach_ns;
 	struct cxlfork_task_state task_state;
