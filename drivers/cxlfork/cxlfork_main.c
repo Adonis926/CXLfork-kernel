@@ -1023,14 +1023,35 @@ static void cxlfork_capture_thread_state(struct cxlfork_thread_state *st)
 	st->gsbase = current->thread.gsbase;
 }
 
-static void cxlfork_apply_thread_state(const struct cxlfork_desc *desc)
+static int cxlfork_validate_thread_state(const struct cxlfork_thread_state *st)
 {
-	/* 可选恢复用户寄存器；benchmark 默认更关注 mmap/PTE 路径。 */
+	unsigned long sp;
+
+	if (!st->ip || !st->sp)
+		return -EINVAL;
+	if (st->ip >= TASK_SIZE_MAX || st->sp >= TASK_SIZE_MAX)
+		return -EFAULT;
+	sp = st->sp;
+	if (sp < 8)
+		return -EFAULT;
+	if (!access_ok((void __user *)(unsigned long)st->ip, 1) ||
+	    !access_ok((void __user *)(sp - 8), 8))
+		return -EFAULT;
+	return 0;
+}
+
+static int cxlfork_apply_thread_state(const struct cxlfork_desc *desc)
+{
+	/* 恢复用户寄存器；返回后必须从保存的用户 IP/SP 继续执行。 */
 	struct pt_regs *regs = task_pt_regs(current);
 	const struct cxlfork_thread_state *st = &desc->thread_state;
+	int ret;
 
 	if (!regs || !st->ip || !st->sp)
-		return;
+		return -EINVAL;
+	ret = cxlfork_validate_thread_state(st);
+	if (ret)
+		return ret;
 
 	regs->ip = st->ip;
 	regs->sp = st->sp;
@@ -1041,6 +1062,7 @@ static void cxlfork_apply_thread_state(const struct cxlfork_desc *desc)
 	regs->bx = st->bx;
 	regs->bp = st->bp;
 	regs->ax = 0;
+	return 0;
 }
 
 static void cxlfork_apply_tls_state(const struct cxlfork_desc *desc)
@@ -2999,11 +3021,6 @@ static int cxlfork_ioctl_restore(struct file *file,
 		global_restore_ns = ktime_get_ns() - global_start;
 		desc->global_attach_ns = global_restore_ns;
 	}
-	if (apply_tls_state)
-		cxlfork_apply_tls_state(desc);
-	if (apply_thread_state)
-		cxlfork_apply_thread_state(desc);
-
 	memset(op, 0, sizeof(*op));
 	op->key = desc->key;
 	op->nr_regions = desc->nr_regions;
@@ -3035,8 +3052,19 @@ static int cxlfork_ioctl_restore(struct file *file,
 		op->regions[i].flags = desc->regions[i].flags;
 		op->regions[i].pages = desc->regions[i].pages;
 	}
-	if (copy_to_user(uarg, op, sizeof(*op)))
+	if (copy_to_user(uarg, op, sizeof(*op))) {
 		ret = -EFAULT;
+		goto out_unlock;
+	}
+	if (apply_thread_state) {
+		ret = cxlfork_validate_thread_state(&desc->thread_state);
+		if (ret)
+			goto out_unlock;
+	}
+	if (apply_tls_state)
+		cxlfork_apply_tls_state(desc);
+	if (apply_thread_state)
+		ret = cxlfork_apply_thread_state(desc);
 
 out_unlock:
 	if (restore_reader && desc && cxlfork_desc_key_ready(desc, op->key) &&
@@ -3088,7 +3116,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
-		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
+		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
+		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;

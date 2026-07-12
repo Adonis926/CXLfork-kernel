@@ -18,6 +18,8 @@
 
 #define KSFT_SKIP 4
 #define TEST_BASE ((void *)0x500000000000ULL)
+#define THREADCTX_STACK_BASE ((void *)0x600000100000ULL)
+#define THREADCTX_STACK_SIZE (64 * 1024)
 #define FNV_SEED 1469598103934665603ULL
 #define FNV_PRIME 1099511628211ULL
 
@@ -90,7 +92,8 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
-		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
+		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
+		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
@@ -228,6 +231,106 @@ static int prepare_snapshot(uint64_t key, size_t bytes)
 	       (uint64_t)inspect.image_bytes);
 	close(fd);
 	return 0;
+}
+
+__attribute__((noinline, noreturn))
+static void threadctx_resume_entry(void)
+{
+	static const char msg[] = "threadctx-resume verify=ok\n";
+
+	(void)!write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+	_exit(0);
+}
+
+static int map_threadctx_stack(void)
+{
+	void *stack;
+
+	stack = mmap(THREADCTX_STACK_BASE, THREADCTX_STACK_SIZE,
+		     PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (stack == MAP_FAILED) {
+		perror("mmap threadctx stack");
+		return 1;
+	}
+	return 0;
+}
+
+static int prepare_threadctx_snapshot(uint64_t key, size_t bytes)
+{
+	struct cxlfork_checkpoint op = { 0 };
+	unsigned char *first;
+	size_t page = getpagesize();
+	uint64_t hash = FNV_SEED;
+	uintptr_t stack_top = (uintptr_t)THREADCTX_STACK_BASE + THREADCTX_STACK_SIZE;
+	int fd;
+
+	bytes = (bytes + page - 1) & ~(page - 1);
+	if (bytes < page)
+		bytes = page;
+	first = mmap(TEST_BASE, bytes, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (first == MAP_FAILED) {
+		perror("mmap threadctx data");
+		return 1;
+	}
+	fill_region(first, bytes, key, 8);
+	hash = fnv_bytes(hash, first, bytes);
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	op.key = key;
+	op.scan_start = (uintptr_t)TEST_BASE;
+	op.scan_end = (uintptr_t)TEST_BASE + bytes;
+	op.flags = CXLFORK_F_USER_THREAD_STATE;
+	op.thread_state.ip = (uintptr_t)threadctx_resume_entry;
+	op.thread_state.sp = stack_top - 8;
+	op.thread_state.flags = 0x202;
+	if (ioctl(fd, CXLFORK_FORK_PREPARE, &op)) {
+		perror("FORK_PREPARE threadctx");
+		return 1;
+	}
+	printf("threadctx-prepare key=%" PRIu64 " ip=%" PRIx64
+	       " sp=%" PRIx64 " pages=%" PRIu64 " checksum=%" PRIu64
+	       " verify=ok\n",
+	       key, (uint64_t)op.thread_state.ip,
+	       (uint64_t)op.thread_state.sp, (uint64_t)op.total_pages, hash);
+	close(fd);
+	return 0;
+}
+
+static int restore_threadctx_snapshot(uint64_t key, const char *policy)
+{
+	struct cxlfork_restore op = { .key = key };
+	int fd;
+
+	if (!strcmp(policy, "readonly"))
+		op.flags = CXLFORK_F_MAP_READONLY;
+	else if (!strcmp(policy, "mow"))
+		op.flags = CXLFORK_F_SHARED_COW;
+	else if (!strcmp(policy, "moa"))
+		op.flags = CXLFORK_F_PRIVATE_COW;
+	else {
+		fprintf(stderr, "unknown policy: %s\n", policy);
+		return 2;
+	}
+	op.flags |= CXLFORK_F_APPLY_THREAD_STATE;
+	if (map_threadctx_stack())
+		return 1;
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME threadctx");
+		return 1;
+	}
+	fprintf(stderr, "threadctx restore returned without jumping to saved IP\n");
+	return 1;
 }
 
 static uint64_t hash_restored_regions(const struct cxlfork_restore *op)
@@ -809,6 +912,7 @@ int main(int argc, char **argv)
 		return run_abi_tests();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
+			"threadctx-prepare KEY BYTES | threadctx-restore KEY POLICY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | conflict KEY POLICY\n",
 			argv[0]);
@@ -823,6 +927,10 @@ int main(int argc, char **argv)
 		return run_lifecycle_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)
 		return prepare_snapshot(key, parse_u64(argv[3]));
+	if (!strcmp(argv[1], "threadctx-prepare") && argc == 4)
+		return prepare_threadctx_snapshot(key, parse_u64(argv[3]));
+	if (!strcmp(argv[1], "threadctx-restore") && argc == 4)
+		return restore_threadctx_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "restore") && argc == 4)
 		return restore_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "conflict") && argc == 4)
