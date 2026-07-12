@@ -134,6 +134,33 @@ static bool cxlfork_slot_range_valid(const struct cxlfork_desc *desc,
 	return cxl_range_valid(off, bytes);
 }
 
+static bool cxlfork_desc_matches_slot(const struct cxlfork_desc *desc,
+				      u64 slot)
+{
+	if (!desc || slot >= CXLFORK_MAX_SLOTS)
+		return false;
+	if (READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
+	    READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
+	    READ_ONCE(desc->slot) == slot &&
+	    READ_ONCE(desc->data_offset) == slot_offset(slot) + SZ_2M)
+		return true;
+	return false;
+}
+
+static bool cxlfork_slot_has_room(u64 slot, u64 off, u64 bytes)
+{
+	u64 start;
+	u64 end;
+
+	if (slot >= CXLFORK_MAX_SLOTS || !bytes)
+		return false;
+	start = slot_offset(slot);
+	end = start + CXLFORK_SLOT_BYTES;
+	if (off < start || off >= end || bytes > end - off)
+		return false;
+	return cxl_range_valid(off, bytes);
+}
+
 static u64 cxlfork_checksum_bytes(u64 checksum, const void *data, u64 bytes)
 {
 	const u8 *p = data;
@@ -325,14 +352,16 @@ static u64 cxlfork_pt_table_entry(u64 child_offset)
 	return pte_val(pfn_pte(pfn, __pgprot(_PAGE_TABLE)));
 }
 
-static int cxlfork_pt_tree_alloc_page(struct cxlfork_desc *desc, u64 *data_off,
-				      u64 *page_off, bool metadata)
+static int cxlfork_pt_tree_alloc_page(struct cxlfork_desc *desc, u64 slot,
+				      u64 *data_off, u64 *page_off,
+				      bool metadata)
 {
 	/* 从当前 slot 的线性 data_off 分配一页，作为页表树或元数据对象。 */
-	u64 end = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES;
 	void *page;
 
-	if (*data_off + PAGE_SIZE > end)
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
+	if (!cxlfork_slot_has_room(slot, *data_off, PAGE_SIZE))
 		return -ENOSPC;
 	page = cxl_ptr(*data_off);
 	if (!page)
@@ -345,15 +374,17 @@ static int cxlfork_pt_tree_alloc_page(struct cxlfork_desc *desc, u64 *data_off,
 	return 0;
 }
 
-static int cxlfork_pt_tree_child(struct cxlfork_desc *desc, u64 *data_off,
-				 u64 *parent, u64 idx, u64 **child)
+static int cxlfork_pt_tree_child(struct cxlfork_desc *desc, u64 slot,
+				 u64 *data_off, u64 *parent, u64 idx,
+				 u64 **child)
 {
 	u64 child_off;
 
 	if (idx >= PTRS_PER_PTE)
 		return -EINVAL;
 	if (!parent[idx]) {
-		int ret = cxlfork_pt_tree_alloc_page(desc, data_off, &child_off, false);
+		int ret = cxlfork_pt_tree_alloc_page(desc, slot, data_off,
+						     &child_off, false);
 
 		if (ret)
 			return ret;
@@ -369,8 +400,9 @@ static int cxlfork_pt_tree_child(struct cxlfork_desc *desc, u64 *data_off,
 	return *child ? 0 : -EINVAL;
 }
 
-static int cxlfork_pt_tree_insert_leaf(struct cxlfork_desc *desc, u64 *data_off,
-				       unsigned long addr, u64 leaf_pte_page_offset)
+static int cxlfork_pt_tree_insert_leaf(struct cxlfork_desc *desc, u64 slot,
+				       u64 *data_off, unsigned long addr,
+				       u64 leaf_pte_page_offset)
 {
 	/* 按 VA 页表索引在 CXL 上构建最小页表树，叶子指向 PTE page image。 */
 	u64 *pgd = cxl_ptr(desc->pt_tree_root_offset);
@@ -383,13 +415,13 @@ static int cxlfork_pt_tree_insert_leaf(struct cxlfork_desc *desc, u64 *data_off,
 
 	if (!pgd)
 		return -EINVAL;
-	ret = cxlfork_pt_tree_child(desc, data_off, pgd, pgd_idx, &p4d);
+	ret = cxlfork_pt_tree_child(desc, slot, data_off, pgd, pgd_idx, &p4d);
 	if (ret)
 		return ret;
-	ret = cxlfork_pt_tree_child(desc, data_off, p4d, p4d_idx, &pud);
+	ret = cxlfork_pt_tree_child(desc, slot, data_off, p4d, p4d_idx, &pud);
 	if (ret)
 		return ret;
-	ret = cxlfork_pt_tree_child(desc, data_off, pud, pud_idx, &pmd);
+	ret = cxlfork_pt_tree_child(desc, slot, data_off, pud, pud_idx, &pmd);
 	if (ret)
 		return ret;
 	if (pmd[pmd_idx] &&
@@ -914,7 +946,8 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 	return 0;
 }
 
-static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 *data_off)
+static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 slot,
+					u64 *data_off)
 {
 	/* 将 desc->ptes 扁平化到 CXL，供 restore 端验证和 fault 查找。 */
 	struct cxlfork_leaf_pte_image *image;
@@ -923,10 +956,11 @@ static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 *data_off
 
 	if (!desc->nr_ptes)
 		return 0;
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
 
 	image_bytes = PAGE_ALIGN(desc->nr_ptes * sizeof(*image));
-	if (*data_off + image_bytes >
-	    slot_offset(desc->slot) + CXLFORK_SLOT_BYTES)
+	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
 	image = cxl_ptr(*data_off);
 	if (!image)
@@ -983,7 +1017,8 @@ static void cxlfork_vma_tree_link(struct cxlfork_vma_node_image *nodes,
 	cxlfork_vma_tree_link(nodes, nodes_offset, mid + 1, hi, mid, root_offset);
 }
 
-static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 *data_off)
+static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 slot,
+					u64 *data_off)
 {
 	/* 在 CXL 中生成 VMA tree image，是论文中 OS metadata 序列化的一部分。 */
 	struct cxlfork_vma_tree_image *tree;
@@ -995,9 +1030,11 @@ static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 *data_off
 
 	if (!desc->nr_regions)
 		return 0;
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
 	bytes = PAGE_ALIGN(sizeof(*tree)) +
 		PAGE_ALIGN(desc->nr_regions * sizeof(*nodes));
-	if (*data_off + bytes > slot_offset(desc->slot) + CXLFORK_SLOT_BYTES)
+	if (!cxlfork_slot_has_room(slot, *data_off, bytes))
 		return -ENOSPC;
 	tree_offset = *data_off;
 	tree = cxl_ptr(tree_offset);
@@ -1030,7 +1067,7 @@ static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 *data_off
 	tree->key = desc->key;
 	tree->nodes_offset = nodes_offset;
 	tree->nr_nodes = desc->nr_regions;
-	tree->region_table_offset = slot_offset(desc->slot) + offsetof(struct cxlfork_desc, regions);
+	tree->region_table_offset = slot_offset(slot) + offsetof(struct cxlfork_desc, regions);
 	cxlfork_vma_tree_link(nodes, nodes_offset, 0, desc->nr_regions - 1, -1,
 				&tree->root_offset);
 
@@ -1113,15 +1150,17 @@ static int cxlfork_validate_vma_tree_image(const struct cxlfork_desc *desc,
 	return 0;
 }
 
-static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 *data_off)
+static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 slot,
+				     u64 *data_off)
 {
 	/* 构建完整 state image：task/mm/thread/global/fd/region 的 CXL 常驻副本。 */
 	struct cxlfork_state_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 image_off = *data_off;
 
-	if (*data_off + image_bytes >
-	    slot_offset(desc->slot) + CXLFORK_SLOT_BYTES)
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
+	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
 	image = cxl_ptr(image_off);
 	if (!image)
@@ -1149,7 +1188,7 @@ static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 *data_off)
 	image->region_table_offset = image_off + offsetof(struct cxlfork_state_image, regions);
 	image->vma_tree_image_offset = desc->vma_tree_image_offset;
 	image->vma_tree_root_offset = desc->vma_tree_root_offset;
-	image->pte_table_offset = slot_offset(desc->slot) + offsetof(struct cxlfork_desc, ptes);
+	image->pte_table_offset = slot_offset(slot) + offsetof(struct cxlfork_desc, ptes);
 	image->leaf_pte_image_offset = desc->pte_image_offset;
 	image->pt_page_image_offset = desc->pt_page_image_offset;
 	image->pt_tree_image_offset = desc->pt_tree_image_offset;
@@ -1274,7 +1313,8 @@ static void cxlfork_private_ptr_set(struct cxlfork_private_rebase_image *image,
 	ptr->entries = entries;
 }
 
-static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
+static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 slot,
+				       u64 *data_off)
 {
 	/* 把 leaf PTE 合并成按 PMD 覆盖的页表页镜像，供 restore/fault 快速 attach。 */
 	struct cxlfork_pt_page_image *meta;
@@ -1287,6 +1327,8 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 
 	if (!desc->nr_ptes)
 		return 0;
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
 	while (i < desc->nr_ptes) {
 		u64 va_base = desc->ptes[i].va & PMD_MASK;
 
@@ -1300,8 +1342,8 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 		return -ENOSPC;
 
 	meta_bytes = PAGE_ALIGN(nr_pages * sizeof(*meta));
-	if (*data_off + meta_bytes + PAGE_SIZE * 2 >
-	    slot_offset(desc->slot) + CXLFORK_SLOT_BYTES)
+	if (!cxlfork_slot_has_room(slot, *data_off,
+				   meta_bytes + PAGE_SIZE * 2))
 		return -ENOSPC;
 	meta = cxl_ptr(*data_off);
 	if (!meta)
@@ -1312,7 +1354,8 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 	desc->pt_page_image_entries = nr_pages;
 	*data_off += meta_bytes;
 
-	ret = cxlfork_pt_tree_alloc_page(desc, data_off, &tree_offset, true);
+	ret = cxlfork_pt_tree_alloc_page(desc, slot, data_off, &tree_offset,
+					 true);
 	if (ret)
 		return ret;
 	tree = cxl_ptr(tree_offset);
@@ -1323,14 +1366,14 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 	tree->key = desc->key;
 	desc->pt_tree_image_offset = tree_offset;
 
-	ret = cxlfork_pt_tree_alloc_page(desc, data_off,
+	ret = cxlfork_pt_tree_alloc_page(desc, slot, data_off,
 					  &desc->pt_tree_root_offset, false);
 	if (ret)
 		return ret;
 	tree->root_offset = desc->pt_tree_root_offset;
 	tree->leaf_pte_image_offset = desc->pte_image_offset;
 	tree->pt_page_image_offset = desc->pt_page_image_offset;
-	tree->pte_table_offset = slot_offset(desc->slot) + offsetof(struct cxlfork_desc, ptes);
+	tree->pte_table_offset = slot_offset(slot) + offsetof(struct cxlfork_desc, ptes);
 	tree->nr_leaf_ptes = desc->nr_ptes;
 
 	i = 0;
@@ -1341,7 +1384,8 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 		u64 page_off;
 		u64 *ptes;
 
-		ret = cxlfork_pt_tree_alloc_page(desc, data_off, &page_off, false);
+		ret = cxlfork_pt_tree_alloc_page(desc, slot, data_off, &page_off,
+						 false);
 		if (ret)
 			return ret;
 		ptes = cxl_ptr(page_off);
@@ -1350,7 +1394,8 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 *data_off)
 		meta[nr_pages].va_base = va_base;
 		meta[nr_pages].pte_index_base = pte_index_base;
 		meta[nr_pages].pte_page_offset = page_off;
-		ret = cxlfork_pt_tree_insert_leaf(desc, data_off, va_base, page_off);
+		ret = cxlfork_pt_tree_insert_leaf(desc, slot, data_off, va_base,
+						  page_off);
 		if (ret)
 			return ret;
 		do {
@@ -1437,15 +1482,16 @@ static int cxlfork_validate_pt_page_image(const struct cxlfork_desc *desc,
 }
 
 static int cxlfork_build_private_rebase_image(struct cxlfork_desc *desc,
-                                              u64 *data_off)
+					      u64 slot, u64 *data_off)
 {
 	/* 构建 private rebase image，用于量化跨 OS 恢复时需要重定位的内部对象集合。 */
 	struct cxlfork_private_rebase_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 idx = 0;
 
-	if (*data_off + image_bytes >
-	    slot_offset(desc->slot) + CXLFORK_SLOT_BYTES)
+	if (!cxlfork_desc_matches_slot(desc, slot))
+		return -EILSEQ;
+	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
 	image = cxl_ptr(*data_off);
 	if (!image)
@@ -1468,12 +1514,12 @@ static int cxlfork_build_private_rebase_image(struct cxlfork_desc *desc,
 				desc->state_image_offset,
 				desc->state_image_pages * PAGE_SIZE, 1);
 	cxlfork_private_ptr_set(image, &idx, CXLFORK_PTR_REGION_TABLE,
-				slot_offset(desc->slot) +
+				slot_offset(slot) +
 				offsetof(struct cxlfork_desc, regions),
 				desc->nr_regions * sizeof(desc->regions[0]),
 				desc->nr_regions);
 	cxlfork_private_ptr_set(image, &idx, CXLFORK_PTR_PTE_TABLE,
-				slot_offset(desc->slot) +
+				slot_offset(slot) +
 				offsetof(struct cxlfork_desc, ptes),
 				desc->nr_ptes * sizeof(desc->ptes[0]),
 				desc->nr_ptes);
@@ -1670,36 +1716,40 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	if (!ret) {
 		u64 pte_image_start = ktime_get_ns();
 
-		ret = cxlfork_build_leaf_pte_image(desc, &data_off);
+		ret = cxlfork_build_leaf_pte_image(desc, slot, &data_off);
 		desc->pte_image_build_ns = ktime_get_ns() - pte_image_start;
 	}
 	if (!ret) {
 		u64 pt_page_start = ktime_get_ns();
 
-		ret = cxlfork_build_pt_page_image(desc, &data_off);
+		ret = cxlfork_build_pt_page_image(desc, slot, &data_off);
 		desc->pt_page_image_build_ns = ktime_get_ns() - pt_page_start;
 	}
 	if (!ret) {
 		u64 vma_tree_start = ktime_get_ns();
 
-		ret = cxlfork_build_vma_tree_image(desc, &data_off);
+		ret = cxlfork_build_vma_tree_image(desc, slot, &data_off);
 		desc->vma_tree_build_ns = ktime_get_ns() - vma_tree_start;
 	}
 	if (!ret) {
 		u64 state_image_start = ktime_get_ns();
 
-		ret = cxlfork_build_state_image(desc, &data_off);
+		ret = cxlfork_build_state_image(desc, slot, &data_off);
 		desc->state_image_build_ns = ktime_get_ns() - state_image_start;
 	}
 	if (!ret) {
 		u64 rebase_start = ktime_get_ns();
 
-		ret = cxlfork_build_private_rebase_image(desc, &data_off);
+		ret = cxlfork_build_private_rebase_image(desc, slot, &data_off);
 		if (!ret)
 			cxlfork_patch_state_image_rebase_offset(desc);
 		desc->private_rebase_ns = ktime_get_ns() - rebase_start;
 	}
 	if (!ret) {
+		if (!cxlfork_desc_matches_slot(desc, slot)) {
+			ret = -EILSEQ;
+			goto out_unlock;
+		}
 		desc->image_bytes = data_off - slot_offset(slot);
 		ret = cxlfork_compute_checksums(desc, &desc->page_checksum,
 						&desc->leaf_checksum);
@@ -1797,19 +1847,23 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 
 static int cxlfork_map_region_cow(struct file *file,
 				  const struct cxlfork_region_desc *r,
-				  u64 region_idx)
+				  u64 region_idx, bool private_cow)
 {
 	/* COW/tiering 路径：先 mmap /dev/cxlfork，后续 fault 决定共享还是复制。 */
 	unsigned long mapped;
+	unsigned long flags = (private_cow ? MAP_SHARED : MAP_PRIVATE) |
+		MAP_FIXED_NOREPLACE;
 
 	mapped = vm_mmap(file, r->start, r->length,
 			 PROT_READ | ((r->prot & PROT_WRITE) ? PROT_WRITE : 0),
-			 MAP_PRIVATE | MAP_FIXED_NOREPLACE,
+			 flags,
 			 (region_idx * CXLFORK_REGION_PGOFF_STEP) << PAGE_SHIFT);
 	if (IS_ERR_VALUE(mapped)) {
+		flags &= ~MAP_FIXED_NOREPLACE;
+		flags |= MAP_FIXED;
 		mapped = vm_mmap(file, r->start, r->length,
 				 PROT_READ | ((r->prot & PROT_WRITE) ? PROT_WRITE : 0),
-				 MAP_PRIVATE | MAP_FIXED,
+				 flags,
 				 (region_idx * CXLFORK_REGION_PGOFF_STEP) << PAGE_SHIFT);
 		if (IS_ERR_VALUE(mapped)) {
 			pr_warn("cxlfork: cow vm_mmap start=%llx len=%llx ret=%ld\n",
@@ -2224,7 +2278,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 		u64 map_start = ktime_get_ns();
 
 		if (private_cow || shared_cow || hybrid_tiering)
-			ret = cxlfork_map_region_cow(file, &desc->regions[i], i);
+			ret = cxlfork_map_region_cow(file, &desc->regions[i], i,
+						     private_cow);
 		else
 			ret = cxlfork_map_region(desc, &desc->regions[i], readonly);
 		if (!ret && shared_cow) {
