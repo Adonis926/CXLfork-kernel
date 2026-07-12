@@ -86,6 +86,7 @@ static int run_abi_tests(void)
 	required = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
+		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
@@ -93,8 +94,7 @@ static int run_abi_tests(void)
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
 
-	forbidden = CXLFORK_CAP_PTE_LEAF_COW |
-		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
+	forbidden = CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_FULL_PRIVATE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID;
 	ok = !(caps.capabilities & forbidden);
@@ -284,13 +284,14 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		fprintf(stderr, "restored checksum mismatch\n");
 		return 1;
 	}
-	if (!strcmp(policy, "readonly")) {
+	if (!strcmp(policy, "readonly") || !strcmp(policy, "mow")) {
 		if (!(before.flags & CXLFORK_INSPECT_F_SHARED_LEAF_VALID) ||
 		    !(before.flags & CXLFORK_INSPECT_F_CURRENT_PMD_VALID) ||
 		    !before.shared_leaf_pfn ||
 		    before.current_pmd_pfn != before.shared_leaf_pfn ||
 		    before.current_pfn != before.shared_pfn) {
-			fprintf(stderr, "readonly restore did not attach the shared CXL PTE leaf\n");
+			fprintf(stderr, "%s restore did not attach the shared CXL PTE leaf\n",
+				policy);
 			return 1;
 		}
 	}
@@ -317,6 +318,12 @@ static int restore_snapshot(uint64_t key, const char *policy)
 			fprintf(stderr, "MoW write did not materialize a local PFN\n");
 			return 1;
 		}
+		if (!strcmp(policy, "mow") &&
+		    (!(after.flags & CXLFORK_INSPECT_F_CURRENT_PMD_VALID) ||
+		     after.current_pmd_pfn == before.shared_leaf_pfn)) {
+			fprintf(stderr, "MoW write did not materialize a local PTE leaf\n");
+			return 1;
+		}
 		if (!strcmp(policy, "moa") &&
 		    (before.current_pfn == before.shared_pfn ||
 		     after.current_pfn != before.current_pfn)) {
@@ -337,6 +344,11 @@ static int restore_snapshot(uint64_t key, const char *policy)
 				policy);
 			return 1;
 		}
+		if (!strcmp(policy, "mow") &&
+		    after_second.current_pmd_pfn != after.current_pmd_pfn) {
+			fprintf(stderr, "MoW repeated write changed PTE leaf again\n");
+			return 1;
+		}
 		if (after_second.observed_page_checksum != before.page_checksum) {
 			fprintf(stderr, "%s repeated write changed the shared checkpoint image\n",
 				policy);
@@ -348,13 +360,16 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       " shared_pfn=%" PRIu64 " before_pfn=%" PRIu64
 	       " after_pfn=%" PRIu64 " second_pfn=%" PRIu64
 	       " shared_leaf_pfn=%" PRIu64 " current_pmd_pfn=%" PRIu64
+	       " after_pmd_pfn=%" PRIu64 " second_pmd_pfn=%" PRIu64
 	       " verify=ok\n",
 	       key, policy, (uint64_t)op.nr_regions, (uint64_t)op.total_pages,
 	       hash, (uint64_t)before.shared_pfn,
 	       (uint64_t)before.current_pfn, (uint64_t)after.current_pfn,
 	       (uint64_t)after_second.current_pfn,
 	       (uint64_t)before.shared_leaf_pfn,
-	       (uint64_t)before.current_pmd_pfn);
+	       (uint64_t)before.current_pmd_pfn,
+	       (uint64_t)after.current_pmd_pfn,
+	       (uint64_t)after_second.current_pmd_pfn);
 	close(fd);
 	return 0;
 }

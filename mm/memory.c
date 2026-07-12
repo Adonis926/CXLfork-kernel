@@ -4989,6 +4989,19 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		vmf->pte = NULL;
 		vmf->flags &= ~FAULT_FLAG_ORIG_PTE_VALID;
 	} else {
+		if (cxlfork_pmd_is_shared_leaf(*vmf->pmd)) {
+			int ret;
+
+			if (!(vmf->flags & (FAULT_FLAG_WRITE | FAULT_FLAG_UNSHARE)))
+				return 0;
+			ret = cxlfork_materialize_shared_leaf_pmd(vmf->vma->vm_mm,
+								  vmf->pmd,
+								  vmf->address);
+			if (ret == -ENOMEM)
+				return VM_FAULT_OOM;
+			if (ret)
+				return VM_FAULT_SIGBUS;
+		}
 		/*
 		 * A regular pmd is established and it can't morph into a huge
 		 * pmd by anon khugepaged, since that takes mmap_lock in write

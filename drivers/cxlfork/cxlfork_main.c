@@ -34,6 +34,7 @@
 #include <linux/user_namespace.h>
 #include <linux/vmalloc.h>
 #include <asm/fsgsbase.h>
+#include <asm/pgalloc.h>
 #include <asm/pgtable.h>
 #include <asm/ptrace.h>
 #include <asm/tlbflush.h>
@@ -203,6 +204,62 @@ void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
 
 	pmd_clear(pmd);
 	flush_tlb_mm_range(mm, start, start + PMD_SIZE, PAGE_SHIFT, true);
+}
+
+int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
+					unsigned long addr)
+{
+	unsigned long start = addr & PMD_MASK;
+	pgtable_t new;
+	spinlock_t *ptl;
+	pmd_t old;
+	phys_addr_t leaf_phys;
+	void *src;
+	void *dst;
+	int ret = 0;
+
+	old = READ_ONCE(*pmd);
+	if (!cxlfork_pmd_is_shared_leaf(old))
+		return 0;
+
+	leaf_phys = (phys_addr_t)pmd_pfn(old) << PAGE_SHIFT;
+	src = cxl_ptr(leaf_phys - cxl_phys);
+	if (!src)
+		return -EFAULT;
+
+	new = pte_alloc_one(mm);
+	if (!new)
+		return -ENOMEM;
+	dst = kmap_local_page(new);
+	memcpy(dst, src, PAGE_SIZE);
+	kunmap_local(dst);
+
+	ptl = pmd_lock(mm, pmd);
+	if (!pmd_same(old, *pmd)) {
+		if (!cxlfork_pmd_is_shared_leaf(*pmd))
+			goto out_unlock;
+		old = *pmd;
+		leaf_phys = (phys_addr_t)pmd_pfn(old) << PAGE_SHIFT;
+		src = cxl_ptr(leaf_phys - cxl_phys);
+		if (!src) {
+			ret = -EFAULT;
+			goto out_unlock;
+		}
+		dst = kmap_local_page(new);
+		memcpy(dst, src, PAGE_SIZE);
+		kunmap_local(dst);
+	}
+	pmd_clear(pmd);
+	smp_wmb();
+	pmd_populate(mm, pmd, new);
+	new = NULL;
+	flush_tlb_mm_range(mm, start, start + PMD_SIZE, PAGE_SHIFT, true);
+
+out_unlock:
+	spin_unlock(ptl);
+	if (new)
+		pte_free(mm, new);
+	return ret;
 }
 
 static u64 slot_offset(u64 slot)
@@ -410,8 +467,9 @@ static u64 cxlfork_make_cxl_pteval(u64 orig_pteval, u64 cxl_offset)
 	/* CXLfork redirects the leaf PTE to the CXL replica and makes it immutable.
 	 * Accessed/Dirty and the remaining protection bits are inherited from the
 	 * checkpointed process page table.
-	 */
+	*/
 	cxl = pte_wrprotect(cxl);
+	cxl = pte_mkspecial(cxl);
 	return pte_val(cxl);
 }
 
@@ -2109,25 +2167,31 @@ static int cxlfork_install_shared_leaf_pmd(struct mm_struct *mm,
 }
 
 static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
-					  struct cxlfork_region_desc *r)
+					  struct cxlfork_region_desc *r,
+					  u64 mapping_flags,
+					  bool writable_vma)
 {
 	/*
-	 * Phase 5a gate: readonly, PMD-aligned, full-PMD regions only.
+	 * Shared leaf gate: PMD-aligned, full-PMD regions only.
 	 * The CPU page walker consumes the CXL PTE page directly. Core-MM
-	 * mutation support is intentionally limited to zap/free safeguards.
+	 * materializes the leaf before software PTE mutation.
 	 */
 	struct cxlfork_mapping *mapping;
 	struct vm_area_struct *vma;
 	unsigned long mapped;
 	unsigned long addr;
+	unsigned long prot = PROT_READ | ((r->prot & PROT_EXEC) ? PROT_EXEC : 0);
+	unsigned long mmap_flags = (writable_vma ? MAP_PRIVATE : MAP_SHARED) |
+		MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
 	int ret = 0;
 
 	if (!IS_ALIGNED(r->start, PMD_SIZE) || !IS_ALIGNED(r->length, PMD_SIZE))
 		return -EOPNOTSUPP;
+	if (writable_vma && (r->prot & PROT_WRITE))
+		prot |= PROT_WRITE;
 
 	mapped = vm_mmap(NULL, r->start, r->length,
-			 PROT_READ | ((r->prot & PROT_EXEC) ? PROT_EXEC : 0),
-			 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
+			 prot, mmap_flags, 0);
 	if (IS_ERR_VALUE(mapped))
 		return (int)mapped;
 	if (mapped != r->start) {
@@ -2142,7 +2206,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	}
 	mapping->key = desc->key;
 	mapping->generation = desc->generation;
-	mapping->flags = CXLFORK_F_MAP_READONLY;
+	mapping->flags = mapping_flags;
 	mapping->holds_slot_reader = true;
 	refcount_set(&mapping->refs, 1);
 	ret = cxlfork_slot_get_reader(mapping->key, mapping->generation);
@@ -2657,11 +2721,20 @@ static int cxlfork_ioctl_restore(struct file *file,
 	for (i = 0; i < desc->nr_regions; i++) {
 		u64 map_start = ktime_get_ns();
 
-		if (private_cow || shared_cow || hybrid_tiering)
+		if (shared_cow) {
+			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i],
+							     CXLFORK_F_SHARED_COW,
+							     true);
+			if (ret == -EOPNOTSUPP)
+				ret = cxlfork_map_region_cow(file, &desc->regions[i],
+							     i, false);
+		} else if (private_cow || hybrid_tiering) {
 			ret = cxlfork_map_region_cow(file, &desc->regions[i], i,
 						     private_cow);
-		else if (readonly) {
-			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i]);
+		} else if (readonly) {
+			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i],
+							     CXLFORK_F_MAP_READONLY,
+							     false);
 			if (ret == -EOPNOTSUPP)
 				ret = cxlfork_map_region(desc, &desc->regions[i],
 							 readonly);
@@ -2786,6 +2859,7 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 	caps.capabilities = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
+		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |

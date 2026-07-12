@@ -8,6 +8,8 @@
 bool cxlfork_pmd_is_shared_leaf(pmd_t pmd);
 void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
 				 unsigned long addr);
+int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
+					unsigned long addr);
 #else
 static inline bool cxlfork_pmd_is_shared_leaf(pmd_t pmd)
 {
@@ -18,6 +20,13 @@ static inline void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm,
 					       pmd_t *pmd,
 					       unsigned long addr)
 {
+}
+
+static inline int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm,
+						      pmd_t *pmd,
+						      unsigned long addr)
+{
+	return 0;
 }
 #endif
 
