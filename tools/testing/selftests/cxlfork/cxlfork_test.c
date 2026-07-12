@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define KSFT_SKIP 4
@@ -36,6 +37,8 @@ static int open_device(void)
 {
 	return open(CXLFORK_DEVICE, O_RDWR | O_CLOEXEC);
 }
+
+static int inspect_missing(int fd, uint64_t key);
 
 static void tap(bool ok, unsigned int nr, const char *name)
 {
@@ -83,7 +86,8 @@ static int run_abi_tests(void)
 	required = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
-		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD;
+		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
+		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
@@ -91,7 +95,6 @@ static int run_abi_tests(void)
 	forbidden = CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
-		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_FULL_PRIVATE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID;
 	ok = !(caps.capabilities & forbidden);
@@ -362,6 +365,163 @@ static int release_snapshot(uint64_t key)
 	return 0;
 }
 
+static int release_with_errno(int fd, uint64_t key, int expected_errno)
+{
+	struct cxlfork_release op = { .key = key };
+	int ret;
+
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_RELEASE, &op);
+	if (expected_errno)
+		return ret == -1 && errno == expected_errno ? 0 : -1;
+	return ret == 0 ? 0 : -1;
+}
+
+static int prepare_existing_range(int fd, uint64_t key, void *addr,
+				  size_t bytes)
+{
+	struct cxlfork_checkpoint op = {
+		.key = key,
+		.scan_start = (uintptr_t)addr,
+		.scan_end = (uintptr_t)addr + bytes,
+	};
+
+	return ioctl(fd, CXLFORK_FORK_PREPARE, &op);
+}
+
+static int inspect_ready(int fd, uint64_t key, uint64_t *generation,
+			 uint32_t *readers)
+{
+	struct cxlfork_inspect_v2 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+
+	if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect))
+		return -1;
+	if (inspect.state != CXLFORK_SLOT_READY || !inspect.generation)
+		return -1;
+	if (generation)
+		*generation = inspect.generation;
+	if (readers)
+		*readers = inspect.reader_count;
+	return 0;
+}
+
+static int hold_restore(uint64_t key, unsigned int seconds)
+{
+	struct cxlfork_restore op = {
+		.key = key,
+		.flags = CXLFORK_F_PRIVATE_COW,
+	};
+	volatile unsigned char *p;
+	int fd;
+
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME hold");
+		close(fd);
+		return 1;
+	}
+	p = (void *)(uintptr_t)op.regions[0].start;
+	(void)*p;
+	sleep(seconds);
+	close(fd);
+	return 0;
+}
+
+static int run_lifecycle_tests(uint64_t key)
+{
+	unsigned char *anon;
+	size_t page = getpagesize();
+	uint64_t generation_before = 0;
+	uint64_t generation_after = 0;
+	uint32_t readers = 0;
+	pid_t child;
+	int status;
+	int fd;
+	int failed = 0;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	anon = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED) {
+		perror("mmap lifecycle");
+		close(fd);
+		return 1;
+	}
+	fill_region(anon, page, key, 0);
+	if (prepare_existing_range(fd, key, anon, page)) {
+		perror("lifecycle prepare");
+		close(fd);
+		return 1;
+	}
+	if (inspect_ready(fd, key, &generation_before, &readers) || readers) {
+		fprintf(stderr, "lifecycle: initial inspect failed\n");
+		failed++;
+	}
+
+	errno = 0;
+	if (prepare_existing_range(fd, key + 16, anon, page) != -1 ||
+	    errno != EEXIST) {
+		fprintf(stderr, "lifecycle: same-slot collision did not EEXIST\n");
+		failed++;
+	}
+	if (inspect_missing(fd, key + 16)) {
+		fprintf(stderr, "lifecycle: collision key became visible\n");
+		failed++;
+	}
+	if (inspect_ready(fd, key, &generation_after, NULL) ||
+	    generation_after != generation_before) {
+		fprintf(stderr, "lifecycle: original generation changed\n");
+		failed++;
+	}
+
+	child = fork();
+	if (child < 0) {
+		perror("fork");
+		close(fd);
+		return 1;
+	}
+	if (!child)
+		_exit(hold_restore(key, 3));
+	sleep(1);
+	if (inspect_ready(fd, key, NULL, &readers) || !readers) {
+		fprintf(stderr, "lifecycle: active restore reader not visible\n");
+		failed++;
+	}
+	if (release_with_errno(fd, key, EBUSY)) {
+		fprintf(stderr, "lifecycle: active release did not EBUSY\n");
+		failed++;
+	}
+	waitpid(child, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+		fprintf(stderr, "lifecycle: child restore failed\n");
+		failed++;
+	}
+	if (release_with_errno(fd, key, 0)) {
+		fprintf(stderr, "lifecycle: release after reader exit failed\n");
+		failed++;
+	}
+	if (inspect_missing(fd, key)) {
+		fprintf(stderr, "lifecycle: release left visible slot\n");
+		failed++;
+	}
+
+	printf("lifecycle key=%" PRIu64 " generation=%" PRIu64
+	       " verify=%s\n", key, generation_before,
+	       failed ? "fail" : "ok");
+	close(fd);
+	return failed ? 1 : 0;
+}
+
 static int inspect_missing(int fd, uint64_t key)
 {
 	struct cxlfork_inspect_v2 inspect = {
@@ -516,13 +676,18 @@ int main(int argc, char **argv)
 		return run_abi_tests();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
-			"inspect KEY [ADDRESS] | release KEY | failures KEY\n",
+			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
+			"lifecycle KEY | hold KEY SECONDS\n",
 			argv[0]);
 		return 2;
 	}
 	key = parse_u64(argv[2]);
+	if (!strcmp(argv[1], "hold") && argc == 4)
+		return hold_restore(key, (unsigned int)parse_u64(argv[3]));
 	if (!strcmp(argv[1], "failures") && argc == 3)
 		return run_failure_tests(key);
+	if (!strcmp(argv[1], "lifecycle") && argc == 3)
+		return run_lifecycle_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)
 		return prepare_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "restore") && argc == 4)

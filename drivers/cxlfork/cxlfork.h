@@ -176,6 +176,9 @@ struct cxlfork_desc {
 	u64 version;
 	u64 key;
 	u64 ready;
+	u64 state;
+	u64 generation;
+	u64 reader_count;
 	u64 slot;
 	u64 nr_regions;
 	u64 nr_ptes;

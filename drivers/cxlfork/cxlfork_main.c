@@ -62,9 +62,14 @@ static struct cdev cxlfork_cdev;
 static void __iomem *cxlfork_cxl;
 static DEFINE_MUTEX(cxlfork_lock);
 
+static int key_to_slot(u64 key);
+static struct cxlfork_desc *slot_desc(u64 slot);
+static const struct vm_operations_struct cxlfork_vm_ops;
+
 struct cxlfork_file_state {
 	/* 每个打开的 /dev/cxlfork fd 保存一次 mmap/restore 的临时上下文。 */
 	u64 mmap_key;
+	u64 mmap_generation;
 	u64 mmap_flags;
 	u64 tiering_hot_stride_pages;
 	u64 pte_image_validate_ns;
@@ -74,11 +79,87 @@ struct cxlfork_file_state {
 struct cxlfork_mapping {
 	/* 绑定到用户 VMA 的状态，fault handler 用它定位 key、region 和 tiering policy。 */
 	u64 key;
+	u64 generation;
 	u64 region_idx;
 	u64 flags;
 	u64 tiering_hot_stride_pages;
+	bool holds_slot_reader;
 	refcount_t refs;
 };
+
+static bool cxlfork_desc_key_ready(const struct cxlfork_desc *desc, u64 key)
+{
+	return desc && READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
+		READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
+		READ_ONCE(desc->key) == key &&
+		READ_ONCE(desc->state) == CXLFORK_SLOT_READY &&
+		READ_ONCE(desc->ready);
+}
+
+static bool cxlfork_desc_generation_matches(const struct cxlfork_desc *desc,
+					    u64 generation)
+{
+	return READ_ONCE(desc->generation) == generation;
+}
+
+static int cxlfork_slot_get_reader_locked(struct cxlfork_desc *desc, u64 key,
+					  u64 generation)
+{
+	u64 readers;
+
+	if (!cxlfork_desc_key_ready(desc, key) ||
+	    !cxlfork_desc_generation_matches(desc, generation))
+		return -ENOENT;
+	do {
+		readers = READ_ONCE(desc->reader_count);
+	} while (cmpxchg(&desc->reader_count, readers, readers + 1) != readers);
+	return 0;
+}
+
+static void cxlfork_slot_put_reader_locked(struct cxlfork_desc *desc, u64 key,
+					   u64 generation)
+{
+	u64 readers;
+
+	if (!cxlfork_desc_key_ready(desc, key) ||
+	    !cxlfork_desc_generation_matches(desc, generation))
+		return;
+	do {
+		readers = READ_ONCE(desc->reader_count);
+		if (!readers)
+			return;
+	} while (cmpxchg(&desc->reader_count, readers, readers - 1) != readers);
+}
+
+static void cxlfork_slot_put_reader(u64 key, u64 generation)
+{
+	struct cxlfork_desc *desc;
+	int slot;
+
+	slot = key_to_slot(key);
+	if (slot < 0)
+		return;
+	mutex_lock(&cxlfork_lock);
+	desc = slot_desc(slot);
+	cxlfork_slot_put_reader_locked(desc, key, generation);
+	mutex_unlock(&cxlfork_lock);
+}
+
+static int cxlfork_slot_get_reader(u64 key, u64 generation)
+{
+	struct cxlfork_desc *desc;
+	int slot;
+	int ret;
+
+	slot = key_to_slot(key);
+	if (slot < 0)
+		return slot;
+	mutex_lock(&cxlfork_lock);
+	desc = slot_desc(slot);
+	ret = cxlfork_slot_get_reader_locked(desc, key, generation);
+	mutex_unlock(&cxlfork_lock);
+	return ret;
+}
 
 static void *cxl_ptr(u64 off)
 {
@@ -1650,12 +1731,23 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	}
 
 	mutex_lock(&cxlfork_lock);
-	memset(desc, 0, sizeof(*desc));
+	if (cmpxchg(&desc->state, (u64)CXLFORK_SLOT_FREE,
+		    (u64)CXLFORK_SLOT_WRITING) != CXLFORK_SLOT_FREE) {
+		ret = -EEXIST;
+		goto out_unlock;
+	}
+	{
+		u64 generation = READ_ONCE(desc->generation) + 1;
+
+	memset_after(desc, 0, reader_count);
 	desc->magic = CXLFORK_DESC_MAGIC;
 	desc->version = CXLFORK_DESC_VERSION;
 	desc->key = op->key;
+	desc->state = CXLFORK_SLOT_WRITING;
+	desc->generation = generation ?: 1;
 	desc->slot = slot;
 	desc->data_offset = slot_offset(slot) + SZ_2M;
+	}
 	data_off = desc->data_offset;
 	start_ns = ktime_get_ns();
 
@@ -1792,7 +1884,8 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 
 		desc->create_ns = ktime_get_ns() - start_ns;
 		smp_wmb();
-		desc->ready = 1;
+		WRITE_ONCE(desc->ready, 1);
+		WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
 		memset(op, 0, sizeof(*op));
 		op->key = desc->key;
 		op->nr_regions = desc->nr_regions;
@@ -1818,8 +1911,12 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	}
 
 out_unlock:
-	if (ret && desc && !desc->ready)
+	if (ret && desc && !desc->ready) {
+		u64 generation = desc->generation;
+
 		memset(desc, 0, sizeof(*desc));
+		desc->generation = generation;
+	}
 	mutex_unlock(&cxlfork_lock);
 out_free:
 	kfree(op);
@@ -1831,6 +1928,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			      bool readonly)
 {
 	/* 非 COW 路径：直接把 CXL 物理页 remap 到目标进程地址。 */
+	struct cxlfork_mapping *mapping;
 	unsigned long addr = r->start;
 	unsigned long mapped;
 	u64 i;
@@ -1850,6 +1948,20 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 		return -EINVAL;
 	}
 
+	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+	if (!mapping)
+		return -ENOMEM;
+	mapping->key = desc->key;
+	mapping->generation = desc->generation;
+	mapping->flags = readonly ? CXLFORK_F_MAP_READONLY : 0;
+	mapping->holds_slot_reader = true;
+	refcount_set(&mapping->refs, 1);
+	ret = cxlfork_slot_get_reader(mapping->key, mapping->generation);
+	if (ret) {
+		kfree(mapping);
+		return ret;
+	}
+
 	addr = r->start;
 	mmap_write_lock(current->mm);
 	for (i = 0; i < r->pages; i++, addr += PAGE_SIZE) {
@@ -1862,6 +1974,9 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			pr_warn("cxlfork: no vma for addr=%lx start=%llx len=%llx\n",
 				addr, r->start, r->length);
 			mmap_write_unlock(current->mm);
+			cxlfork_slot_put_reader(mapping->key,
+						mapping->generation);
+			kfree(mapping);
 			return -EFAULT;
 		}
 		vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
@@ -1871,8 +1986,25 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			pr_warn("cxlfork: remap addr=%lx pfn=%lx ret=%d\n",
 				addr, pfn, ret);
 			mmap_write_unlock(current->mm);
+			cxlfork_slot_put_reader(mapping->key,
+						mapping->generation);
+			kfree(mapping);
 			return ret;
 		}
+	}
+	{
+		struct vm_area_struct *vma = find_vma(current->mm, r->start);
+
+		if (!vma || vma->vm_start != r->start ||
+		    vma->vm_end != r->start + r->length) {
+			mmap_write_unlock(current->mm);
+			cxlfork_slot_put_reader(mapping->key,
+						mapping->generation);
+			kfree(mapping);
+			return -EFAULT;
+		}
+		vma->vm_ops = &cxlfork_vm_ops;
+		vma->vm_private_data = mapping;
 	}
 	mmap_write_unlock(current->mm);
 
@@ -2051,7 +2183,9 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != mapping->key ||
-	    !desc->ready || mapping->region_idx >= desc->nr_regions) {
+	    desc->state != CXLFORK_SLOT_READY ||
+	    desc->generation != mapping->generation || !desc->ready ||
+	    mapping->region_idx >= desc->nr_regions) {
 		mutex_unlock(&cxlfork_lock);
 		return VM_FAULT_SIGBUS;
 	}
@@ -2139,6 +2273,8 @@ static void cxlfork_vma_close(struct vm_area_struct *vma)
 		return;
 	if (!refcount_dec_and_test(&mapping->refs))
 		return;
+	if (mapping->holds_slot_reader)
+		cxlfork_slot_put_reader(mapping->key, mapping->generation);
 	kfree(mapping);
 }
 
@@ -2174,6 +2310,8 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != state->mmap_key ||
+	    desc->state != CXLFORK_SLOT_READY ||
+	    desc->generation != state->mmap_generation ||
 	    !desc->ready || region_idx >= desc->nr_regions) {
 		ret = -ENOENT;
 		goto out_unlock;
@@ -2191,10 +2329,18 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 		goto out_unlock;
 	}
 	mapping->key = state->mmap_key;
+	mapping->generation = state->mmap_generation;
 	mapping->region_idx = region_idx;
 	mapping->flags = state->mmap_flags;
 	mapping->tiering_hot_stride_pages = state->tiering_hot_stride_pages;
 	refcount_set(&mapping->refs, 1);
+	ret = cxlfork_slot_get_reader_locked(desc, mapping->key,
+					     mapping->generation);
+	if (ret) {
+		kfree(mapping);
+		goto out_unlock;
+	}
+	mapping->holds_slot_reader = true;
 
 	if (mapping->flags & CXLFORK_F_SHARED_COW)
 		ret = cxlfork_prefault_shared_cxl(vma, desc, r,
@@ -2202,6 +2348,9 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	else
 		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 	if (ret) {
+		if (mapping->holds_slot_reader)
+			cxlfork_slot_put_reader_locked(desc, mapping->key,
+						       mapping->generation);
 		kfree(mapping);
 		goto out_unlock;
 	}
@@ -2236,6 +2385,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 	u64 pte_attach_pages = 0;
 	u64 pte_image_validate_ns = 0;
 	u64 state_image_validate_ns = 0;
+	u64 generation = 0;
+	bool restore_reader = false;
 	int slot;
 	int ret = 0;
 	int i;
@@ -2262,10 +2413,15 @@ static int cxlfork_ioctl_restore(struct file *file,
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != op->key ||
-	    !desc->ready) {
+	    desc->state != CXLFORK_SLOT_READY || !desc->ready) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
+	generation = desc->generation;
+	ret = cxlfork_slot_get_reader_locked(desc, op->key, generation);
+	if (ret)
+		goto out_unlock;
+	restore_reader = true;
 
 	start_ns = ktime_get_ns();
 	desc->pt_page_image_validate_ns = 0;
@@ -2302,6 +2458,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 		goto out_unlock;
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
 		state->mmap_key = desc->key;
+		state->mmap_generation = generation;
 		state->mmap_flags = op->flags;
 		state->tiering_hot_stride_pages = op->tiering_hot_stride_pages;
 		state->pte_image_validate_ns = 0;
@@ -2326,6 +2483,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 	mutex_lock(&cxlfork_lock);
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
 		state->mmap_key = 0;
+		state->mmap_generation = 0;
 		state->mmap_flags = 0;
 		state->tiering_hot_stride_pages = 0;
 	}
@@ -2333,7 +2491,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 		goto out_unlock;
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != op->key ||
-	    !desc->ready) {
+	    desc->state != CXLFORK_SLOT_READY ||
+	    desc->generation != generation || !desc->ready) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
@@ -2389,6 +2548,9 @@ static int cxlfork_ioctl_restore(struct file *file,
 		ret = -EFAULT;
 
 out_unlock:
+	if (restore_reader && desc && cxlfork_desc_key_ready(desc, op->key) &&
+	    desc->generation == generation)
+		cxlfork_slot_put_reader_locked(desc, op->key, generation);
 	mutex_unlock(&cxlfork_lock);
 out_free:
 	kfree(op);
@@ -2431,7 +2593,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |
-		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD;
+		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
+		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;
@@ -2479,18 +2642,13 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 
 	mutex_lock(&cxlfork_lock);
 	desc = slot_desc(slot);
-	if (!desc || READ_ONCE(desc->magic) != CXLFORK_DESC_MAGIC ||
-	    READ_ONCE(desc->version) != CXLFORK_DESC_VERSION ||
-	    READ_ONCE(desc->key) != key) {
+	if (!cxlfork_desc_key_ready(desc, key)) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	inspect.state = READ_ONCE(desc->ready) ? CXLFORK_SLOT_READY :
-		CXLFORK_SLOT_WRITING;
-	if (inspect.state != CXLFORK_SLOT_READY) {
-		ret = -EAGAIN;
-		goto out_unlock;
-	}
+	inspect.state = READ_ONCE(desc->state);
+	inspect.generation = READ_ONCE(desc->generation);
+	inspect.reader_count = READ_ONCE(desc->reader_count);
 	smp_rmb();
 	if (desc->slot != slot || desc->nr_regions > CXLFORK_MAX_REGIONS ||
 	    desc->nr_ptes > CXLFORK_MAX_PTES ||
@@ -2564,7 +2722,7 @@ static int cxlfork_ioctl_stats(struct cxlfork_stats __user *uarg)
 
 	mutex_lock(&cxlfork_lock);
 	desc = slot_desc(slot);
-	if (!desc || desc->magic != CXLFORK_DESC_MAGIC || desc->key != st.key) {
+	if (!cxlfork_desc_key_ready(desc, st.key)) {
 		mutex_unlock(&cxlfork_lock);
 		return -ENOENT;
 	}
@@ -2597,8 +2755,22 @@ static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
 
 	mutex_lock(&cxlfork_lock);
 	desc = slot_desc(slot);
-	if (desc && desc->magic == CXLFORK_DESC_MAGIC && desc->key == rel.key)
+	if (cxlfork_desc_key_ready(desc, rel.key)) {
+		u64 generation = desc->generation;
+
+		if (cmpxchg(&desc->state, (u64)CXLFORK_SLOT_READY,
+			    (u64)CXLFORK_SLOT_RELEASING) != CXLFORK_SLOT_READY) {
+			mutex_unlock(&cxlfork_lock);
+			return -EBUSY;
+		}
+		if (desc->reader_count) {
+			WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
+			mutex_unlock(&cxlfork_lock);
+			return -EBUSY;
+		}
 		memset(desc, 0, sizeof(*desc));
+		desc->generation = generation;
+	}
 	mutex_unlock(&cxlfork_lock);
 	return 0;
 }
