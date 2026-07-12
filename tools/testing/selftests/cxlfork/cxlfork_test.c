@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/cxlfork.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define KSFT_SKIP 4
@@ -80,7 +82,8 @@ static int run_abi_tests(void)
 
 	required = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
-		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION;
+		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
@@ -88,7 +91,6 @@ static int run_abi_tests(void)
 	forbidden = CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
-		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_FULL_PRIVATE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID;
@@ -360,6 +362,138 @@ static int release_snapshot(uint64_t key)
 	return 0;
 }
 
+static int inspect_missing(int fd, uint64_t key)
+{
+	struct cxlfork_inspect_v2 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	int ret;
+
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_INSPECT_V2, &inspect);
+	return ret == -1 && errno == ENOENT ? 0 : -1;
+}
+
+static int expect_prepare_errno(int fd, struct cxlfork_checkpoint *op,
+				int expected_errno, const char *name)
+{
+	int ret;
+
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_FORK_PREPARE, op);
+	if (ret != -1 || errno != expected_errno) {
+		fprintf(stderr, "%s: expected errno %d got ret=%d errno=%d\n",
+			name, expected_errno, ret, errno);
+		return 1;
+	}
+	if (inspect_missing(fd, op->key)) {
+		fprintf(stderr, "%s: failed prepare left a visible slot\n", name);
+		return 1;
+	}
+	return 0;
+}
+
+static void *sleep_thread(void *arg)
+{
+	(void)arg;
+	sleep(3);
+	return NULL;
+}
+
+static int run_failure_tests(uint64_t key)
+{
+	struct cxlfork_checkpoint op = { 0 };
+	unsigned char *anon;
+	unsigned char *shared;
+	unsigned char *filemap;
+	size_t page = getpagesize();
+	pthread_t thread;
+	char template[] = "/tmp/cxlfork-filemap-XXXXXX";
+	int tmpfd;
+	int fd;
+	int failed = 0;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+
+	anon = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED) {
+		perror("mmap anon");
+		close(fd);
+		return 1;
+	}
+	anon[0] = 0x5a;
+
+	op.key = key++;
+	op.flags = CXLFORK_F_FULL_PRIVATE_STATE;
+	failed += expect_prepare_errno(fd, &op, EOPNOTSUPP,
+				       "FULL_PRIVATE_STATE");
+
+	memset(&op, 0, sizeof(op));
+	op.key = key++;
+	op.scan_start = (uintptr_t)anon;
+	op.scan_end = (uintptr_t)anon + page;
+	if (pthread_create(&thread, NULL, sleep_thread, NULL)) {
+		perror("pthread_create");
+		close(fd);
+		return 1;
+	}
+	failed += expect_prepare_errno(fd, &op, EBUSY, "multithread");
+	pthread_join(thread, NULL);
+
+	shared = mmap((void *)((uintptr_t)TEST_BASE + 2 * page), page,
+		      PROT_READ | PROT_WRITE,
+		      MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (shared == MAP_FAILED) {
+		perror("mmap shared");
+		close(fd);
+		return 1;
+	}
+	shared[0] = 0xa5;
+	memset(&op, 0, sizeof(op));
+	op.key = key++;
+	op.scan_start = (uintptr_t)shared;
+	op.scan_end = (uintptr_t)shared + page;
+	failed += expect_prepare_errno(fd, &op, EOPNOTSUPP,
+				       "shared mapping");
+
+	tmpfd = mkstemp(template);
+	if (tmpfd < 0 || ftruncate(tmpfd, page)) {
+		perror("file setup");
+		close(fd);
+		return 1;
+	}
+	unlink(template);
+	filemap = mmap((void *)((uintptr_t)TEST_BASE + 4 * page), page,
+		       PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_FIXED_NOREPLACE, tmpfd, 0);
+	if (filemap == MAP_FAILED) {
+		perror("mmap file");
+		close(tmpfd);
+		close(fd);
+		return 1;
+	}
+	filemap[0] = 0x3c;
+	memset(&op, 0, sizeof(op));
+	op.key = key++;
+	op.scan_start = (uintptr_t)filemap;
+	op.scan_end = (uintptr_t)filemap + page;
+	failed += expect_prepare_errno(fd, &op, EOPNOTSUPP,
+				       "file mapping");
+	close(tmpfd);
+
+	printf("failure-tests key_base=%" PRIu64 " verify=%s\n",
+	       key - 4, failed ? "fail" : "ok");
+	close(fd);
+	return failed ? 1 : 0;
+}
+
 static uint64_t parse_u64(const char *value)
 {
 	char *end;
@@ -382,10 +516,13 @@ int main(int argc, char **argv)
 		return run_abi_tests();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
-			"inspect KEY [ADDRESS] | release KEY\n", argv[0]);
+			"inspect KEY [ADDRESS] | release KEY | failures KEY\n",
+			argv[0]);
 		return 2;
 	}
 	key = parse_u64(argv[2]);
+	if (!strcmp(argv[1], "failures") && argc == 3)
+		return run_failure_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)
 		return prepare_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "restore") && argc == 4)

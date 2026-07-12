@@ -305,8 +305,8 @@ static u64 cxlfork_make_cxl_pteval(u64 orig_pteval, u64 cxl_offset)
 	return pte_val(cxl);
 }
 
-static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
-				    u64 *pteval)
+static int cxlfork_read_pte_snapshot(struct mm_struct *mm, unsigned long addr,
+				     u64 *pteval, unsigned long *pfn)
 {
 	/* checkpoint 阶段读取源进程叶子 PTE，用于构建 leaf PTE image。 */
 	pgd_t *pgd;
@@ -339,8 +339,16 @@ static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
 		return -EFAULT;
 	}
 	*pteval = pte_val(*ptep);
+	if (pfn)
+		*pfn = pte_pfn(*ptep);
 	pte_unmap_unlock(ptep, ptl);
 	return 0;
+}
+
+static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
+				    u64 *pteval)
+{
+	return cxlfork_read_pte_snapshot(mm, addr, pteval, NULL);
 }
 
 
@@ -888,37 +896,55 @@ static u64 cxlfork_reopen_fd_state(const struct cxlfork_desc *desc)
 	return restored;
 }
 
-static bool checkpoint_vma_allowed(struct vm_area_struct *vma,
-				   const struct cxlfork_checkpoint *op)
+static int cxlfork_checkpoint_vma_supported(struct vm_area_struct *vma,
+					    const struct cxlfork_checkpoint *op)
 {
-	/* 只 checkpoint 普通可读 VMA；IO/hugepage/dontdump 等区域不进入最小闭环。 */
+	/* Phase 2 strict model: private anonymous 4 KiB VMAs only. */
 	if (!(vma->vm_flags & VM_READ))
-		return false;
-	if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_HUGETLB | VM_DONTDUMP))
-		return false;
-	if (op->flags & CXLFORK_F_FULL_PRIVATE_STATE) {
-		if (vma->vm_flags & VM_SHARED)
-			return false;
-	} else if (vma->vm_end <= op->scan_start || vma->vm_start >= op->scan_end) {
-		return false;
-	}
-	return true;
+		return -EOPNOTSUPP;
+	if (vma->vm_file || (vma->vm_flags & VM_SHARED))
+		return -EOPNOTSUPP;
+	if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_HUGETLB | VM_DONTDUMP |
+			     VM_DONTCOPY | VM_MIXEDMAP | VM_UFFD_MISSING |
+			     VM_UFFD_WP))
+		return -EOPNOTSUPP;
+	return 0;
 }
 
 static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 				    struct vm_area_struct *vma,
 				    struct cxlfork_region_desc *r,
-				    struct cxlfork_desc *desc)
+				    struct cxlfork_desc *desc,
+				    struct mm_struct *mm,
+				    u64 *orig_pteval)
 {
-	/* 把源进程一页复制到 CXL slot，同时统计 anon/clean file/dirty file 页类型。 */
+	/* Copy one page only if its PTE/PFN stays stable across the copy. */
 	struct page *page = NULL;
+	unsigned long pfn_before;
+	unsigned long pfn_after;
+	u64 pte_before;
+	u64 pte_after;
 	void *src;
 	void *dst;
 	int ret;
 
+	ret = cxlfork_read_pte_snapshot(mm, addr, &pte_before, &pfn_before);
+	if (ret)
+		return ret;
+	if (!pte_present(__pte(pte_before)))
+		return -EFAULT;
+
 	ret = get_user_pages_fast(addr, 1, 0, &page);
 	if (ret != 1)
 		return -EFAULT;
+	if (!PageAnon(page) || page_maybe_dma_pinned(page)) {
+		put_page(page);
+		return -EOPNOTSUPP;
+	}
+	if (page_to_pfn(page) != pfn_before) {
+		put_page(page);
+		return -EBUSY;
+	}
 
 	dst = cxl_ptr(cxl_off);
 	if (!dst) {
@@ -926,22 +952,24 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 		return -ENOSPC;
 	}
 
-	if (vma->vm_file && !PageAnon(page)) {
-		if (PageDirty(page)) {
-			r->dirty_file_pages++;
-			desc->dirty_file_pages++;
-		} else {
-			r->clean_file_pages++;
-			desc->clean_file_pages++;
-		}
-	} else {
-		r->anon_pages++;
-		desc->anon_pages++;
-	}
-
 	src = kmap_local_page(page);
 	memcpy(dst, src, PAGE_SIZE);
 	kunmap_local(src);
+
+	ret = cxlfork_read_pte_snapshot(mm, addr, &pte_after, &pfn_after);
+	if (ret) {
+		put_page(page);
+		return ret;
+	}
+	if (pte_after != pte_before || pfn_after != pfn_before ||
+	    page_to_pfn(page) != pfn_after) {
+		put_page(page);
+		return -EBUSY;
+	}
+
+	r->anon_pages++;
+	desc->anon_pages++;
+	*orig_pteval = pte_before;
 	put_page(page);
 	return 0;
 }
@@ -1602,6 +1630,14 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		ret = -EINVAL;
 		goto out_free;
 	}
+	if (op->flags & CXLFORK_F_FULL_PRIVATE_STATE) {
+		ret = -EOPNOTSUPP;
+		goto out_free;
+	}
+	if (get_nr_threads(current) != 1) {
+		ret = -EBUSY;
+		goto out_free;
+	}
 
 	ret = key_to_slot(op->key);
 	if (ret < 0)
@@ -1649,17 +1685,14 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		unsigned long scan_start = op->scan_start;
 		unsigned long scan_end = op->scan_end;
 
-		if (op->flags & CXLFORK_F_FULL_PRIVATE_STATE) {
-			scan_start = 0;
-			scan_end = TASK_SIZE;
-		}
 		VMA_ITERATOR(vmi, mm, scan_start);
 		for_each_vma_range(vmi, vma, scan_end) {
 		unsigned long addr, start, end;
 		struct cxlfork_region_desc *r;
 
-		if (!checkpoint_vma_allowed(vma, op))
-			continue;
+		ret = cxlfork_checkpoint_vma_supported(vma, op);
+		if (ret)
+			break;
 		if (desc->nr_regions >= CXLFORK_MAX_REGIONS) {
 			ret = -ENOSPC;
 			break;
@@ -1690,18 +1723,17 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 				ret = -ENOSPC;
 				break;
 			}
-			ret = cxlfork_copy_page_to_cxl(addr, data_off, vma, r, desc);
-			if (ret)
-				break;
-
-			pte = &desc->ptes[desc->nr_ptes++];
+			pte = &desc->ptes[desc->nr_ptes];
 			pte->va = addr;
 			pte->cxl_offset = data_off;
-			ret = cxlfork_read_orig_pteval(mm, addr, &pte->orig_pteval);
+			ret = cxlfork_copy_page_to_cxl(addr, data_off, vma, r,
+						       desc, mm,
+						       &pte->orig_pteval);
 			if (ret)
 				break;
 			pte->cxl_pteval = cxlfork_make_cxl_pteval(pte->orig_pteval,
 								 pte->cxl_offset);
+			desc->nr_ptes++;
 			data_off += PAGE_SIZE;
 			r->pages++;
 			desc->total_pages++;
@@ -1786,6 +1818,8 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	}
 
 out_unlock:
+	if (ret && desc && !desc->ready)
+		memset(desc, 0, sizeof(*desc));
 	mutex_unlock(&cxlfork_lock);
 out_free:
 	kfree(op);
@@ -2396,7 +2430,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_MOW_DATA_COW |
-		CXLFORK_CAP_MOA_DATA_COPY;
+		CXLFORK_CAP_MOA_DATA_COPY |
+		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;
