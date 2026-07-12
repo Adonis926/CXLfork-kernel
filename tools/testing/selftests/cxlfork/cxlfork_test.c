@@ -250,6 +250,7 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		.key = key,
 	};
 	struct cxlfork_inspect_v2 after;
+	struct cxlfork_inspect_v2 after_second;
 	uint64_t hash;
 	unsigned char *first;
 	int fd;
@@ -284,6 +285,7 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		return 1;
 	}
 	after = before;
+	after_second = before;
 	if (strcmp(policy, "readonly")) {
 		first = (void *)(uintptr_t)op.regions[0].start;
 		first[0] ^= 0x5a;
@@ -292,6 +294,11 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		after.reserved0 = 0;
 		if (ioctl(fd, CXLFORK_INSPECT_V2, &after)) {
 			perror("INSPECT after write");
+			return 1;
+		}
+		if (after.observed_page_checksum != before.page_checksum) {
+			fprintf(stderr, "%s write changed the shared checkpoint image\n",
+				policy);
 			return 1;
 		}
 		if (!strcmp(policy, "mow") &&
@@ -306,14 +313,87 @@ static int restore_snapshot(uint64_t key, const char *policy)
 			fprintf(stderr, "MoA did not retain its first-access local PFN\n");
 			return 1;
 		}
+		first[0] ^= 0xa5;
+		after_second = before;
+		after_second.size = sizeof(after_second);
+		after_second.abi_version = CXLFORK_ABI_VERSION_V2;
+		after_second.reserved0 = 0;
+		if (ioctl(fd, CXLFORK_INSPECT_V2, &after_second)) {
+			perror("INSPECT after second write");
+			return 1;
+		}
+		if (after_second.current_pfn != after.current_pfn) {
+			fprintf(stderr, "%s repeated write changed PFN again\n",
+				policy);
+			return 1;
+		}
+		if (after_second.observed_page_checksum != before.page_checksum) {
+			fprintf(stderr, "%s repeated write changed the shared checkpoint image\n",
+				policy);
+			return 1;
+		}
 	}
 	printf("restore key=%" PRIu64 " policy=%s regions=%" PRIu64
 	       " pages=%" PRIu64 " checksum=%" PRIu64
 	       " shared_pfn=%" PRIu64 " before_pfn=%" PRIu64
-	       " after_pfn=%" PRIu64 " verify=ok\n",
+	       " after_pfn=%" PRIu64 " second_pfn=%" PRIu64
+	       " verify=ok\n",
 	       key, policy, (uint64_t)op.nr_regions, (uint64_t)op.total_pages,
 	       hash, (uint64_t)before.shared_pfn,
-	       (uint64_t)before.current_pfn, (uint64_t)after.current_pfn);
+	       (uint64_t)before.current_pfn, (uint64_t)after.current_pfn,
+	       (uint64_t)after_second.current_pfn);
+	close(fd);
+	return 0;
+}
+
+static int restore_conflict(uint64_t key, const char *policy)
+{
+	struct cxlfork_restore op = { .key = key };
+	unsigned char *guard;
+	size_t page = getpagesize();
+	int fd;
+	int ret;
+
+	if (!strcmp(policy, "mow"))
+		op.flags = CXLFORK_F_SHARED_COW;
+	else if (!strcmp(policy, "moa"))
+		op.flags = CXLFORK_F_PRIVATE_COW;
+	else if (!strcmp(policy, "readonly"))
+		op.flags = CXLFORK_F_MAP_READONLY;
+	else {
+		fprintf(stderr, "unknown policy: %s\n", policy);
+		return 2;
+	}
+
+	guard = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (guard == MAP_FAILED) {
+		perror("mmap conflict guard");
+		return 1;
+	}
+	guard[0] = 0x7e;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_FORK_RESUME, &op);
+	if (ret != -1 || errno != EEXIST) {
+		fprintf(stderr, "conflict restore: expected EEXIST got ret=%d errno=%d\n",
+			ret, errno);
+		close(fd);
+		return 1;
+	}
+	if (guard[0] != 0x7e) {
+		fprintf(stderr, "conflict restore replaced the existing mapping\n");
+		close(fd);
+		return 1;
+	}
+
+	printf("conflict key=%" PRIu64 " policy=%s errno=%d guard=ok verify=ok\n",
+	       key, policy, EEXIST);
 	close(fd);
 	return 0;
 }
@@ -490,8 +570,10 @@ static int run_lifecycle_tests(uint64_t key)
 		close(fd);
 		return 1;
 	}
-	if (!child)
+	if (!child) {
+		munmap(anon, page);
 		_exit(hold_restore(key, 3));
+	}
 	sleep(1);
 	if (inspect_ready(fd, key, NULL, &readers) || !readers) {
 		fprintf(stderr, "lifecycle: active restore reader not visible\n");
@@ -677,7 +759,7 @@ int main(int argc, char **argv)
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
-			"lifecycle KEY | hold KEY SECONDS\n",
+			"lifecycle KEY | hold KEY SECONDS | conflict KEY POLICY\n",
 			argv[0]);
 		return 2;
 	}
@@ -692,6 +774,8 @@ int main(int argc, char **argv)
 		return prepare_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "restore") && argc == 4)
 		return restore_snapshot(key, argv[3]);
+	if (!strcmp(argv[1], "conflict") && argc == 4)
+		return restore_conflict(key, argv[3]);
 	if (!strcmp(argv[1], "inspect") && (argc == 3 || argc == 4))
 		return inspect_snapshot(key, argc == 4 ? parse_u64(argv[3]) : 0);
 	if (!strcmp(argv[1], "release") && argc == 3)

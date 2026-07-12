@@ -1938,8 +1938,9 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			 PROT_READ | ((r->prot & PROT_EXEC) ? PROT_EXEC : 0),
 			 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
 	if (IS_ERR_VALUE(mapped)) {
-		pr_warn("cxlfork: vm_mmap start=%llx len=%llx ret=%ld\n",
-			r->start, r->length, mapped);
+		if (mapped != -EEXIST)
+			pr_warn("cxlfork: vm_mmap start=%llx len=%llx ret=%ld\n",
+				r->start, r->length, mapped);
 		return (int)mapped;
 	}
 	if (mapped != r->start) {
@@ -2025,17 +2026,10 @@ static int cxlfork_map_region_cow(struct file *file,
 			 flags,
 			 (region_idx * CXLFORK_REGION_PGOFF_STEP) << PAGE_SHIFT);
 	if (IS_ERR_VALUE(mapped)) {
-		flags &= ~MAP_FIXED_NOREPLACE;
-		flags |= MAP_FIXED;
-		mapped = vm_mmap(file, r->start, r->length,
-				 PROT_READ | ((r->prot & PROT_WRITE) ? PROT_WRITE : 0),
-				 flags,
-				 (region_idx * CXLFORK_REGION_PGOFF_STEP) << PAGE_SHIFT);
-		if (IS_ERR_VALUE(mapped)) {
+		if (mapped != -EEXIST)
 			pr_warn("cxlfork: cow vm_mmap start=%llx len=%llx ret=%ld\n",
 				r->start, r->length, mapped);
-			return (int)mapped;
-		}
+		return (int)mapped;
 	}
 	if (mapped != r->start)
 		return -EINVAL;
