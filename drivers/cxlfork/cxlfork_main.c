@@ -75,6 +75,7 @@ static DEFINE_MUTEX(cxlfork_lock);
 
 static int key_to_slot(u64 key);
 static struct cxlfork_desc *slot_desc(u64 slot);
+static const struct file_operations cxlfork_fops;
 static const struct vm_operations_struct cxlfork_vm_ops;
 static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
 					unsigned long addr,
@@ -853,7 +854,7 @@ static void cxlfork_capture_mm_state(struct cxlfork_mm_state *st,
 	memcpy(st->comm, current->comm, sizeof(st->comm));
 }
 
-static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
+static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
 {
 	/* 遍历当前进程打开的 fd，记录 path/pos/flag；这是跨 OS 重开 fd 的模拟成本来源。 */
 	struct file *files[CXLFORK_MAX_FDS];
@@ -868,7 +869,7 @@ static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 	memset(files, 0, sizeof(files));
 
 	if (!files_struct)
-		return;
+		return 0;
 
 	spin_lock(&files_struct->file_lock);
 	fdt = files_fdtable(files_struct);
@@ -876,8 +877,12 @@ static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 		struct file *file;
 		u64 idx;
 
+		if (i < 3)
+			continue;
 		file = rcu_dereference_check_fdtable(files_struct, fdt->fd[i]);
 		if (!file)
+			continue;
+		if (file->f_op == &cxlfork_fops)
 			continue;
 		get_file(file);
 		idx = desc->nr_fds++;
@@ -891,10 +896,25 @@ static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 		struct cxlfork_fd_state *st = &desc->fds[i];
 		struct file *file = files[i];
 		struct inode *inode = file_inode(file);
+		umode_t mode = inode ? inode->i_mode : 0;
 
 		st->fd = fds[i];
 		st->flags = file->f_flags;
 		st->pos = file->f_pos;
+		if (!inode || !S_ISREG(mode)) {
+			if (strict) {
+				while (i < desc->nr_fds)
+					fput(files[i++]);
+				if (path_buf)
+					free_page((unsigned long)path_buf);
+				desc->nr_fds = 0;
+				memset(desc->fds, 0, sizeof(desc->fds));
+				return -EOPNOTSUPP;
+			}
+			fput(file);
+			memset(st, 0, sizeof(*st));
+			continue;
+		}
 		if (inode) {
 			st->inode = inode->i_ino;
 			st->dev = inode->i_sb ? inode->i_sb->s_dev : 0;
@@ -909,6 +929,7 @@ static void cxlfork_capture_fd_state(struct cxlfork_desc *desc)
 	}
 	if (path_buf)
 		free_page((unsigned long)path_buf);
+	return 0;
 }
 
 static void cxlfork_path_to_state(const struct path *path, u8 *dst, size_t len)
@@ -1233,37 +1254,53 @@ static void cxlfork_apply_global_state(const struct cxlfork_desc *desc)
 	current->sas_ss_flags = st->sas_ss_flags;
 }
 
-static u64 cxlfork_reopen_fd_state(const struct cxlfork_desc *desc)
+static int cxlfork_reopen_fd_state(const struct cxlfork_desc *desc,
+				   u64 *restored)
 {
-	/* 按记录的 path/flags 重新打开 fd；无法打开的 fd 会被跳过并体现在计数中。 */
-	u64 restored = 0;
+	/* 严格恢复普通文件 fd：原 fd number、offset、flags 和 inode/dev 必须匹配。 */
 	u64 i;
 
+	*restored = 0;
 	for (i = 0; i < desc->nr_fds; i++) {
 		const struct cxlfork_fd_state *st = &desc->fds[i];
 		struct file *file;
+		struct inode *inode;
 		int fd;
 		int flags;
+		int ret;
 
 		if (!st->path[0] || st->path[0] != '/')
-			continue;
+			return -EILSEQ;
+		if (st->fd < 3)
+			return -EOPNOTSUPP;
 
 		flags = st->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK | O_LARGEFILE);
 		file = filp_open((const char *)st->path, flags, 0);
 		if (IS_ERR(file))
-			continue;
-		if (st->pos)
-			(void)vfs_llseek(file, st->pos, SEEK_SET);
-
-		fd = get_unused_fd_flags(st->flags & O_CLOEXEC);
-		if (fd >= 0) {
-			fd_install(fd, file);
-			restored++;
-		} else {
+			return PTR_ERR(file);
+		inode = file_inode(file);
+		if (!inode || !S_ISREG(inode->i_mode) ||
+		    inode->i_ino != st->inode ||
+		    (inode->i_sb ? inode->i_sb->s_dev : 0) != st->dev) {
 			fput(file);
+			return -ESTALE;
 		}
+		if (st->pos)
+			if (vfs_llseek(file, st->pos, SEEK_SET) < 0) {
+				fput(file);
+				return -EINVAL;
+			}
+
+		fd = st->fd;
+		ret = replace_fd(fd, file, st->flags & O_CLOEXEC);
+		if (ret < 0) {
+			fput(file);
+			return ret;
+		}
+		fput(file);
+		(*restored)++;
 	}
-	return restored;
+	return 0;
 }
 
 static int cxlfork_checkpoint_vma_supported(struct vm_area_struct *vma,
@@ -2058,7 +2095,10 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		u64 global_start = ktime_get_ns();
 
 		cxlfork_capture_global_state(desc);
-		cxlfork_capture_fd_state(desc);
+		ret = cxlfork_capture_fd_state(desc,
+					       op->flags & CXLFORK_F_REOPEN_FDS);
+		if (ret)
+			goto out_mmap_unlock;
 		desc->global_checkpoint_ns = ktime_get_ns() - global_start;
 		desc->global_detach_ns = desc->global_checkpoint_ns;
 	}
@@ -2123,6 +2163,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 			break;
 		}
 	}
+out_mmap_unlock:
 	mmap_read_unlock(mm);
 	mmput(mm);
 
@@ -3016,8 +3057,11 @@ static int cxlfork_ioctl_restore(struct file *file,
 
 		if (apply_global_state)
 			cxlfork_apply_global_state(desc);
-		if (reopen_fds)
-			nr_fds_restored = cxlfork_reopen_fd_state(desc);
+		if (reopen_fds) {
+			ret = cxlfork_reopen_fd_state(desc, &nr_fds_restored);
+			if (ret)
+				goto out_unlock;
+		}
 		global_restore_ns = ktime_get_ns() - global_start;
 		desc->global_attach_ns = global_restore_ns;
 	}
@@ -3117,7 +3161,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_MOA_DATA_COPY |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
-		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME;
+		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
+		CXLFORK_CAP_GLOBAL_FILE_STATE;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;

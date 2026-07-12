@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <linux/cxlfork.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -93,7 +94,8 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
-		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME;
+		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
+		CXLFORK_CAP_GLOBAL_FILE_STATE;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
@@ -331,6 +333,169 @@ static int restore_threadctx_snapshot(uint64_t key, const char *policy)
 	}
 	fprintf(stderr, "threadctx restore returned without jumping to saved IP\n");
 	return 1;
+}
+
+static int prepare_fdglobal_snapshot(uint64_t key, size_t bytes)
+{
+	struct cxlfork_checkpoint op = { 0 };
+	unsigned char *first;
+	size_t page = getpagesize();
+	char path[128];
+	sigset_t set;
+	int filefd;
+	int fd;
+
+	bytes = (bytes + page - 1) & ~(page - 1);
+	if (bytes < page)
+		bytes = page;
+	first = mmap(TEST_BASE, bytes, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (first == MAP_FAILED) {
+		perror("mmap fdglobal data");
+		return 1;
+	}
+	fill_region(first, bytes, key, 9);
+
+	snprintf(path, sizeof(path), "/tmp/cxlfork-fdglobal-%" PRIu64, key);
+	filefd = open(path, O_CREAT | O_TRUNC | O_RDWR | O_APPEND, 0600);
+	if (filefd < 0) {
+		perror("open fdglobal file");
+		return 1;
+	}
+	if (write(filefd, "cxlfork-fd-global\n", 18) != 18 ||
+	    lseek(filefd, 11, SEEK_SET) != 11) {
+		perror("setup fdglobal file");
+		return 1;
+	}
+	if (filefd != 7) {
+		if (dup2(filefd, 7) != 7) {
+			perror("dup2 fdglobal file");
+			return 1;
+		}
+		close(filefd);
+		filefd = 7;
+	}
+	if (chdir("/tmp")) {
+		perror("chdir /tmp");
+		return 1;
+	}
+	umask(0027);
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	if (sigprocmask(SIG_BLOCK, &set, NULL)) {
+		perror("sigprocmask block");
+		return 1;
+	}
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	op.key = key;
+	op.scan_start = (uintptr_t)TEST_BASE;
+	op.scan_end = (uintptr_t)TEST_BASE + bytes;
+	op.flags = CXLFORK_F_REOPEN_FDS;
+	if (ioctl(fd, CXLFORK_FORK_PREPARE, &op)) {
+		perror("FORK_PREPARE fdglobal");
+		return 1;
+	}
+	printf("fdglobal-prepare key=%" PRIu64 " fd=7 pos=11 flags=append"
+	       " cwd=/tmp umask=027 sigusr1=blocked fds=%" PRIu64
+	       " verify=ok\n",
+	       key, (uint64_t)op.nr_fds);
+	close(fd);
+	close(filefd);
+	return 0;
+}
+
+static int restore_fdglobal_snapshot(uint64_t key, const char *policy)
+{
+	struct cxlfork_restore op = { .key = key };
+	char cwd[256];
+	sigset_t set;
+	mode_t old_umask;
+	int flags;
+	int devnull;
+	int fd;
+	int failed = 0;
+
+	if (!strcmp(policy, "readonly"))
+		op.flags = CXLFORK_F_MAP_READONLY;
+	else if (!strcmp(policy, "mow"))
+		op.flags = CXLFORK_F_SHARED_COW;
+	else if (!strcmp(policy, "moa"))
+		op.flags = CXLFORK_F_PRIVATE_COW;
+	else {
+		fprintf(stderr, "unknown policy: %s\n", policy);
+		return 2;
+	}
+	op.flags |= CXLFORK_F_REOPEN_FDS | CXLFORK_F_APPLY_GLOBAL_STATE;
+
+	devnull = open("/dev/null", O_RDONLY);
+	if (devnull < 0 || dup2(devnull, 7) != 7) {
+		perror("setup conflicting fd 7");
+		return 1;
+	}
+	close(devnull);
+	if (chdir("/")) {
+		perror("chdir /");
+		return 1;
+	}
+	umask(0002);
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	if (sigprocmask(SIG_UNBLOCK, &set, NULL)) {
+		perror("sigprocmask unblock");
+		return 1;
+	}
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME fdglobal");
+		return 1;
+	}
+	if (op.nr_fds != 1 || op.nr_fds_restored != 1) {
+		fprintf(stderr, "fdglobal: expected one restored fd, got nr=%"
+			PRIu64 " restored=%" PRIu64 "\n",
+			(uint64_t)op.nr_fds, (uint64_t)op.nr_fds_restored);
+		failed++;
+	}
+	if (lseek(7, 0, SEEK_CUR) != 11) {
+		perror("fdglobal restored offset");
+		failed++;
+	}
+	flags = fcntl(7, F_GETFL);
+	if (flags < 0 || !(flags & O_APPEND)) {
+		fprintf(stderr, "fdglobal: O_APPEND not restored\n");
+		failed++;
+	}
+	if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, "/tmp")) {
+		fprintf(stderr, "fdglobal: cwd not restored, got %s\n",
+			cwd[0] ? cwd : "<none>");
+		failed++;
+	}
+	old_umask = umask(0002);
+	umask(old_umask);
+	if (old_umask != 0027) {
+		fprintf(stderr, "fdglobal: umask not restored, got %03o\n",
+			old_umask);
+		failed++;
+	}
+	if (sigprocmask(SIG_SETMASK, NULL, &set) ||
+	    !sigismember(&set, SIGUSR1)) {
+		fprintf(stderr, "fdglobal: SIGUSR1 mask not restored\n");
+		failed++;
+	}
+	printf("fdglobal-restore key=%" PRIu64 " policy=%s fd=7 pos=11"
+	       " flags=append cwd=/tmp umask=027 sigusr1=blocked verify=%s\n",
+	       key, policy, failed ? "fail" : "ok");
+	close(fd);
+	return failed ? 1 : 0;
 }
 
 static uint64_t hash_restored_regions(const struct cxlfork_restore *op)
@@ -807,6 +972,7 @@ static int run_failure_tests(uint64_t key)
 	size_t page = getpagesize();
 	pthread_t thread;
 	char template[] = "/tmp/cxlfork-filemap-XXXXXX";
+	int pipefd[2] = { -1, -1 };
 	int tmpfd;
 	int fd;
 	int failed = 0;
@@ -884,8 +1050,23 @@ static int run_failure_tests(uint64_t key)
 				       "file mapping");
 	close(tmpfd);
 
+	if (pipe(pipefd)) {
+		perror("pipe");
+		close(fd);
+		return 1;
+	}
+	memset(&op, 0, sizeof(op));
+	op.key = key++;
+	op.flags = CXLFORK_F_REOPEN_FDS;
+	op.scan_start = (uintptr_t)anon;
+	op.scan_end = (uintptr_t)anon + page;
+	failed += expect_prepare_errno(fd, &op, EOPNOTSUPP,
+				       "strict fd pipe");
+	close(pipefd[0]);
+	close(pipefd[1]);
+
 	printf("failure-tests key_base=%" PRIu64 " verify=%s\n",
-	       key - 4, failed ? "fail" : "ok");
+	       key - 5, failed ? "fail" : "ok");
 	close(fd);
 	return failed ? 1 : 0;
 }
@@ -913,6 +1094,7 @@ int main(int argc, char **argv)
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
 			"threadctx-prepare KEY BYTES | threadctx-restore KEY POLICY | "
+			"fdglobal-prepare KEY BYTES | fdglobal-restore KEY POLICY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | conflict KEY POLICY\n",
 			argv[0]);
@@ -931,6 +1113,10 @@ int main(int argc, char **argv)
 		return prepare_threadctx_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "threadctx-restore") && argc == 4)
 		return restore_threadctx_snapshot(key, argv[3]);
+	if (!strcmp(argv[1], "fdglobal-prepare") && argc == 4)
+		return prepare_fdglobal_snapshot(key, parse_u64(argv[3]));
+	if (!strcmp(argv[1], "fdglobal-restore") && argc == 4)
+		return restore_fdglobal_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "restore") && argc == 4)
 		return restore_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "conflict") && argc == 4)
