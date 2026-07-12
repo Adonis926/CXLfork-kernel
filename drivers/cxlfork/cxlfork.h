@@ -186,6 +186,12 @@ struct cxlfork_desc {
 	u64 data_offset;
 	u64 create_ns;
 	u64 faults;
+	u64 image_bytes;
+	u64 page_checksum;
+	u64 leaf_checksum;
+	u64 shared_map_pages;
+	u64 local_copy_pages;
+	u64 leaf_copy_pages;
 	u64 nr_fds;
 	u64 global_checkpoint_ns;
 	u64 pte_image_offset;

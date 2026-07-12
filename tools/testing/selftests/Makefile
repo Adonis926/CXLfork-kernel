@@ -12,6 +12,7 @@ TARGETS += connector
 TARGETS += core
 TARGETS += cpufreq
 TARGETS += cpu-hotplug
+TARGETS += cxlfork
 TARGETS += damon
 TARGETS += dmabuf-heaps
 TARGETS += drivers/dma-buf

@@ -16,6 +16,7 @@
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/nsproxy.h>
+#include <linux/overflow.h>
 #include <linux/pid_namespace.h>
 #include <linux/pfn_t.h>
 #include <linux/personality.h>
@@ -113,6 +114,84 @@ static int key_to_slot(u64 key)
 	if (off + CXLFORK_SLOT_BYTES > cxl_size)
 		return -ENOSPC;
 	return slot;
+}
+
+#define CXLFORK_CHECKSUM_SEED 1469598103934665603ULL
+#define CXLFORK_CHECKSUM_PRIME 1099511628211ULL
+
+static bool cxlfork_slot_range_valid(const struct cxlfork_desc *desc,
+				     u64 off, u64 bytes)
+{
+	u64 start;
+	u64 end;
+
+	if (!desc || desc->slot >= CXLFORK_MAX_SLOTS || !bytes)
+		return false;
+	start = slot_offset(desc->slot);
+	end = start + CXLFORK_SLOT_BYTES;
+	if (off < start || off >= end || bytes > end - off)
+		return false;
+	return cxl_range_valid(off, bytes);
+}
+
+static u64 cxlfork_checksum_bytes(u64 checksum, const void *data, u64 bytes)
+{
+	const u8 *p = data;
+	u64 i;
+
+	for (i = 0; i < bytes; i++) {
+		checksum ^= READ_ONCE(p[i]);
+		checksum *= CXLFORK_CHECKSUM_PRIME;
+	}
+	return checksum;
+}
+
+static int cxlfork_compute_checksums(const struct cxlfork_desc *desc,
+				     u64 *page_checksum,
+				     u64 *leaf_checksum)
+{
+	u64 page_hash = CXLFORK_CHECKSUM_SEED;
+	u64 leaf_hash = CXLFORK_CHECKSUM_SEED;
+	u64 leaf_bytes;
+	u64 i;
+
+	if (!desc || desc->slot >= CXLFORK_MAX_SLOTS ||
+	    desc->nr_regions > CXLFORK_MAX_REGIONS ||
+	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	    desc->total_pages != desc->nr_ptes)
+		return -EILSEQ;
+
+	for (i = 0; i < desc->nr_ptes; i++) {
+		const struct cxlfork_pte_desc *pte = &desc->ptes[i];
+		void *page;
+
+		if (!IS_ALIGNED(pte->va, PAGE_SIZE) ||
+		    !IS_ALIGNED(pte->cxl_offset, PAGE_SIZE) ||
+		    !cxlfork_slot_range_valid(desc, pte->cxl_offset, PAGE_SIZE))
+			return -EILSEQ;
+		page = cxl_ptr(pte->cxl_offset);
+		if (!page)
+			return -EILSEQ;
+		page_hash = cxlfork_checksum_bytes(page_hash, page, PAGE_SIZE);
+	}
+
+	if (desc->nr_ptes) {
+		if (desc->pte_image_entries != desc->nr_ptes)
+			return -EILSEQ;
+		if (check_mul_overflow(desc->pte_image_entries,
+				       (u64)sizeof(struct cxlfork_leaf_pte_image),
+				       &leaf_bytes) ||
+		    !cxlfork_slot_range_valid(desc, desc->pte_image_offset,
+					      leaf_bytes))
+			return -EILSEQ;
+		leaf_hash = cxlfork_checksum_bytes(leaf_hash,
+					     cxl_ptr(desc->pte_image_offset),
+					     leaf_bytes);
+	}
+
+	*page_checksum = desc->nr_ptes ? page_hash : 0;
+	*leaf_checksum = desc->nr_ptes ? leaf_hash : 0;
+	return 0;
 }
 
 static pgprot_t prot_from_uapi(u64 prot, bool readonly)
@@ -1620,6 +1699,11 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 			cxlfork_patch_state_image_rebase_offset(desc);
 		desc->private_rebase_ns = ktime_get_ns() - rebase_start;
 	}
+	if (!ret) {
+		desc->image_bytes = data_off - slot_offset(slot);
+		ret = cxlfork_compute_checksums(desc, &desc->page_checksum,
+						&desc->leaf_checksum);
+	}
 
 	if (!ret) {
 		int i;
@@ -1847,6 +1931,7 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 		if (ret)
 			return ret;
 		desc->direct_pte_install_pages += run_pages;
+		desc->shared_map_pages += run_pages;
 		i += run_pages;
 	}
 	desc->direct_pte_install_ns += ktime_get_ns() - install_start;
@@ -1912,8 +1997,10 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 		vm_fault_t ret;
 
 		ret = cxlfork_insert_shared_cxl(vmf, pte, addr);
-		if (!(ret & VM_FAULT_ERROR))
+		if (!(ret & VM_FAULT_ERROR)) {
 			desc->faults++;
+			desc->shared_map_pages++;
+		}
 		mutex_unlock(&cxlfork_lock);
 		return ret;
 	}
@@ -1935,6 +2022,7 @@ copy_local:
 	kunmap_local(dst);
 	flush_dcache_page(page);
 	desc->faults++;
+	desc->local_copy_pages++;
 	mutex_unlock(&cxlfork_lock);
 
 	{
@@ -2218,6 +2306,159 @@ out_free:
 	return ret;
 }
 
+static int cxlfork_check_v2_header(const void __user *uarg, size_t min_size)
+{
+	const struct cxlfork_v2_header __user *header = uarg;
+	u32 size;
+	u16 version;
+	u16 reserved;
+
+	if (get_user(size, &header->size) ||
+	    get_user(version, &header->abi_version) ||
+	    get_user(reserved, &header->reserved))
+		return -EFAULT;
+	if (size < min_size)
+		return -EINVAL;
+	if (version != CXLFORK_ABI_VERSION_V2)
+		return -EPROTONOSUPPORT;
+	if (reserved)
+		return -EINVAL;
+	return 0;
+}
+
+static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg)
+{
+	struct cxlfork_query_caps_v2 caps;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(caps));
+	if (ret)
+		return ret;
+	memset(&caps, 0, sizeof(caps));
+	caps.size = sizeof(caps);
+	caps.abi_version = CXLFORK_ABI_VERSION_V2;
+	caps.capabilities = CXLFORK_CAP_V2_ABI |
+		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_MOW_DATA_COW |
+		CXLFORK_CAP_MOA_DATA_COPY;
+	caps.cxl_phys = cxl_phys;
+	caps.cxl_size = cxl_size;
+	caps.slot_bytes = CXLFORK_SLOT_BYTES;
+	caps.data_offset = CXLFORK_DATA_OFFSET;
+	caps.page_size = PAGE_SIZE;
+	caps.max_slots = CXLFORK_MAX_SLOTS;
+	caps.max_regions = CXLFORK_MAX_REGIONS;
+	caps.max_ptes = CXLFORK_MAX_PTES;
+	caps.descriptor_version = CXLFORK_DESC_VERSION;
+	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+}
+
+static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
+{
+	struct cxlfork_inspect_v2 inspect;
+	struct cxlfork_desc *desc;
+	u64 key;
+	u64 address;
+	u64 observed_page = 0;
+	u64 observed_leaf = 0;
+	u64 current_pte = 0;
+	u64 i;
+	int slot;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(inspect));
+	if (ret)
+		return ret;
+	if (copy_from_user(&inspect, uarg, sizeof(inspect)))
+		return -EFAULT;
+	key = inspect.key;
+	address = inspect.address & PAGE_MASK;
+	if (!key)
+		return -EINVAL;
+	slot = key_to_slot(key);
+	if (slot < 0)
+		return slot;
+
+	memset(&inspect, 0, sizeof(inspect));
+	inspect.size = sizeof(inspect);
+	inspect.abi_version = CXLFORK_ABI_VERSION_V2;
+	inspect.key = key;
+	inspect.address = address;
+	inspect.slot = slot;
+
+	mutex_lock(&cxlfork_lock);
+	desc = slot_desc(slot);
+	if (!desc || READ_ONCE(desc->magic) != CXLFORK_DESC_MAGIC ||
+	    READ_ONCE(desc->version) != CXLFORK_DESC_VERSION ||
+	    READ_ONCE(desc->key) != key) {
+		ret = -ENOENT;
+		goto out_unlock;
+	}
+	inspect.state = READ_ONCE(desc->ready) ? CXLFORK_SLOT_READY :
+		CXLFORK_SLOT_WRITING;
+	if (inspect.state != CXLFORK_SLOT_READY) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+	smp_rmb();
+	if (desc->slot != slot || desc->nr_regions > CXLFORK_MAX_REGIONS ||
+	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	    desc->image_bytes > CXLFORK_SLOT_BYTES) {
+		ret = -EILSEQ;
+		goto out_unlock;
+	}
+	ret = cxlfork_compute_checksums(desc, &observed_page, &observed_leaf);
+	if (ret)
+		goto out_unlock;
+
+	inspect.nr_regions = desc->nr_regions;
+	inspect.nr_ptes = desc->nr_ptes;
+	inspect.total_pages = desc->total_pages;
+	inspect.image_bytes = desc->image_bytes;
+	inspect.page_checksum = desc->page_checksum;
+	inspect.observed_page_checksum = observed_page;
+	inspect.leaf_checksum = desc->leaf_checksum;
+	inspect.observed_leaf_checksum = observed_leaf;
+	inspect.shared_map_pages = desc->shared_map_pages;
+	inspect.local_copy_pages = desc->local_copy_pages;
+	inspect.leaf_copy_pages = desc->leaf_copy_pages;
+	if (desc->nr_ptes) {
+		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
+			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;
+	}
+	if (desc->page_checksum != observed_page ||
+	    desc->leaf_checksum != observed_leaf)
+		inspect.flags |= CXLFORK_INSPECT_F_CHECKSUM_MISMATCH;
+
+	if (address) {
+		for (i = 0; i < desc->nr_ptes; i++) {
+			const struct cxlfork_pte_desc *pte = &desc->ptes[i];
+
+			if (pte->va != address)
+				continue;
+			inspect.shared_pfn =
+				(cxl_phys + pte->cxl_offset) >> PAGE_SHIFT;
+			break;
+		}
+		mmap_read_lock(current->mm);
+		ret = cxlfork_read_orig_pteval(current->mm, address, &current_pte);
+		mmap_read_unlock(current->mm);
+		if (!ret) {
+			inspect.current_pte = current_pte;
+			inspect.current_pfn = pte_pfn(__pte(current_pte));
+			inspect.flags |= CXLFORK_INSPECT_F_CURRENT_PTE_VALID;
+		}
+		ret = 0;
+	}
+
+	ret = copy_to_user(uarg, &inspect, sizeof(inspect)) ? -EFAULT : 0;
+
+out_unlock:
+	mutex_unlock(&cxlfork_lock);
+	return ret;
+}
+
 static int cxlfork_ioctl_stats(struct cxlfork_stats __user *uarg)
 {
 	/* benchmark 用它读取 faults 计数，比较 MoW/MoA/hybrid 的访问行为。 */
@@ -2284,6 +2525,110 @@ static int cxlfork_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+#if 0 /* retained only as an audit diff while the duplicate prototype is removed */
+static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uarg)
+{
+	struct cxlfork_inspect_v2 inspect;
+	struct cxlfork_desc *desc;
+	u64 key;
+	u64 address;
+	u64 observed_page = 0;
+	u64 observed_leaf = 0;
+	u64 current_pte = 0;
+	u64 i;
+	int slot;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(inspect));
+	if (ret)
+		return ret;
+	if (copy_from_user(&inspect, uarg, sizeof(inspect)))
+		return -EFAULT;
+	key = inspect.key;
+	address = inspect.address & PAGE_MASK;
+	if (!key)
+		return -EINVAL;
+	slot = key_to_slot(key);
+	if (slot < 0)
+		return slot;
+
+	memset(&inspect, 0, sizeof(inspect));
+	inspect.size = sizeof(inspect);
+	inspect.abi_version = CXLFORK_ABI_VERSION_V2;
+	inspect.key = key;
+	inspect.address = address;
+	inspect.slot = slot;
+
+	mutex_lock(&cxlfork_lock);
+	desc = slot_desc(slot);
+	if (!desc || READ_ONCE(desc->magic) != CXLFORK_DESC_MAGIC ||
+	    READ_ONCE(desc->version) != CXLFORK_DESC_VERSION ||
+	    READ_ONCE(desc->key) != key) {
+		mutex_unlock(&cxlfork_lock);
+		return -ENOENT;
+	}
+	inspect.state = READ_ONCE(desc->ready) ? CXLFORK_SLOT_READY :
+		CXLFORK_SLOT_WRITING;
+	if (inspect.state != CXLFORK_SLOT_READY) {
+		mutex_unlock(&cxlfork_lock);
+		return -EAGAIN;
+	}
+	smp_rmb();
+	if (desc->slot != slot || desc->nr_regions > CXLFORK_MAX_REGIONS ||
+	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	    desc->image_bytes > CXLFORK_SLOT_BYTES) {
+		mutex_unlock(&cxlfork_lock);
+		return -EILSEQ;
+	}
+	ret = cxlfork_compute_checksums(desc, &observed_page, &observed_leaf);
+	if (ret) {
+		mutex_unlock(&cxlfork_lock);
+		return ret;
+	}
+
+	inspect.nr_regions = desc->nr_regions;
+	inspect.nr_ptes = desc->nr_ptes;
+	inspect.total_pages = desc->total_pages;
+	inspect.image_bytes = desc->image_bytes;
+	inspect.page_checksum = desc->page_checksum;
+	inspect.observed_page_checksum = observed_page;
+	inspect.leaf_checksum = desc->leaf_checksum;
+	inspect.observed_leaf_checksum = observed_leaf;
+	inspect.shared_map_pages = desc->shared_map_pages;
+	inspect.local_copy_pages = desc->local_copy_pages;
+	inspect.leaf_copy_pages = desc->leaf_copy_pages;
+	if (desc->nr_ptes)
+		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
+			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;
+	if (desc->page_checksum != observed_page ||
+	    desc->leaf_checksum != observed_leaf)
+		inspect.flags |= CXLFORK_INSPECT_F_CHECKSUM_MISMATCH;
+
+	if (address) {
+		for (i = 0; i < desc->nr_ptes; i++) {
+			const struct cxlfork_pte_desc *pte = &desc->ptes[i];
+
+			if (pte->va != address)
+				continue;
+			inspect.shared_pfn =
+				(cxl_phys + pte->cxl_offset) >> PAGE_SHIFT;
+			break;
+		}
+		mmap_read_lock(current->mm);
+		ret = cxlfork_read_orig_pteval(current->mm, address, &current_pte);
+		mmap_read_unlock(current->mm);
+		if (!ret) {
+			inspect.current_pte = current_pte;
+			inspect.current_pfn = pte_pfn(__pte(current_pte));
+			inspect.flags |= CXLFORK_INSPECT_F_CURRENT_PTE_VALID;
+		}
+	}
+
+	mutex_unlock(&cxlfork_lock);
+	return copy_to_user(uarg, &inspect, sizeof(inspect)) ? -EFAULT : 0;
+}
+#endif
+
 static int cxlfork_release_file(struct inode *inode, struct file *file)
 {
 	kfree(file->private_data);
@@ -2305,6 +2650,10 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		return cxlfork_ioctl_stats((void __user *)arg);
 	case CXLFORK_RELEASE:
 		return cxlfork_ioctl_release((void __user *)arg);
+	case CXLFORK_QUERY_CAPS_V2:
+		return cxlfork_ioctl_query_caps_v2((void __user *)arg);
+	case CXLFORK_INSPECT_V2:
+		return cxlfork_ioctl_inspect_v2((void __user *)arg);
 	default:
 		return -ENOTTY;
 	}

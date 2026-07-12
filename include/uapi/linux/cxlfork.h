@@ -46,6 +46,90 @@
 #define CXLFORK_F_FULL_PRIVATE_STATE 0x400ULL
 #define CXLFORK_COMM_LEN 16
 
+#define CXLFORK_ABI_VERSION_V2 2U
+
+/* QUERY_CAPS capability bits. Unset bits are deliberately unsupported. */
+#define CXLFORK_CAP_V2_ABI (1ULL << 0)
+#define CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION (1ULL << 1)
+#define CXLFORK_CAP_REAL_SHARED_PTE_LEAF (1ULL << 2)
+#define CXLFORK_CAP_PTE_LEAF_COW (1ULL << 3)
+#define CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION (1ULL << 4)
+#define CXLFORK_CAP_REAL_SHARED_VMA_LEAF (1ULL << 5)
+#define CXLFORK_CAP_MOW_DATA_COW (1ULL << 6)
+#define CXLFORK_CAP_MOA_DATA_COPY (1ULL << 7)
+#define CXLFORK_CAP_CONSISTENT_SINGLE_THREAD (1ULL << 8)
+#define CXLFORK_CAP_RELIABLE_SLOT_GENERATION (1ULL << 9)
+#define CXLFORK_CAP_FULL_PRIVATE_STATE (1ULL << 10)
+#define CXLFORK_CAP_A_BIT_HYBRID (1ULL << 11)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 12) - 1)
+
+#define CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID (1ULL << 0)
+#define CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID (1ULL << 1)
+#define CXLFORK_INSPECT_F_CURRENT_PTE_VALID (1ULL << 2)
+#define CXLFORK_INSPECT_F_CHECKSUM_MISMATCH (1ULL << 3)
+
+enum cxlfork_slot_state_v2 {
+	CXLFORK_SLOT_FREE = 0,
+	CXLFORK_SLOT_WRITING = 1,
+	CXLFORK_SLOT_READY = 2,
+	CXLFORK_SLOT_RELEASING = 3,
+};
+
+struct cxlfork_v2_header {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved;
+};
+
+struct cxlfork_query_caps_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 capabilities;
+	__u64 cxl_phys;
+	__u64 cxl_size;
+	__u64 slot_bytes;
+	__u64 data_offset;
+	__u32 page_size;
+	__u32 max_slots;
+	__u32 max_regions;
+	__u32 max_ptes;
+	__u32 descriptor_version;
+	__u32 reserved;
+};
+
+/*
+ * INSPECT is read-only. key and address are inputs; all other fields are
+ * outputs. generation is zero until the reliable slot protocol is enabled.
+ */
+struct cxlfork_inspect_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 address;
+	__u64 flags;
+	__u32 slot;
+	__u32 state;
+	__u32 reader_count;
+	__u32 reserved;
+	__u64 nr_regions;
+	__u64 nr_ptes;
+	__u64 total_pages;
+	__u64 image_bytes;
+	__u64 page_checksum;
+	__u64 observed_page_checksum;
+	__u64 leaf_checksum;
+	__u64 observed_leaf_checksum;
+	__u64 shared_pfn;
+	__u64 current_pfn;
+	__u64 current_pte;
+	__u64 shared_map_pages;
+	__u64 local_copy_pages;
+	__u64 leaf_copy_pages;
+};
+
 struct cxlfork_region {
 	/* 对外暴露的 VMA/region 摘要，便于 benchmark 记录页分类。 */
 	__u64 start;
@@ -283,5 +367,7 @@ struct cxlfork_release {
 #define CXLFORK_RELEASE _IOW(CXLFORK_IOC_MAGIC, 4, struct cxlfork_release)
 #define CXLFORK_FORK_PREPARE _IOWR(CXLFORK_IOC_MAGIC, 5, struct cxlfork_checkpoint)
 #define CXLFORK_FORK_RESUME _IOWR(CXLFORK_IOC_MAGIC, 6, struct cxlfork_restore)
+#define CXLFORK_QUERY_CAPS_V2 _IOWR(CXLFORK_IOC_MAGIC, 7, struct cxlfork_v2_header)
+#define CXLFORK_INSPECT_V2 _IOWR(CXLFORK_IOC_MAGIC, 11, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */
