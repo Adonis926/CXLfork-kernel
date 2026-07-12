@@ -85,6 +85,7 @@ static int run_abi_tests(void)
 
 	required = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION;
@@ -92,8 +93,7 @@ static int run_abi_tests(void)
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
 
-	forbidden = CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
-		CXLFORK_CAP_PTE_LEAF_COW |
+	forbidden = CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_FULL_PRIVATE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID;
@@ -284,6 +284,16 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		fprintf(stderr, "restored checksum mismatch\n");
 		return 1;
 	}
+	if (!strcmp(policy, "readonly")) {
+		if (!(before.flags & CXLFORK_INSPECT_F_SHARED_LEAF_VALID) ||
+		    !(before.flags & CXLFORK_INSPECT_F_CURRENT_PMD_VALID) ||
+		    !before.shared_leaf_pfn ||
+		    before.current_pmd_pfn != before.shared_leaf_pfn ||
+		    before.current_pfn != before.shared_pfn) {
+			fprintf(stderr, "readonly restore did not attach the shared CXL PTE leaf\n");
+			return 1;
+		}
+	}
 	after = before;
 	after_second = before;
 	if (strcmp(policy, "readonly")) {
@@ -337,11 +347,14 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       " pages=%" PRIu64 " checksum=%" PRIu64
 	       " shared_pfn=%" PRIu64 " before_pfn=%" PRIu64
 	       " after_pfn=%" PRIu64 " second_pfn=%" PRIu64
+	       " shared_leaf_pfn=%" PRIu64 " current_pmd_pfn=%" PRIu64
 	       " verify=ok\n",
 	       key, policy, (uint64_t)op.nr_regions, (uint64_t)op.total_pages,
 	       hash, (uint64_t)before.shared_pfn,
 	       (uint64_t)before.current_pfn, (uint64_t)after.current_pfn,
-	       (uint64_t)after_second.current_pfn);
+	       (uint64_t)after_second.current_pfn,
+	       (uint64_t)before.shared_leaf_pfn,
+	       (uint64_t)before.current_pmd_pfn);
 	close(fd);
 	return 0;
 }
@@ -419,13 +432,15 @@ static int inspect_snapshot(uint64_t key, uint64_t address)
 	       " pages=%" PRIu64 " page_checksum=%" PRIu64
 	       " observed_page_checksum=%" PRIu64 " leaf_checksum=%" PRIu64
 	       " observed_leaf_checksum=%" PRIu64 " shared_pfn=%" PRIu64
-	       " current_pfn=%" PRIu64 " flags=%" PRIu64 "\n",
+	       " current_pfn=%" PRIu64 " shared_leaf_pfn=%" PRIu64
+	       " current_pmd_pfn=%" PRIu64 " flags=%" PRIu64 "\n",
 	       (uint64_t)op.key, (uint64_t)op.generation, op.slot, op.state,
 	       op.reader_count, (uint64_t)op.nr_regions,
 	       (uint64_t)op.total_pages, (uint64_t)op.page_checksum,
 	       (uint64_t)op.observed_page_checksum, (uint64_t)op.leaf_checksum,
 	       (uint64_t)op.observed_leaf_checksum, (uint64_t)op.shared_pfn,
-	       (uint64_t)op.current_pfn, (uint64_t)op.flags);
+	       (uint64_t)op.current_pfn, (uint64_t)op.shared_leaf_pfn,
+	       (uint64_t)op.current_pmd_pfn, (uint64_t)op.flags);
 	close(fd);
 	return 0;
 }

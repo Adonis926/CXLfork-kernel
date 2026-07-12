@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config CXLFORK
-	tristate "CXLfork checkpoint/restore prototype"
+	bool "CXLfork checkpoint/restore prototype"
 	depends on MMU && X86_64
 	help
 	  CXLfork 主线复现需要开启该配置；内建为 y 时 VM 启动后直接出现

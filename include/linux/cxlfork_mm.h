@@ -1,0 +1,24 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _LINUX_CXLFORK_MM_H
+#define _LINUX_CXLFORK_MM_H
+
+#include <linux/mm_types.h>
+
+#ifdef CONFIG_CXLFORK
+bool cxlfork_pmd_is_shared_leaf(pmd_t pmd);
+void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
+				 unsigned long addr);
+#else
+static inline bool cxlfork_pmd_is_shared_leaf(pmd_t pmd)
+{
+	return false;
+}
+
+static inline void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm,
+					       pmd_t *pmd,
+					       unsigned long addr)
+{
+}
+#endif
+
+#endif /* _LINUX_CXLFORK_MM_H */

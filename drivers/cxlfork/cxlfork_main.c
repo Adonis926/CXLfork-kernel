@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/cdev.h>
 #include <linux/cgroup.h>
+#include <linux/cxlfork_mm.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/device.h>
@@ -35,6 +36,7 @@
 #include <asm/fsgsbase.h>
 #include <asm/pgtable.h>
 #include <asm/ptrace.h>
+#include <asm/tlbflush.h>
 #include <net/net_namespace.h>
 
 #include "cxlfork.h"
@@ -65,6 +67,9 @@ static DEFINE_MUTEX(cxlfork_lock);
 static int key_to_slot(u64 key);
 static struct cxlfork_desc *slot_desc(u64 slot);
 static const struct vm_operations_struct cxlfork_vm_ops;
+static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
+					unsigned long addr,
+					unsigned long *pfn_out);
 
 struct cxlfork_file_state {
 	/* 每个打开的 /dev/cxlfork fd 保存一次 mmap/restore 的临时上下文。 */
@@ -174,6 +179,30 @@ static bool cxl_range_valid(u64 off, u64 bytes)
 	if (!bytes || off >= cxl_size || bytes > cxl_size - off)
 		return false;
 	return cxl_ptr(off) && cxl_ptr(off + bytes - 1);
+}
+
+static bool cxlfork_phys_in_window(phys_addr_t phys)
+{
+	return phys >= cxl_phys && phys < cxl_phys + cxl_size;
+}
+
+bool cxlfork_pmd_is_shared_leaf(pmd_t pmd)
+{
+	phys_addr_t phys;
+
+	if (!pmd_present(pmd) || pmd_leaf(pmd))
+		return false;
+	phys = (phys_addr_t)pmd_pfn(pmd) << PAGE_SHIFT;
+	return cxlfork_phys_in_window(phys);
+}
+
+void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
+				 unsigned long addr)
+{
+	unsigned long start = addr & PMD_MASK;
+
+	pmd_clear(pmd);
+	flush_tlb_mm_range(mm, start, start + PMD_SIZE, PAGE_SHIFT, true);
 }
 
 static u64 slot_offset(u64 slot)
@@ -411,6 +440,21 @@ static int cxlfork_read_pte_snapshot(struct mm_struct *mm, unsigned long addr,
 		return -EFAULT;
 	if (pmd_trans_huge(*pmd) || pmd_devmap(*pmd))
 		return -EOPNOTSUPP;
+	if (cxlfork_pmd_is_shared_leaf(*pmd)) {
+		phys_addr_t phys = (phys_addr_t)pmd_pfn(*pmd) << PAGE_SHIFT;
+		pte_t *ptes = cxl_ptr(phys - cxl_phys);
+		pte_t pte;
+
+		if (!ptes)
+			return -EFAULT;
+		pte = ptes[pte_index(addr)];
+		if (!pte_present(pte))
+			return -EFAULT;
+		*pteval = pte_val(pte);
+		if (pfn)
+			*pfn = pte_pfn(pte);
+		return 0;
+	}
 
 	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!ptep)
@@ -430,6 +474,32 @@ static int cxlfork_read_orig_pteval(struct mm_struct *mm, unsigned long addr,
 				    u64 *pteval)
 {
 	return cxlfork_read_pte_snapshot(mm, addr, pteval, NULL);
+}
+
+static int cxlfork_read_pmd_snapshot(struct mm_struct *mm, unsigned long addr,
+				     u64 *pmdval, unsigned long *pfn)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return -EFAULT;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return -EFAULT;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return -EFAULT;
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return -EFAULT;
+	*pmdval = pmd_val(*pmd);
+	if (pfn)
+		*pfn = pmd_pfn(*pmd);
+	return 0;
 }
 
 
@@ -2012,6 +2082,107 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 	return 0;
 }
 
+static int cxlfork_install_shared_leaf_pmd(struct mm_struct *mm,
+					   unsigned long addr,
+					   unsigned long leaf_pfn)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+
+	pgd = pgd_offset(mm, addr);
+	p4d = p4d_alloc(mm, pgd, addr);
+	if (!p4d)
+		return -ENOMEM;
+	pud = pud_alloc(mm, p4d, addr);
+	if (!pud)
+		return -ENOMEM;
+	pmd = pmd_alloc(mm, pud, addr);
+	if (!pmd)
+		return -ENOMEM;
+	if (!pmd_none(*pmd))
+		return -EEXIST;
+	set_pmd(pmd, __pmd(pte_val(pfn_pte(leaf_pfn, __pgprot(_PAGE_TABLE)))));
+	mm_inc_nr_ptes(mm);
+	return 0;
+}
+
+static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
+					  struct cxlfork_region_desc *r)
+{
+	/*
+	 * Phase 5a gate: readonly, PMD-aligned, full-PMD regions only.
+	 * The CPU page walker consumes the CXL PTE page directly. Core-MM
+	 * mutation support is intentionally limited to zap/free safeguards.
+	 */
+	struct cxlfork_mapping *mapping;
+	struct vm_area_struct *vma;
+	unsigned long mapped;
+	unsigned long addr;
+	int ret = 0;
+
+	if (!IS_ALIGNED(r->start, PMD_SIZE) || !IS_ALIGNED(r->length, PMD_SIZE))
+		return -EOPNOTSUPP;
+
+	mapped = vm_mmap(NULL, r->start, r->length,
+			 PROT_READ | ((r->prot & PROT_EXEC) ? PROT_EXEC : 0),
+			 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
+	if (IS_ERR_VALUE(mapped))
+		return (int)mapped;
+	if (mapped != r->start) {
+		vm_munmap(mapped, r->length);
+		return -EINVAL;
+	}
+
+	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+	if (!mapping) {
+		vm_munmap(r->start, r->length);
+		return -ENOMEM;
+	}
+	mapping->key = desc->key;
+	mapping->generation = desc->generation;
+	mapping->flags = CXLFORK_F_MAP_READONLY;
+	mapping->holds_slot_reader = true;
+	refcount_set(&mapping->refs, 1);
+	ret = cxlfork_slot_get_reader(mapping->key, mapping->generation);
+	if (ret) {
+		kfree(mapping);
+		vm_munmap(r->start, r->length);
+		return ret;
+	}
+
+	mmap_write_lock(current->mm);
+	vma = find_vma(current->mm, r->start);
+	if (!vma || vma->vm_start != r->start ||
+	    vma->vm_end != r->start + r->length) {
+		ret = -EFAULT;
+		goto out_unlock;
+	}
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_ops = &cxlfork_vm_ops;
+	vma->vm_private_data = mapping;
+
+	for (addr = r->start; addr < r->start + r->length; addr += PMD_SIZE) {
+		unsigned long leaf_pfn;
+
+		ret = cxlfork_find_shared_leaf_pfn(desc, addr, &leaf_pfn);
+		if (ret)
+			goto out_unlock;
+		ret = cxlfork_install_shared_leaf_pmd(current->mm, addr, leaf_pfn);
+		if (ret)
+			goto out_unlock;
+		desc->direct_pte_install_pages += PMD_SIZE >> PAGE_SHIFT;
+		desc->shared_map_pages += PMD_SIZE >> PAGE_SHIFT;
+	}
+
+out_unlock:
+	mmap_write_unlock(current->mm);
+	if (ret)
+		vm_munmap(r->start, r->length);
+	return ret;
+}
+
 static int cxlfork_map_region_cow(struct file *file,
 				  const struct cxlfork_region_desc *r,
 				  u64 region_idx, bool private_cow)
@@ -2065,6 +2236,30 @@ static int cxlfork_find_pt_page_pfn(const struct cxlfork_desc *desc,
 		return -ENOENT;
 	*pfn_out = pte_pfn(__pte(raw));
 	return 0;
+}
+
+static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
+					unsigned long addr,
+					unsigned long *pfn_out)
+{
+	const struct cxlfork_pt_page_image *meta;
+	u64 i;
+
+	if (!desc->pt_page_image_offset || !desc->pt_page_image_entries)
+		return -EINVAL;
+	meta = cxl_ptr(desc->pt_page_image_offset);
+	if (!meta)
+		return -EINVAL;
+	addr &= PMD_MASK;
+	for (i = 0; i < desc->pt_page_image_entries; i++) {
+		if (meta[i].va_base != addr)
+			continue;
+		if (!cxl_range_valid(meta[i].pte_page_offset, PAGE_SIZE))
+			return -EINVAL;
+		*pfn_out = (cxl_phys + meta[i].pte_page_offset) >> PAGE_SHIFT;
+		return 0;
+	}
+	return -ENOENT;
 }
 
 static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
@@ -2465,8 +2660,14 @@ static int cxlfork_ioctl_restore(struct file *file,
 		if (private_cow || shared_cow || hybrid_tiering)
 			ret = cxlfork_map_region_cow(file, &desc->regions[i], i,
 						     private_cow);
-		else
+		else if (readonly) {
+			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i]);
+			if (ret == -EOPNOTSUPP)
+				ret = cxlfork_map_region(desc, &desc->regions[i],
+							 readonly);
+		} else {
 			ret = cxlfork_map_region(desc, &desc->regions[i], readonly);
+		}
 		if (!ret && shared_cow) {
 			pte_attach_ns += ktime_get_ns() - map_start;
 			pte_attach_pages += desc->regions[i].pages;
@@ -2584,6 +2785,7 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 	caps.abi_version = CXLFORK_ABI_VERSION_V2;
 	caps.capabilities = CXLFORK_CAP_V2_ABI |
 		CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION |
+		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |
@@ -2674,6 +2876,9 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 		inspect.flags |= CXLFORK_INSPECT_F_CHECKSUM_MISMATCH;
 
 	if (address) {
+		unsigned long leaf_pfn;
+		unsigned long current_pmd_pfn;
+
 		for (i = 0; i < desc->nr_ptes; i++) {
 			const struct cxlfork_pte_desc *pte = &desc->ptes[i];
 
@@ -2683,7 +2888,18 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 				(cxl_phys + pte->cxl_offset) >> PAGE_SHIFT;
 			break;
 		}
+		if (!cxlfork_find_shared_leaf_pfn(desc, address, &leaf_pfn)) {
+			inspect.shared_leaf_pfn = leaf_pfn;
+			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
+		}
 		mmap_read_lock(current->mm);
+		ret = cxlfork_read_pmd_snapshot(current->mm, address,
+						&inspect.current_pmd,
+						&current_pmd_pfn);
+		if (!ret) {
+			inspect.current_pmd_pfn = current_pmd_pfn;
+			inspect.flags |= CXLFORK_INSPECT_F_CURRENT_PMD_VALID;
+		}
 		ret = cxlfork_read_orig_pteval(current->mm, address, &current_pte);
 		mmap_read_unlock(current->mm);
 		if (!ret) {
@@ -2861,6 +3077,9 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 		inspect.flags |= CXLFORK_INSPECT_F_CHECKSUM_MISMATCH;
 
 	if (address) {
+		unsigned long leaf_pfn;
+		unsigned long current_pmd_pfn;
+
 		for (i = 0; i < desc->nr_ptes; i++) {
 			const struct cxlfork_pte_desc *pte = &desc->ptes[i];
 
@@ -2870,7 +3089,18 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 				(cxl_phys + pte->cxl_offset) >> PAGE_SHIFT;
 			break;
 		}
+		if (!cxlfork_find_shared_leaf_pfn(desc, address, &leaf_pfn)) {
+			inspect.shared_leaf_pfn = leaf_pfn;
+			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
+		}
 		mmap_read_lock(current->mm);
+		ret = cxlfork_read_pmd_snapshot(current->mm, address,
+						&inspect.current_pmd,
+						&current_pmd_pfn);
+		if (!ret) {
+			inspect.current_pmd_pfn = current_pmd_pfn;
+			inspect.flags |= CXLFORK_INSPECT_F_CURRENT_PMD_VALID;
+		}
 		ret = cxlfork_read_orig_pteval(current->mm, address, &current_pte);
 		mmap_read_unlock(current->mm);
 		if (!ret) {

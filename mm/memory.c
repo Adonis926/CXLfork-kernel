@@ -42,6 +42,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
+#include <linux/cxlfork_mm.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
 #include <linux/sched/numa_balancing.h>
@@ -188,6 +189,11 @@ void mm_trace_rss_stat(struct mm_struct *mm, int member)
 static void free_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 			   unsigned long addr)
 {
+	if (cxlfork_pmd_is_shared_leaf(*pmd)) {
+		cxlfork_zap_shared_leaf_pmd(tlb->mm, pmd, addr);
+		mm_dec_nr_ptes(tlb->mm);
+		return;
+	}
 	pgtable_t token = pmd_pgtable(*pmd);
 	pmd_clear(pmd);
 	pte_free_tlb(tlb, token, addr);
@@ -1405,6 +1411,11 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 	swp_entry_t entry;
 
 	tlb_change_page_size(tlb, PAGE_SIZE);
+	if (cxlfork_pmd_is_shared_leaf(*pmd)) {
+		cxlfork_zap_shared_leaf_pmd(mm, pmd, addr);
+		mm_dec_nr_ptes(mm);
+		return end;
+	}
 	init_rss_vec(rss);
 	start_pte = pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	if (!pte)

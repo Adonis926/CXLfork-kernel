@@ -67,6 +67,8 @@
 #define CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID (1ULL << 1)
 #define CXLFORK_INSPECT_F_CURRENT_PTE_VALID (1ULL << 2)
 #define CXLFORK_INSPECT_F_CHECKSUM_MISMATCH (1ULL << 3)
+#define CXLFORK_INSPECT_F_SHARED_LEAF_VALID (1ULL << 4)
+#define CXLFORK_INSPECT_F_CURRENT_PMD_VALID (1ULL << 5)
 
 enum cxlfork_slot_state_v2 {
 	CXLFORK_SLOT_FREE = 0,
@@ -128,6 +130,9 @@ struct cxlfork_inspect_v2 {
 	__u64 shared_map_pages;
 	__u64 local_copy_pages;
 	__u64 leaf_copy_pages;
+	__u64 shared_leaf_pfn;
+	__u64 current_pmd;
+	__u64 current_pmd_pfn;
 };
 
 struct cxlfork_region {
