@@ -72,6 +72,13 @@
 #define CXLFORK_INSPECT_F_SHARED_LEAF_VALID (1ULL << 4)
 #define CXLFORK_INSPECT_F_CURRENT_PMD_VALID (1ULL << 5)
 #define CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID (1ULL << 6)
+#define CXLFORK_INSPECT_F_ORIG_PTE_VALID (1ULL << 7)
+
+#define CXLFORK_PTE_MARK_CLEAR_ACCESSED (1ULL << 0)
+#define CXLFORK_PTE_MARK_CLEAR_DIRTY (1ULL << 1)
+#define CXLFORK_PTE_MARK_SET_ACCESSED (1ULL << 2)
+#define CXLFORK_PTE_MARK_SET_DIRTY (1ULL << 3)
+#define CXLFORK_PTE_MARK_KNOWN_MASK ((1ULL << 4) - 1)
 
 enum cxlfork_slot_state_v2 {
 	CXLFORK_SLOT_FREE = 0,
@@ -130,6 +137,7 @@ struct cxlfork_inspect_v2 {
 	__u64 shared_pfn;
 	__u64 current_pfn;
 	__u64 current_pte;
+	__u64 orig_pte;
 	__u64 shared_map_pages;
 	__u64 local_copy_pages;
 	__u64 leaf_copy_pages;
@@ -140,6 +148,16 @@ struct cxlfork_inspect_v2 {
 	__u64 vma_maple_nodes;
 	__u64 vma_lookup_start;
 	__u64 vma_lookup_end;
+};
+
+struct cxlfork_pte_mark_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 start;
+	__u64 length;
+	__u64 flags;
+	__u64 reserved1;
 };
 
 struct cxlfork_region {
@@ -381,5 +399,6 @@ struct cxlfork_release {
 #define CXLFORK_FORK_RESUME _IOWR(CXLFORK_IOC_MAGIC, 6, struct cxlfork_restore)
 #define CXLFORK_QUERY_CAPS_V2 _IOWR(CXLFORK_IOC_MAGIC, 7, struct cxlfork_v2_header)
 #define CXLFORK_INSPECT_V2 _IOWR(CXLFORK_IOC_MAGIC, 11, struct cxlfork_v2_header)
+#define CXLFORK_PTE_MARK_V2 _IOWR(CXLFORK_IOC_MAGIC, 12, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

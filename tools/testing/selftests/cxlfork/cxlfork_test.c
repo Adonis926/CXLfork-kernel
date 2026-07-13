@@ -21,6 +21,8 @@
 #define TEST_BASE ((void *)0x500000000000ULL)
 #define THREADCTX_STACK_BASE ((void *)0x600000100000ULL)
 #define THREADCTX_STACK_SIZE (64 * 1024)
+#define X86_PTE_ACCESSED (1ULL << 5)
+#define X86_PTE_DIRTY (1ULL << 6)
 #define FNV_SEED 1469598103934665603ULL
 #define FNV_PRIME 1099511628211ULL
 
@@ -95,13 +97,13 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
-		CXLFORK_CAP_GLOBAL_FILE_STATE;
+		CXLFORK_CAP_GLOBAL_FILE_STATE |
+		CXLFORK_CAP_A_BIT_HYBRID;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
 
-	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE |
-		CXLFORK_CAP_A_BIT_HYBRID;
+	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE;
 	ok = !(caps.capabilities & forbidden);
 	tap(ok, nr++, "unimplemented paper mechanisms are not advertised");
 	failed += !ok;
@@ -494,6 +496,153 @@ static int restore_fdglobal_snapshot(uint64_t key, const char *policy)
 	printf("fdglobal-restore key=%" PRIu64 " policy=%s fd=7 pos=11"
 	       " flags=append cwd=/tmp umask=027 sigusr1=blocked verify=%s\n",
 	       key, policy, failed ? "fail" : "ok");
+	close(fd);
+	return failed ? 1 : 0;
+}
+
+static int mark_self_pte_range(int fd, void *addr, size_t len, uint64_t flags)
+{
+	struct cxlfork_pte_mark_v2 mark = {
+		.size = sizeof(mark),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.start = (uintptr_t)addr,
+		.length = len,
+		.flags = flags,
+	};
+
+	if (ioctl(fd, CXLFORK_PTE_MARK_V2, &mark)) {
+		perror("PTE_MARK_V2");
+		return 1;
+	}
+	return 0;
+}
+
+static int prepare_hybrid_snapshot(uint64_t key)
+{
+	struct cxlfork_checkpoint op = { 0 };
+	unsigned char *p;
+	size_t page = getpagesize();
+	int fd;
+
+	p = mmap(TEST_BASE, 3 * page, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("mmap hybrid");
+		return 1;
+	}
+	fill_region(p, 3 * page, key, 10);
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	if (mark_self_pte_range(fd, p, 3 * page,
+				CXLFORK_PTE_MARK_CLEAR_ACCESSED |
+				CXLFORK_PTE_MARK_CLEAR_DIRTY) ||
+	    mark_self_pte_range(fd, p, page, CXLFORK_PTE_MARK_SET_ACCESSED) ||
+	    mark_self_pte_range(fd, p + 2 * page, page,
+				CXLFORK_PTE_MARK_SET_DIRTY)) {
+		close(fd);
+		return 1;
+	}
+	op.key = key;
+	op.scan_start = (uintptr_t)p;
+	op.scan_end = (uintptr_t)p + 3 * page;
+	if (ioctl(fd, CXLFORK_FORK_PREPARE, &op)) {
+		perror("FORK_PREPARE hybrid");
+		return 1;
+	}
+	printf("hybrid-prepare key=%" PRIu64 " pages=%" PRIu64
+	       " verify=ok\n", key, (uint64_t)op.total_pages);
+	close(fd);
+	return 0;
+}
+
+static int inspect_addr(int fd, uint64_t key, uint64_t addr,
+			struct cxlfork_inspect_v2 *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->size = sizeof(*out);
+	out->abi_version = CXLFORK_ABI_VERSION_V2;
+	out->key = key;
+	out->address = addr;
+	return ioctl(fd, CXLFORK_INSPECT_V2, out);
+}
+
+static int restore_hybrid_snapshot(uint64_t key)
+{
+	struct cxlfork_restore op = {
+		.key = key,
+		.flags = CXLFORK_F_HYBRID_TIERING,
+	};
+	struct cxlfork_inspect_v2 hot, cold, dirty;
+	size_t page = getpagesize();
+	volatile unsigned char sink;
+	unsigned char *base = TEST_BASE;
+	int fd;
+	int failed = 0;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open cxlfork");
+		return KSFT_SKIP;
+	}
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME hybrid");
+		return 1;
+	}
+	if (inspect_addr(fd, key, (uintptr_t)base, &hot) ||
+	    inspect_addr(fd, key, (uintptr_t)base + page, &cold) ||
+	    inspect_addr(fd, key, (uintptr_t)base + 2 * page, &dirty)) {
+		perror("INSPECT hybrid before access");
+		return 1;
+	}
+	if (!(hot.flags & CXLFORK_INSPECT_F_ORIG_PTE_VALID) ||
+	    !(cold.flags & CXLFORK_INSPECT_F_ORIG_PTE_VALID) ||
+	    !(dirty.flags & CXLFORK_INSPECT_F_ORIG_PTE_VALID)) {
+		fprintf(stderr, "hybrid: orig PTE not reported\n");
+		return 1;
+	}
+	if (!(hot.orig_pte & X86_PTE_ACCESSED) ||
+	    (cold.orig_pte & X86_PTE_ACCESSED) ||
+	    !(dirty.orig_pte & X86_PTE_DIRTY)) {
+		fprintf(stderr, "hybrid: unexpected checkpoint A/D bits"
+			" hot=%" PRIx64 " cold=%" PRIx64 " dirty=%" PRIx64 "\n",
+			(uint64_t)hot.orig_pte, (uint64_t)cold.orig_pte,
+			(uint64_t)dirty.orig_pte);
+		return 1;
+	}
+	if (dirty.current_pfn == dirty.shared_pfn) {
+		fprintf(stderr, "hybrid: dirty page was not prefaulted local\n");
+		failed++;
+	}
+	sink = base[0];
+	(void)sink;
+	sink = base[page];
+	(void)sink;
+	if (inspect_addr(fd, key, (uintptr_t)base, &hot) ||
+	    inspect_addr(fd, key, (uintptr_t)base + page, &cold)) {
+		perror("INSPECT hybrid after access");
+		return 1;
+	}
+	if (hot.current_pfn == hot.shared_pfn) {
+		fprintf(stderr, "hybrid: A=1 page did not copy local\n");
+		failed++;
+	}
+	if (cold.current_pfn != cold.shared_pfn) {
+		fprintf(stderr, "hybrid: A=0 page did not remain shared\n");
+		failed++;
+	}
+	printf("hybrid-restore key=%" PRIu64
+	       " hot_orig=%" PRIx64 " cold_orig=%" PRIx64
+	       " dirty_orig=%" PRIx64 " hot_pfn=%" PRIu64
+	       " cold_pfn=%" PRIu64 " dirty_pfn=%" PRIu64
+	       " verify=%s\n",
+	       key, (uint64_t)hot.orig_pte, (uint64_t)cold.orig_pte,
+	       (uint64_t)dirty.orig_pte, (uint64_t)hot.current_pfn,
+	       (uint64_t)cold.current_pfn, (uint64_t)dirty.current_pfn,
+	       failed ? "fail" : "ok");
 	close(fd);
 	return failed ? 1 : 0;
 }
@@ -1095,6 +1244,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
 			"threadctx-prepare KEY BYTES | threadctx-restore KEY POLICY | "
 			"fdglobal-prepare KEY BYTES | fdglobal-restore KEY POLICY | "
+			"hybrid-prepare KEY | hybrid-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | conflict KEY POLICY\n",
 			argv[0]);
@@ -1117,6 +1267,10 @@ int main(int argc, char **argv)
 		return prepare_fdglobal_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "fdglobal-restore") && argc == 4)
 		return restore_fdglobal_snapshot(key, argv[3]);
+	if (!strcmp(argv[1], "hybrid-prepare") && argc == 3)
+		return prepare_hybrid_snapshot(key);
+	if (!strcmp(argv[1], "hybrid-restore") && argc == 3)
+		return restore_hybrid_snapshot(key);
 	if (!strcmp(argv[1], "restore") && argc == 4)
 		return restore_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "conflict") && argc == 4)

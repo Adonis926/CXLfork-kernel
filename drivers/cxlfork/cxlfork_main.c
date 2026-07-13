@@ -563,38 +563,41 @@ static void cxlfork_capture_task_state(struct cxlfork_task_state *st,
 				       bool full_private_state)
 {
 	/* 采集 task_struct/cred/capability 摘要，模拟跨 OS task metadata 迁移。 */
+	struct cxlfork_task_state tmp;
 	const struct cred *cred;
 
-	memset(st, 0, sizeof(*st));
-	st->pid = task_pid_nr(current);
-	st->tgid = task_tgid_nr(current);
-	st->ppid = task_ppid_nr(current);
-	st->flags = current->flags;
-	st->personality = current->personality;
-	st->exit_signal = current->exit_signal;
-	st->policy = current->policy;
-	st->prio = current->prio;
-	st->static_prio = current->static_prio;
-	st->normal_prio = current->normal_prio;
-	st->full_private_state = full_private_state;
-	memcpy(st->comm, current->comm, sizeof(st->comm));
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.pid = task_pid_nr(current);
+	tmp.tgid = task_tgid_nr(current);
+	tmp.ppid = task_ppid_nr(current);
+	tmp.flags = current->flags;
+	tmp.personality = current->personality;
+	tmp.exit_signal = current->exit_signal;
+	tmp.policy = current->policy;
+	tmp.prio = current->prio;
+	tmp.static_prio = current->static_prio;
+	tmp.normal_prio = current->normal_prio;
+	tmp.full_private_state = full_private_state;
+	memcpy(tmp.comm, current->comm, sizeof(tmp.comm));
 
 	rcu_read_lock();
 	cred = __task_cred(current);
-	st->uid = from_kuid_munged(current_user_ns(), cred->uid);
-	st->gid = from_kgid_munged(current_user_ns(), cred->gid);
-	st->euid = from_kuid_munged(current_user_ns(), cred->euid);
-	st->egid = from_kgid_munged(current_user_ns(), cred->egid);
-	st->suid = from_kuid_munged(current_user_ns(), cred->suid);
-	st->sgid = from_kgid_munged(current_user_ns(), cred->sgid);
-	st->fsuid = from_kuid_munged(current_user_ns(), cred->fsuid);
-	st->fsgid = from_kgid_munged(current_user_ns(), cred->fsgid);
-	st->cap_inheritable = cxlfork_cap_to_u64(cred->cap_inheritable);
-	st->cap_permitted = cxlfork_cap_to_u64(cred->cap_permitted);
-	st->cap_effective = cxlfork_cap_to_u64(cred->cap_effective);
-	st->cap_bset = cxlfork_cap_to_u64(cred->cap_bset);
-	st->cap_ambient = cxlfork_cap_to_u64(cred->cap_ambient);
+	tmp.uid = from_kuid_munged(current_user_ns(), cred->uid);
+	tmp.gid = from_kgid_munged(current_user_ns(), cred->gid);
+	tmp.euid = from_kuid_munged(current_user_ns(), cred->euid);
+	tmp.egid = from_kgid_munged(current_user_ns(), cred->egid);
+	tmp.suid = from_kuid_munged(current_user_ns(), cred->suid);
+	tmp.sgid = from_kgid_munged(current_user_ns(), cred->sgid);
+	tmp.fsuid = from_kuid_munged(current_user_ns(), cred->fsuid);
+	tmp.fsgid = from_kgid_munged(current_user_ns(), cred->fsgid);
+	tmp.cap_inheritable = cxlfork_cap_to_u64(cred->cap_inheritable);
+	tmp.cap_permitted = cxlfork_cap_to_u64(cred->cap_permitted);
+	tmp.cap_effective = cxlfork_cap_to_u64(cred->cap_effective);
+	tmp.cap_bset = cxlfork_cap_to_u64(cred->cap_bset);
+	tmp.cap_ambient = cxlfork_cap_to_u64(cred->cap_ambient);
 	rcu_read_unlock();
+
+	memcpy(st, &tmp, sizeof(tmp));
 }
 
 static u64 cxlfork_make_cxl_pteval(u64 orig_pteval, u64 cxl_offset)
@@ -835,23 +838,26 @@ static void cxlfork_capture_mm_state(struct cxlfork_mm_state *st,
 				     struct mm_struct *mm)
 {
 	/* 采集 mm_struct 中的地址空间边界和 auxv，restore 可选择写回。 */
-	memset(st, 0, sizeof(*st));
-	st->start_code = mm->start_code;
-	st->end_code = mm->end_code;
-	st->start_data = mm->start_data;
-	st->end_data = mm->end_data;
-	st->start_brk = mm->start_brk;
-	st->brk = mm->brk;
-	st->start_stack = mm->start_stack;
-	st->arg_start = mm->arg_start;
-	st->arg_end = mm->arg_end;
-	st->env_start = mm->env_start;
-	st->env_end = mm->env_end;
-	memcpy(st->saved_auxv, mm->saved_auxv,
-	       min(sizeof(st->saved_auxv), sizeof(mm->saved_auxv)));
-	st->pid = task_pid_nr(current);
-	st->tgid = task_tgid_nr(current);
-	memcpy(st->comm, current->comm, sizeof(st->comm));
+	struct cxlfork_mm_state tmp;
+
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.start_code = mm->start_code;
+	tmp.end_code = mm->end_code;
+	tmp.start_data = mm->start_data;
+	tmp.end_data = mm->end_data;
+	tmp.start_brk = mm->start_brk;
+	tmp.brk = mm->brk;
+	tmp.start_stack = mm->start_stack;
+	tmp.arg_start = mm->arg_start;
+	tmp.arg_end = mm->arg_end;
+	tmp.env_start = mm->env_start;
+	tmp.env_end = mm->env_end;
+	memcpy(tmp.saved_auxv, mm->saved_auxv,
+	       min(sizeof(tmp.saved_auxv), sizeof(mm->saved_auxv)));
+	tmp.pid = task_pid_nr(current);
+	tmp.tgid = task_tgid_nr(current);
+	memcpy(tmp.comm, current->comm, sizeof(tmp.comm));
+	memcpy(st, &tmp, sizeof(tmp));
 }
 
 static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
@@ -859,21 +865,27 @@ static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
 	/* 遍历当前进程打开的 fd，记录 path/pos/flag；这是跨 OS 重开 fd 的模拟成本来源。 */
 	struct file *files[CXLFORK_MAX_FDS];
 	unsigned int fds[CXLFORK_MAX_FDS];
+	struct cxlfork_fd_state *out;
 	struct files_struct *files_struct = current->files;
 	struct fdtable *fdt;
 	char *path_buf;
+	u64 nr_fds = 0;
 	u64 i;
 
-	desc->nr_fds = 0;
-	memset(desc->fds, 0, sizeof(desc->fds));
 	memset(files, 0, sizeof(files));
 
-	if (!files_struct)
+	if (!files_struct) {
+		desc->nr_fds = 0;
+		memset(desc->fds, 0, sizeof(desc->fds));
 		return 0;
+	}
+	out = kvcalloc(CXLFORK_MAX_FDS, sizeof(*out), GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
 
 	spin_lock(&files_struct->file_lock);
 	fdt = files_fdtable(files_struct);
-	for (i = 0; i < fdt->max_fds && desc->nr_fds < CXLFORK_MAX_FDS; i++) {
+	for (i = 0; i < fdt->max_fds && nr_fds < CXLFORK_MAX_FDS; i++) {
 		struct file *file;
 		u64 idx;
 
@@ -885,15 +897,15 @@ static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
 		if (file->f_op == &cxlfork_fops)
 			continue;
 		get_file(file);
-		idx = desc->nr_fds++;
+		idx = nr_fds++;
 		files[idx] = file;
 		fds[idx] = i;
 	}
 	spin_unlock(&files_struct->file_lock);
 
 	path_buf = (char *)__get_free_page(GFP_KERNEL);
-	for (i = 0; i < desc->nr_fds; i++) {
-		struct cxlfork_fd_state *st = &desc->fds[i];
+	for (i = 0; i < nr_fds; i++) {
+		struct cxlfork_fd_state *st = &out[i];
 		struct file *file = files[i];
 		struct inode *inode = file_inode(file);
 		umode_t mode = inode ? inode->i_mode : 0;
@@ -903,12 +915,13 @@ static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
 		st->pos = file->f_pos;
 		if (!inode || !S_ISREG(mode)) {
 			if (strict) {
-				while (i < desc->nr_fds)
+				while (i < nr_fds)
 					fput(files[i++]);
 				if (path_buf)
 					free_page((unsigned long)path_buf);
 				desc->nr_fds = 0;
 				memset(desc->fds, 0, sizeof(desc->fds));
+				kvfree(out);
 				return -EOPNOTSUPP;
 			}
 			fput(file);
@@ -929,6 +942,9 @@ static int cxlfork_capture_fd_state(struct cxlfork_desc *desc, bool strict)
 	}
 	if (path_buf)
 		free_page((unsigned long)path_buf);
+	desc->nr_fds = nr_fds;
+	memcpy(desc->fds, out, sizeof(desc->fds));
+	kvfree(out);
 	return 0;
 }
 
@@ -953,95 +969,102 @@ static void cxlfork_path_to_state(const struct path *path, u8 *dst, size_t len)
 static void cxlfork_capture_namespace_state(struct cxlfork_namespace_state *st)
 {
 	/* namespace 这里只记录身份和策略；net/cgroup 在当前原型中视为继承。 */
+	struct cxlfork_namespace_state tmp;
 	struct nsproxy *nsproxy = current->nsproxy;
 	struct pid_namespace *pid_ns;
 
-	memset(st, 0, sizeof(*st));
-	st->flags = CXLFORK_NS_F_MOUNT_SERIALIZED |
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.flags = CXLFORK_NS_F_MOUNT_SERIALIZED |
 		    CXLFORK_NS_F_PID_SERIALIZED |
 		    CXLFORK_NS_F_NET_INHERITED |
 		    CXLFORK_NS_F_CGROUP_INHERITED;
 
-	if (!nsproxy)
+	if (!nsproxy) {
+		memcpy(st, &tmp, sizeof(tmp));
 		return;
+	}
 	/*
 	 * mnt_namespace is opaque to modules; cwd/root paths above are the
 	 * portable mount-state representation for this module build.
 	 */
-	st->mnt_ns = 0;
+	tmp.mnt_ns = 0;
 	pid_ns = nsproxy->pid_ns_for_children;
 	if (pid_ns) {
-		st->pid_ns = pid_ns->ns.inum;
-		st->pid_ns_level = pid_ns->level;
+		tmp.pid_ns = pid_ns->ns.inum;
+		tmp.pid_ns_level = pid_ns->level;
 	}
 	if (nsproxy->net_ns)
-		st->net_ns = nsproxy->net_ns->ns.inum;
+		tmp.net_ns = nsproxy->net_ns->ns.inum;
 	if (nsproxy->cgroup_ns)
-		st->cgroup_ns = nsproxy->cgroup_ns->ns.inum;
+		tmp.cgroup_ns = nsproxy->cgroup_ns->ns.inum;
+	memcpy(st, &tmp, sizeof(tmp));
 }
 
 static void cxlfork_capture_global_state(struct cxlfork_desc *desc)
 {
 	/* 采集 cwd/root/umask/rlimit/signal/namespace 等进程全局状态。 */
-	struct cxlfork_global_state *st = &desc->global_state;
+	struct cxlfork_global_state tmp;
 	struct path path;
 	unsigned int i;
 
-	memset(st, 0, sizeof(*st));
+	memset(&tmp, 0, sizeof(tmp));
 	if (current->fs) {
 		spin_lock(&current->fs->lock);
-		st->umask = current->fs->umask;
+		tmp.umask = current->fs->umask;
 		spin_unlock(&current->fs->lock);
 
 		get_fs_pwd(current->fs, &path);
-		cxlfork_path_to_state(&path, st->cwd, sizeof(st->cwd));
+		cxlfork_path_to_state(&path, tmp.cwd, sizeof(tmp.cwd));
 		path_put(&path);
 
 		get_fs_root(current->fs, &path);
-		cxlfork_path_to_state(&path, st->root, sizeof(st->root));
+		cxlfork_path_to_state(&path, tmp.root, sizeof(tmp.root));
 		path_put(&path);
 	}
-	cxlfork_capture_namespace_state(&st->ns_state);
+	cxlfork_capture_namespace_state(&tmp.ns_state);
 
-	st->nr_rlimits = min_t(unsigned int, RLIM_NLIMITS, CXLFORK_MAX_RLIMITS);
+	tmp.nr_rlimits = min_t(unsigned int, RLIM_NLIMITS, CXLFORK_MAX_RLIMITS);
 	if (current->signal) {
 		task_lock(current->group_leader);
-		for (i = 0; i < st->nr_rlimits; i++) {
-			st->rlimits[i].rlim_cur = current->signal->rlim[i].rlim_cur;
-			st->rlimits[i].rlim_max = current->signal->rlim[i].rlim_max;
+		for (i = 0; i < tmp.nr_rlimits; i++) {
+			tmp.rlimits[i].rlim_cur = current->signal->rlim[i].rlim_cur;
+			tmp.rlimits[i].rlim_max = current->signal->rlim[i].rlim_max;
 		}
 		task_unlock(current->group_leader);
 	}
 
-	st->sig_blocked[0] = current->blocked.sig[0];
+	tmp.sig_blocked[0] = current->blocked.sig[0];
 #if _NSIG_WORDS > 1
-	st->sig_blocked[1] = current->blocked.sig[1];
+	tmp.sig_blocked[1] = current->blocked.sig[1];
 #endif
-	st->sas_ss_sp = current->sas_ss_sp;
-	st->sas_ss_size = current->sas_ss_size;
-	st->sas_ss_flags = current->sas_ss_flags;
+	tmp.sas_ss_sp = current->sas_ss_sp;
+	tmp.sas_ss_size = current->sas_ss_size;
+	tmp.sas_ss_flags = current->sas_ss_flags;
+	memcpy(&desc->global_state, &tmp, sizeof(tmp));
 }
 
 static void cxlfork_capture_thread_state(struct cxlfork_thread_state *st)
 {
 	/* 采集 x86-64 寄存器和 FS/GS base，主要用于记录和可选 TLS 恢复。 */
+	struct cxlfork_thread_state tmp;
 	struct pt_regs *regs = task_pt_regs(current);
 
-	memset(st, 0, sizeof(*st));
+	memset(&tmp, 0, sizeof(tmp));
 	if (regs) {
-		st->ip = regs->ip;
-		st->sp = regs->sp;
-		st->flags = regs->flags;
-		st->ax = regs->ax;
-		st->bx = regs->bx;
-		st->cx = regs->cx;
-		st->dx = regs->dx;
-		st->si = regs->si;
-		st->di = regs->di;
-		st->bp = regs->bp;
+		tmp.ip = regs->ip;
+		tmp.sp = regs->sp;
+		tmp.flags = regs->flags;
+		tmp.ax = regs->ax;
+		tmp.bx = regs->bx;
+		tmp.cx = regs->cx;
+		tmp.dx = regs->dx;
+		tmp.si = regs->si;
+		tmp.di = regs->di;
+		tmp.bp = regs->bp;
 	}
-	st->fsbase = x86_fsbase_read_cpu();
-	st->gsbase = current->thread.gsbase;
+	tmp.fsbase = x86_fsbase_read_cpu();
+	tmp.gsbase = current->thread.gsbase;
+	memcpy(st, &tmp, sizeof(tmp));
 }
 
 static int cxlfork_validate_thread_state(const struct cxlfork_thread_state *st)
@@ -2024,6 +2047,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	u64 slot;
 	u64 start_ns;
 	int ret = 0;
+	bool reopen_fds;
 
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
 	if (!op)
@@ -2045,6 +2069,8 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		ret = -EBUSY;
 		goto out_free;
 	}
+	reopen_fds = op->flags & CXLFORK_F_REOPEN_FDS;
+	op->flags &= ~CXLFORK_F_REOPEN_FDS;
 
 	ret = key_to_slot(op->key);
 	if (ret < 0)
@@ -2055,6 +2081,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		ret = -ENOSPC;
 		goto out_free;
 	}
+	ret = 0;
 
 	mutex_lock(&cxlfork_lock);
 	if (cmpxchg(&desc->state, (u64)CXLFORK_SLOT_FREE,
@@ -2095,8 +2122,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		u64 global_start = ktime_get_ns();
 
 		cxlfork_capture_global_state(desc);
-		ret = cxlfork_capture_fd_state(desc,
-					       op->flags & CXLFORK_F_REOPEN_FDS);
+		ret = cxlfork_capture_fd_state(desc, reopen_fds);
 		if (ret)
 			goto out_mmap_unlock;
 		desc->global_checkpoint_ns = ktime_get_ns() - global_start;
@@ -2694,6 +2720,41 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 	return 0;
 }
 
+static int cxlfork_prefault_dirty_local(struct vm_area_struct *vma,
+					struct cxlfork_desc *desc,
+					const struct cxlfork_region_desc *r)
+{
+	u64 i;
+
+	for (i = 0; i < r->pages; i++) {
+		struct cxlfork_pte_desc *pte = &desc->ptes[r->pgoff_first + i];
+		struct page *page;
+		void *dst;
+		void *src;
+		int ret;
+
+		if (!pte_dirty(__pte(pte->orig_pteval)))
+			continue;
+		if (pte->va != r->start + i * PAGE_SIZE ||
+		    !cxl_ptr(pte->cxl_offset))
+			return -EINVAL;
+		page = alloc_page(GFP_HIGHUSER);
+		if (!page)
+			return -ENOMEM;
+		dst = kmap_local_page(page);
+		src = cxl_ptr(pte->cxl_offset);
+		memcpy(dst, src, PAGE_SIZE);
+		kunmap_local(dst);
+		flush_dcache_page(page);
+		ret = vm_insert_page(vma, pte->va, page);
+		put_page(page);
+		if (ret)
+			return ret;
+		desc->local_copy_pages++;
+	}
+	return 0;
+}
+
 static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 {
 	/* COW/tiering fault 主路径：MoW 读共享、MoA 首次访问复制、hybrid 按热页/写入复制。 */
@@ -2743,13 +2804,13 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 	}
 
-	if ((mapping->flags & CXLFORK_F_HYBRID_TIERING) &&
-	    (vmf->flags & FAULT_FLAG_WRITE))
-		goto copy_local;
-	if ((mapping->flags & CXLFORK_F_HYBRID_TIERING) &&
-	    mapping->tiering_hot_stride_pages &&
-	    page_idx % mapping->tiering_hot_stride_pages == 0)
-		goto copy_local;
+	if (mapping->flags & CXLFORK_F_HYBRID_TIERING) {
+		pte_t orig = __pte(pte->orig_pteval);
+
+		if ((vmf->flags & FAULT_FLAG_WRITE) || pte_young(orig) ||
+		    pte_dirty(orig))
+			goto copy_local;
+	}
 
 	if (mapping->flags & (CXLFORK_F_SHARED_COW | CXLFORK_F_HYBRID_TIERING)) {
 		vm_fault_t ret;
@@ -2881,8 +2942,11 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	if (mapping->flags & CXLFORK_F_SHARED_COW)
 		ret = cxlfork_prefault_shared_cxl(vma, desc, r,
 						  &state->pte_image_validate_ns);
-	else
+	else {
 		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
+		if (mapping->flags & CXLFORK_F_HYBRID_TIERING)
+			ret = cxlfork_prefault_dirty_local(vma, desc, r);
+	}
 	if (ret) {
 		if (mapping->holds_slot_reader)
 			cxlfork_slot_put_reader_locked(desc, mapping->key,
@@ -3162,7 +3226,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
-		CXLFORK_CAP_GLOBAL_FILE_STATE;
+		CXLFORK_CAP_GLOBAL_FILE_STATE |
+		CXLFORK_CAP_A_BIT_HYBRID;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;
@@ -3173,6 +3238,85 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 	caps.max_ptes = CXLFORK_MAX_PTES;
 	caps.descriptor_version = CXLFORK_DESC_VERSION;
 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
+}
+
+static int cxlfork_mark_one_pte(struct mm_struct *mm, unsigned long addr,
+				u64 flags)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	pte_t pte;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return -EFAULT;
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return -EFAULT;
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		return -EFAULT;
+	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd) || pmd_trans_huge(*pmd))
+		return -EOPNOTSUPP;
+	ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!ptep)
+		return -EFAULT;
+	pte = *ptep;
+	if (!pte_present(pte)) {
+		pte_unmap_unlock(ptep, ptl);
+		return -EFAULT;
+	}
+	if (flags & CXLFORK_PTE_MARK_CLEAR_ACCESSED)
+		pte = pte_mkold(pte);
+	if (flags & CXLFORK_PTE_MARK_CLEAR_DIRTY)
+		pte = pte_mkclean(pte);
+	if (flags & CXLFORK_PTE_MARK_SET_ACCESSED)
+		pte = pte_mkyoung(pte);
+	if (flags & CXLFORK_PTE_MARK_SET_DIRTY)
+		pte = pte_mkdirty(pte);
+	set_pte_at(mm, addr, ptep, pte);
+	pte_unmap_unlock(ptep, ptl);
+	return 0;
+}
+
+static int cxlfork_ioctl_pte_mark_v2(struct cxlfork_pte_mark_v2 __user *uarg)
+{
+	struct cxlfork_pte_mark_v2 mark;
+	unsigned long start;
+	unsigned long end;
+	unsigned long addr;
+	int ret = 0;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(mark));
+	if (ret)
+		return ret;
+	if (copy_from_user(&mark, uarg, sizeof(mark)))
+		return -EFAULT;
+	if (mark.reserved1 || (mark.flags & ~CXLFORK_PTE_MARK_KNOWN_MASK))
+		return -EINVAL;
+	if (!mark.length || !PAGE_ALIGNED(mark.start) ||
+	    !PAGE_ALIGNED(mark.length))
+		return -EINVAL;
+	if (check_add_overflow((unsigned long)mark.start,
+			       (unsigned long)mark.length, &end) ||
+	    end <= mark.start)
+		return -EINVAL;
+	start = (unsigned long)mark.start;
+
+	mmap_write_lock(current->mm);
+	for (addr = start; addr < end; addr += PAGE_SIZE) {
+		ret = cxlfork_mark_one_pte(current->mm, addr, mark.flags);
+		if (ret)
+			break;
+	}
+	flush_tlb_mm_range(current->mm, start, end, PAGE_SHIFT, false);
+	mmap_write_unlock(current->mm);
+	return ret;
 }
 
 static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
@@ -3258,6 +3402,8 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 				continue;
 			inspect.shared_pfn =
 				(cxl_phys + pte->cxl_offset) >> PAGE_SHIFT;
+			inspect.orig_pte = pte->orig_pteval;
+			inspect.flags |= CXLFORK_INSPECT_F_ORIG_PTE_VALID;
 			break;
 		}
 		if (!cxlfork_find_shared_leaf_pfn(desc, address, &leaf_pfn)) {
@@ -3514,6 +3660,8 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		return cxlfork_ioctl_query_caps_v2((void __user *)arg);
 	case CXLFORK_INSPECT_V2:
 		return cxlfork_ioctl_inspect_v2((void __user *)arg);
+	case CXLFORK_PTE_MARK_V2:
+		return cxlfork_ioctl_pte_mark_v2((void __user *)arg);
 	default:
 		return -ENOTTY;
 	}
