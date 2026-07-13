@@ -592,6 +592,13 @@ static int restore_hybrid_snapshot(uint64_t key)
 		perror("FORK_RESUME hybrid");
 		return 1;
 	}
+	if (op.dirty_prefault_pages != 1 || !op.dirty_prefault_ns) {
+		fprintf(stderr, "hybrid: dirty-prefault breakdown invalid pages=%" PRIu64
+			" ns=%" PRIu64 "\n",
+			(uint64_t)op.dirty_prefault_pages,
+			(uint64_t)op.dirty_prefault_ns);
+		return 1;
+	}
 	if (inspect_addr(fd, key, (uintptr_t)base, &hot) ||
 	    inspect_addr(fd, key, (uintptr_t)base + page, &cold) ||
 	    inspect_addr(fd, key, (uintptr_t)base + 2 * page, &dirty)) {
@@ -638,10 +645,12 @@ static int restore_hybrid_snapshot(uint64_t key)
 	       " hot_orig=%" PRIx64 " cold_orig=%" PRIx64
 	       " dirty_orig=%" PRIx64 " hot_pfn=%" PRIu64
 	       " cold_pfn=%" PRIu64 " dirty_pfn=%" PRIu64
+	       " dirty_prefault_pages=%" PRIu64
 	       " verify=%s\n",
 	       key, (uint64_t)hot.orig_pte, (uint64_t)cold.orig_pte,
 	       (uint64_t)dirty.orig_pte, (uint64_t)hot.current_pfn,
 	       (uint64_t)cold.current_pfn, (uint64_t)dirty.current_pfn,
+	       (uint64_t)op.dirty_prefault_pages,
 	       failed ? "fail" : "ok");
 	close(fd);
 	return failed ? 1 : 0;
@@ -690,6 +699,35 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	}
 	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
 		perror("FORK_RESUME");
+		return 1;
+	}
+	if ((!strcmp(policy, "readonly") || !strcmp(policy, "mow")) &&
+	    (!op.shared_leaf_attach_ns ||
+	     !op.shared_leaf_attach_pages ||
+	     op.shared_leaf_attach_pages > op.total_pages ||
+	     !op.direct_pte_install_ns ||
+	     op.direct_pte_install_pages != op.total_pages)) {
+		fprintf(stderr, "%s restore missing shared-leaf/direct-install breakdown"
+			" shared_leaf_ns=%" PRIu64 " shared_leaf_pages=%" PRIu64
+			" direct_ns=%" PRIu64 " direct_pages=%" PRIu64 "\n",
+			policy, (uint64_t)op.shared_leaf_attach_ns,
+			(uint64_t)op.shared_leaf_attach_pages,
+			(uint64_t)op.direct_pte_install_ns,
+			(uint64_t)op.direct_pte_install_pages);
+		return 1;
+	}
+	if (!strcmp(policy, "mow") &&
+	    (!op.pte_image_reconstruct_ns ||
+	     op.pte_image_reconstruct_pages != op.total_pages ||
+	     op.pte_attach_ns != op.pte_image_reconstruct_ns ||
+	     op.pte_attach_pages != op.pte_image_reconstruct_pages)) {
+		fprintf(stderr, "MoW restore missing PTE-image reconstruction breakdown"
+			" reconstruct_ns=%" PRIu64 " reconstruct_pages=%" PRIu64
+			" legacy_ns=%" PRIu64 " legacy_pages=%" PRIu64 "\n",
+			(uint64_t)op.pte_image_reconstruct_ns,
+			(uint64_t)op.pte_image_reconstruct_pages,
+			(uint64_t)op.pte_attach_ns,
+			(uint64_t)op.pte_attach_pages);
 		return 1;
 	}
 	hash = hash_restored_regions(&op);
@@ -790,6 +828,8 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       " after_pmd_pfn=%" PRIu64 " second_pmd_pfn=%" PRIu64
 	       " vma_root_pfn=%" PRIu64 " vma_nodes=%" PRIu64
 	       " vma_lookup=%" PRIx64 "-%" PRIx64
+	       " direct_pages=%" PRIu64 " shared_leaf_pages=%" PRIu64
+	       " reconstruct_pages=%" PRIu64
 	       " verify=ok\n",
 	       key, policy, (uint64_t)op.nr_regions, (uint64_t)op.total_pages,
 	       hash, (uint64_t)before.shared_pfn,
@@ -802,7 +842,10 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       (uint64_t)before.vma_maple_root_pfn,
 	       (uint64_t)before.vma_maple_nodes,
 	       (uint64_t)before.vma_lookup_start,
-	       (uint64_t)before.vma_lookup_end);
+	       (uint64_t)before.vma_lookup_end,
+	       (uint64_t)op.direct_pte_install_pages,
+	       (uint64_t)op.shared_leaf_attach_pages,
+	       (uint64_t)op.pte_image_reconstruct_pages);
 	close(fd);
 	return 0;
 }

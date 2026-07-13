@@ -361,6 +361,12 @@ struct cxlfork_restore {
 	__u64 private_rebase_pages;
 	__u64 global_detach_ns;
 	__u64 global_attach_ns;
+	__u64 pte_image_reconstruct_ns;
+	__u64 pte_image_reconstruct_pages;
+	__u64 shared_leaf_attach_ns;
+	__u64 shared_leaf_attach_pages;
+	__u64 dirty_prefault_ns;
+	__u64 dirty_prefault_pages;
 	struct cxlfork_namespace_state restore_ns_state;
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;

@@ -89,6 +89,28 @@ struct cxlfork_file_state {
 	u64 tiering_hot_stride_pages;
 	u64 pte_image_validate_ns;
 	u64 state_image_validate_ns;
+	u64 direct_pte_install_ns;
+	u64 direct_pte_install_pages;
+	u64 dirty_prefault_ns;
+	u64 dirty_prefault_pages;
+};
+
+struct cxlfork_restore_breakdown {
+	/* 单次 restore 调用的 breakdown；不得写入共享 desc 作为累计值。 */
+	u64 global_restore_ns;
+	u64 pte_image_reconstruct_ns;
+	u64 pte_image_reconstruct_pages;
+	u64 shared_leaf_attach_ns;
+	u64 shared_leaf_attach_pages;
+	u64 direct_pte_install_ns;
+	u64 direct_pte_install_pages;
+	u64 pte_image_validate_ns;
+	u64 pt_page_image_validate_ns;
+	u64 vma_tree_validate_ns;
+	u64 state_image_validate_ns;
+	u64 private_rebase_validate_ns;
+	u64 dirty_prefault_ns;
+	u64 dirty_prefault_pages;
 };
 
 struct cxlfork_mapping {
@@ -1171,7 +1193,6 @@ static void cxlfork_copy_mm_state_to_restore(struct cxlfork_restore *op,
 	op->private_rebase_entries = desc->private_rebase_entries;
 	op->private_rebase_pages = desc->private_rebase_pages;
 	op->global_detach_ns = desc->global_detach_ns;
-	op->global_attach_ns = desc->global_attach_ns;
 	memcpy(op->fds, desc->fds, sizeof(op->fds));
 }
 
@@ -2281,12 +2302,14 @@ out_free:
 
 static int cxlfork_map_region(struct cxlfork_desc *desc,
 			      struct cxlfork_region_desc *r,
-			      bool readonly)
+			      bool readonly,
+			      struct cxlfork_restore_breakdown *bd)
 {
 	/* 非 COW 路径：直接把 CXL 物理页 remap 到目标进程地址。 */
 	struct cxlfork_mapping *mapping;
 	unsigned long addr = r->start;
 	unsigned long mapped;
+	u64 install_start;
 	u64 i;
 	int ret;
 
@@ -2321,6 +2344,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 
 	addr = r->start;
 	mmap_write_lock(current->mm);
+	install_start = ktime_get_ns();
 	for (i = 0; i < r->pages; i++, addr += PAGE_SIZE) {
 		struct vm_area_struct *vma;
 		struct cxlfork_pte_desc *pte = &desc->ptes[r->pgoff_first + i];
@@ -2342,13 +2366,20 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 		if (ret) {
 			pr_warn("cxlfork: remap addr=%lx pfn=%lx ret=%d\n",
 				addr, pfn, ret);
+			if (bd)
+				bd->direct_pte_install_ns +=
+					ktime_get_ns() - install_start;
 			mmap_write_unlock(current->mm);
 			cxlfork_slot_put_reader(mapping->key,
 						mapping->generation);
 			kfree(mapping);
 			return ret;
 		}
+		if (bd)
+			bd->direct_pte_install_pages++;
 	}
+	if (bd)
+		bd->direct_pte_install_ns += ktime_get_ns() - install_start;
 	{
 		struct vm_area_struct *vma = find_vma(current->mm, r->start);
 
@@ -2397,7 +2428,8 @@ static int cxlfork_install_shared_leaf_pmd(struct mm_struct *mm,
 static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 					  struct cxlfork_region_desc *r,
 					  u64 mapping_flags,
-					  bool writable_vma)
+					  bool writable_vma,
+					  struct cxlfork_restore_breakdown *bd)
 {
 	/*
 	 * Shared leaf gate: PMD-aligned, full-PMD regions only.
@@ -2412,6 +2444,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	unsigned long mmap_flags = (writable_vma ? MAP_PRIVATE : MAP_SHARED) |
 		MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
 	int ret = 0;
+	u64 attach_start;
 
 	if (!IS_ALIGNED(r->start, PMD_SIZE) || !IS_ALIGNED(r->length, PMD_SIZE))
 		return -EOPNOTSUPP;
@@ -2455,6 +2488,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	vma->vm_ops = &cxlfork_vm_ops;
 	vma->vm_private_data = mapping;
 
+	attach_start = ktime_get_ns();
 	for (addr = r->start; addr < r->start + r->length; addr += PMD_SIZE) {
 		unsigned long leaf_pfn;
 
@@ -2464,8 +2498,17 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 		ret = cxlfork_install_shared_leaf_pmd(current->mm, addr, leaf_pfn);
 		if (ret)
 			goto out_unlock;
-		desc->direct_pte_install_pages += PMD_SIZE >> PAGE_SHIFT;
+		if (bd) {
+			bd->direct_pte_install_pages += PMD_SIZE >> PAGE_SHIFT;
+			bd->shared_leaf_attach_pages += PMD_SIZE >> PAGE_SHIFT;
+		}
 		desc->shared_map_pages += PMD_SIZE >> PAGE_SHIFT;
+	}
+	if (bd) {
+		u64 elapsed = ktime_get_ns() - attach_start;
+
+		bd->direct_pte_install_ns += elapsed;
+		bd->shared_leaf_attach_ns += elapsed;
 	}
 
 out_unlock:
@@ -2638,7 +2681,7 @@ static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
 static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 				       struct cxlfork_desc *desc,
 				       const struct cxlfork_region_desc *r,
-				       u64 *validate_ns)
+				       struct cxlfork_file_state *state)
 {
 	/* MoW 读共享路径：先校验 PTE image，再批量安装只读 CXL PFN 映射。 */
 	const struct cxlfork_leaf_pte_image *image;
@@ -2678,8 +2721,8 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 		if (ret || pfn != ((cxl_phys + pte->cxl_offset) >> PAGE_SHIFT))
 			return -EINVAL;
 	}
-	if (validate_ns)
-		*validate_ns += ktime_get_ns() - validate_start;
+	if (state)
+		state->pte_image_validate_ns += ktime_get_ns() - validate_start;
 
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	install_start = ktime_get_ns();
@@ -2712,18 +2755,22 @@ static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
 					 prot_from_uapi(r->prot, true));
 		if (ret)
 			return ret;
-		desc->direct_pte_install_pages += run_pages;
+		if (state)
+			state->direct_pte_install_pages += run_pages;
 		desc->shared_map_pages += run_pages;
 		i += run_pages;
 	}
-	desc->direct_pte_install_ns += ktime_get_ns() - install_start;
+	if (state)
+		state->direct_pte_install_ns += ktime_get_ns() - install_start;
 	return 0;
 }
 
 static int cxlfork_prefault_dirty_local(struct vm_area_struct *vma,
 					struct cxlfork_desc *desc,
-					const struct cxlfork_region_desc *r)
+					const struct cxlfork_region_desc *r,
+					struct cxlfork_file_state *state)
 {
+	u64 start_ns = ktime_get_ns();
 	u64 i;
 
 	for (i = 0; i < r->pages; i++) {
@@ -2751,7 +2798,11 @@ static int cxlfork_prefault_dirty_local(struct vm_area_struct *vma,
 		if (ret)
 			return ret;
 		desc->local_copy_pages++;
+		if (state)
+			state->dirty_prefault_pages++;
 	}
+	if (state)
+		state->dirty_prefault_ns += ktime_get_ns() - start_ns;
 	return 0;
 }
 
@@ -2940,12 +2991,11 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	mapping->holds_slot_reader = true;
 
 	if (mapping->flags & CXLFORK_F_SHARED_COW)
-		ret = cxlfork_prefault_shared_cxl(vma, desc, r,
-						  &state->pte_image_validate_ns);
+		ret = cxlfork_prefault_shared_cxl(vma, desc, r, state);
 	else {
 		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 		if (mapping->flags & CXLFORK_F_HYBRID_TIERING)
-			ret = cxlfork_prefault_dirty_local(vma, desc, r);
+			ret = cxlfork_prefault_dirty_local(vma, desc, r, state);
 	}
 	if (ret) {
 		if (mapping->holds_slot_reader)
@@ -2979,12 +3029,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 	bool apply_global_state;
 	bool apply_thread_state;
 	bool apply_tls_state;
+	struct cxlfork_restore_breakdown bd = {};
 	u64 nr_fds_restored = 0;
-	u64 global_restore_ns = 0;
-	u64 pte_attach_ns = 0;
-	u64 pte_attach_pages = 0;
-	u64 pte_image_validate_ns = 0;
-	u64 state_image_validate_ns = 0;
 	u64 generation = 0;
 	bool restore_reader = false;
 	int slot;
@@ -3024,14 +3070,6 @@ static int cxlfork_ioctl_restore(struct file *file,
 	restore_reader = true;
 
 	start_ns = ktime_get_ns();
-	desc->pt_page_image_validate_ns = 0;
-	desc->vma_tree_validate_ns = 0;
-	desc->private_rebase_validate_ns = 0;
-	desc->direct_pte_install_ns = 0;
-	desc->direct_pte_install_pages = 0;
-	desc->vma_maple_attach_ns = 0;
-	desc->vma_maple_nodes = 0;
-	desc->vma_maple_root_offset = 0;
 	readonly = op->flags & CXLFORK_F_MAP_READONLY;
 	private_cow = op->flags & CXLFORK_F_PRIVATE_COW;
 	shared_cow = op->flags & CXLFORK_F_SHARED_COW;
@@ -3045,18 +3083,18 @@ static int cxlfork_ioctl_restore(struct file *file,
 		ret = -EINVAL;
 		goto out_unlock;
 	}
-	ret = cxlfork_validate_vma_tree_image(desc, &desc->vma_tree_validate_ns);
+	ret = cxlfork_validate_vma_tree_image(desc, &bd.vma_tree_validate_ns);
 	if (ret)
 		goto out_unlock;
-	ret = cxlfork_validate_state_image(desc, &state_image_validate_ns);
+	ret = cxlfork_validate_state_image(desc, &bd.state_image_validate_ns);
 	if (ret)
 		goto out_unlock;
 	ret = cxlfork_validate_pt_page_image(desc,
-					       &desc->pt_page_image_validate_ns);
+					       &bd.pt_page_image_validate_ns);
 	if (ret)
 		goto out_unlock;
 	ret = cxlfork_validate_private_rebase_image(desc,
-						   &desc->private_rebase_validate_ns);
+						   &bd.private_rebase_validate_ns);
 	if (ret)
 		goto out_unlock;
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
@@ -3065,7 +3103,11 @@ static int cxlfork_ioctl_restore(struct file *file,
 		state->mmap_flags = op->flags;
 		state->tiering_hot_stride_pages = op->tiering_hot_stride_pages;
 		state->pte_image_validate_ns = 0;
-		state->state_image_validate_ns = state_image_validate_ns;
+		state->state_image_validate_ns = bd.state_image_validate_ns;
+		state->direct_pte_install_ns = 0;
+		state->direct_pte_install_pages = 0;
+		state->dirty_prefault_ns = 0;
+		state->dirty_prefault_pages = 0;
 	}
 	mutex_unlock(&cxlfork_lock);
 	for (i = 0; i < desc->nr_regions; i++) {
@@ -3074,7 +3116,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 		if (shared_cow) {
 			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i],
 							     CXLFORK_F_SHARED_COW,
-							     true);
+							     true, &bd);
 			if (ret == -EOPNOTSUPP)
 				ret = cxlfork_map_region_cow(file, &desc->regions[i],
 							     i, false);
@@ -3084,26 +3126,37 @@ static int cxlfork_ioctl_restore(struct file *file,
 		} else if (readonly) {
 			ret = cxlfork_map_region_shared_leaf(desc, &desc->regions[i],
 							     CXLFORK_F_MAP_READONLY,
-							     false);
+							     false, &bd);
 			if (ret == -EOPNOTSUPP)
 				ret = cxlfork_map_region(desc, &desc->regions[i],
-							 readonly);
+							 readonly, &bd);
 		} else {
-			ret = cxlfork_map_region(desc, &desc->regions[i], readonly);
+			ret = cxlfork_map_region(desc, &desc->regions[i],
+						 readonly, &bd);
 		}
 		if (!ret && shared_cow) {
-			pte_attach_ns += ktime_get_ns() - map_start;
-			pte_attach_pages += desc->regions[i].pages;
+			bd.pte_image_reconstruct_ns += ktime_get_ns() - map_start;
+			bd.pte_image_reconstruct_pages += desc->regions[i].pages;
 		}
 		if (ret)
 			break;
 	}
 	mutex_lock(&cxlfork_lock);
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
+		bd.pte_image_validate_ns += state->pte_image_validate_ns;
+		bd.direct_pte_install_ns += state->direct_pte_install_ns;
+		bd.direct_pte_install_pages += state->direct_pte_install_pages;
+		bd.dirty_prefault_ns += state->dirty_prefault_ns;
+		bd.dirty_prefault_pages += state->dirty_prefault_pages;
 		state->mmap_key = 0;
 		state->mmap_generation = 0;
 		state->mmap_flags = 0;
 		state->tiering_hot_stride_pages = 0;
+		state->pte_image_validate_ns = 0;
+		state->direct_pte_install_ns = 0;
+		state->direct_pte_install_pages = 0;
+		state->dirty_prefault_ns = 0;
+		state->dirty_prefault_pages = 0;
 	}
 	if (ret)
 		goto out_unlock;
@@ -3126,8 +3179,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 			if (ret)
 				goto out_unlock;
 		}
-		global_restore_ns = ktime_get_ns() - global_start;
-		desc->global_attach_ns = global_restore_ns;
+		bd.global_restore_ns = ktime_get_ns() - global_start;
 	}
 	memset(op, 0, sizeof(*op));
 	op->key = desc->key;
@@ -3140,18 +3192,23 @@ static int cxlfork_ioctl_restore(struct file *file,
 	op->restore_ns = ktime_get_ns() - start_ns;
 	cxlfork_copy_mm_state_to_restore(op, desc);
 	op->nr_fds_restored = nr_fds_restored;
-	op->global_restore_ns = global_restore_ns;
-	op->pte_attach_ns = pte_attach_ns;
-	op->pte_attach_pages = pte_attach_pages;
-	op->direct_pte_install_ns = desc->direct_pte_install_ns;
-	op->direct_pte_install_pages = desc->direct_pte_install_pages;
-	if (state)
-		pte_image_validate_ns = state->pte_image_validate_ns;
-	op->pte_image_validate_ns = pte_image_validate_ns;
-	op->pt_page_image_validate_ns = desc->pt_page_image_validate_ns;
-	op->vma_tree_validate_ns = desc->vma_tree_validate_ns;
-	op->state_image_validate_ns = state_image_validate_ns;
-	op->private_rebase_validate_ns = desc->private_rebase_validate_ns;
+	op->global_restore_ns = bd.global_restore_ns;
+	op->global_attach_ns = bd.global_restore_ns;
+	op->pte_attach_ns = bd.pte_image_reconstruct_ns;
+	op->pte_attach_pages = bd.pte_image_reconstruct_pages;
+	op->direct_pte_install_ns = bd.direct_pte_install_ns;
+	op->direct_pte_install_pages = bd.direct_pte_install_pages;
+	op->pte_image_validate_ns = bd.pte_image_validate_ns;
+	op->pt_page_image_validate_ns = bd.pt_page_image_validate_ns;
+	op->vma_tree_validate_ns = bd.vma_tree_validate_ns;
+	op->state_image_validate_ns = bd.state_image_validate_ns;
+	op->private_rebase_validate_ns = bd.private_rebase_validate_ns;
+	op->pte_image_reconstruct_ns = bd.pte_image_reconstruct_ns;
+	op->pte_image_reconstruct_pages = bd.pte_image_reconstruct_pages;
+	op->shared_leaf_attach_ns = bd.shared_leaf_attach_ns;
+	op->shared_leaf_attach_pages = bd.shared_leaf_attach_pages;
+	op->dirty_prefault_ns = bd.dirty_prefault_ns;
+	op->dirty_prefault_pages = bd.dirty_prefault_pages;
 	cxlfork_capture_namespace_state(&op->restore_ns_state);
 	for (i = 0; i < desc->nr_regions; i++) {
 		op->regions[i].start = desc->regions[i].start;
