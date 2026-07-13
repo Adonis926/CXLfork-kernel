@@ -19,6 +19,7 @@
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/shmem_fs.h>
+#include <linux/cxlfork_mm.h>
 
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
@@ -1033,6 +1034,9 @@ static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
 	int write = (gup_flags & FOLL_WRITE);
 	int foreign = (gup_flags & FOLL_REMOTE);
 	bool vma_anon = vma_is_anonymous(vma);
+
+	if (cxlfork_vma_is_restored(vma))
+		return -EOPNOTSUPP;
 
 	if (vm_flags & (VM_IO | VM_PFNMAP))
 		return -EFAULT;
@@ -3199,6 +3203,9 @@ static int internal_get_user_pages_fast(unsigned long start,
 		return -EOVERFLOW;
 	if (end > TASK_SIZE_MAX)
 		return -EFAULT;
+	ret = cxlfork_gup_check_range(current->mm, start, end);
+	if (ret)
+		return ret;
 	if (unlikely(!access_ok((void __user *)start, len)))
 		return -EFAULT;
 

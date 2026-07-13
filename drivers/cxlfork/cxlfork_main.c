@@ -2902,12 +2902,15 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 	if (mapped != r->start) {
 		pr_warn("cxlfork: vm_mmap returned %lx expected=%llx\n",
 			mapped, r->start);
+		vm_munmap(mapped, r->length);
 		return -EINVAL;
 	}
 
 	mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
-	if (!mapping)
+	if (!mapping) {
+		vm_munmap(r->start, r->length);
 		return -ENOMEM;
+	}
 	mapping->key = desc->key;
 	mapping->generation = desc->generation;
 	mapping->flags = readonly ? CXLFORK_F_MAP_READONLY : 0;
@@ -2927,10 +2930,8 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 		if (!vma || vma->vm_start > addr) {
 			pr_warn("cxlfork: no vma for addr=%lx start=%llx len=%llx\n",
 				addr, r->start, r->length);
-			mmap_write_unlock(current->mm);
-			cxlfork_restore_ctx_mapping_put(mapping->ctx);
-			kfree(mapping);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto out_unmap;
 		}
 		vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 		ret = io_remap_pfn_range(vma, addr, pfn, PAGE_SIZE,
@@ -2941,10 +2942,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			if (bd)
 				bd->direct_pte_install_ns +=
 					ktime_get_ns() - install_start;
-			mmap_write_unlock(current->mm);
-			cxlfork_restore_ctx_mapping_put(mapping->ctx);
-			kfree(mapping);
-			return ret;
+			goto out_unmap;
 		}
 		if (bd)
 			bd->direct_pte_install_pages++;
@@ -2956,10 +2954,8 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 
 		if (!vma || vma->vm_start != r->start ||
 		    vma->vm_end != r->start + r->length) {
-			mmap_write_unlock(current->mm);
-			cxlfork_restore_ctx_mapping_put(mapping->ctx);
-			kfree(mapping);
-			return -EFAULT;
+			ret = -EFAULT;
+			goto out_unmap;
 		}
 		vma->vm_ops = &cxlfork_vm_ops;
 		vma->vm_private_data = mapping;
@@ -2967,6 +2963,13 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 	mmap_write_unlock(current->mm);
 
 	return 0;
+
+out_unmap:
+	mmap_write_unlock(current->mm);
+	cxlfork_restore_ctx_mapping_put(mapping->ctx);
+	kfree(mapping);
+	vm_munmap(r->start, r->length);
+	return ret;
 }
 
 static int cxlfork_install_shared_leaf_pmd(struct mm_struct *mm,
@@ -3191,8 +3194,10 @@ static int cxlfork_map_region_cow(struct file *file,
 				r->start, r->length, mapped);
 		return (int)mapped;
 	}
-	if (mapped != r->start)
+	if (mapped != r->start) {
+		vm_munmap(mapped, r->length);
 		return -EINVAL;
+	}
 	return 0;
 }
 
@@ -3522,10 +3527,61 @@ static void cxlfork_vma_close(struct vm_area_struct *vma)
 	kfree(mapping);
 }
 
+bool cxlfork_vma_is_restored(const struct vm_area_struct *vma)
+{
+	return vma && vma->vm_ops == &cxlfork_vm_ops;
+}
+
+int cxlfork_gup_check_range(struct mm_struct *mm, unsigned long start,
+			    unsigned long end)
+{
+	struct vm_area_struct *vma;
+	VMA_ITERATOR(vmi, mm, start);
+	int ret = 0;
+
+	if (start >= end)
+		return 0;
+	mmap_read_lock(mm);
+	for_each_vma_range(vmi, vma, end) {
+		if (cxlfork_vma_is_restored(vma)) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+	}
+	mmap_read_unlock(mm);
+	return ret;
+}
+
+int cxlfork_fork_check_mm(struct mm_struct *mm)
+{
+	return cxlfork_gup_check_range(mm, 0, TASK_SIZE_MAX);
+}
+
+static int cxlfork_vma_may_split(struct vm_area_struct *vma,
+				 unsigned long addr)
+{
+	return -EOPNOTSUPP;
+}
+
+static int cxlfork_vma_mremap(struct vm_area_struct *vma)
+{
+	return -EOPNOTSUPP;
+}
+
+static int cxlfork_vma_mprotect(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end,
+				unsigned long newflags)
+{
+	return -EOPNOTSUPP;
+}
+
 static const struct vm_operations_struct cxlfork_vm_ops = {
 	.open = cxlfork_vma_open,
 	.fault = cxlfork_fault,
 	.close = cxlfork_vma_close,
+	.may_split = cxlfork_vma_may_split,
+	.mremap = cxlfork_vma_mremap,
+	.mprotect = cxlfork_vma_mprotect,
 };
 
 static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
@@ -3626,6 +3682,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	bool apply_global_state;
 	bool apply_thread_state;
 	bool apply_tls_state;
+	bool test_fail_after_first = false;
 	struct cxlfork_restore_breakdown bd = {};
 	struct cxlfork_region_desc *regions;
 	u64 nr_fds_restored = 0;
@@ -3635,6 +3692,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	int slot;
 	int ret = 0;
 	int i;
+	int mapped_regions = 0;
 
 	if (!op->key) {
 		ret = -EINVAL;
@@ -3687,6 +3745,9 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	apply_global_state = op->flags & CXLFORK_F_APPLY_GLOBAL_STATE;
 	apply_thread_state = op->flags & CXLFORK_F_APPLY_THREAD_STATE;
 	apply_tls_state = op->flags & CXLFORK_F_APPLY_TLS_STATE;
+	if (v2)
+		test_fail_after_first =
+			v2->flags & CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION;
 	if ((private_cow + shared_cow + hybrid_tiering) > 1) {
 		ret = -EINVAL;
 		goto out_unlock;
@@ -3710,6 +3771,18 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		ret = -EILSEQ;
 		goto out_unlock;
 	}
+	/* Reject address conflicts before creating any VMA. MAP_FIXED fallback is forbidden. */
+	mmap_read_lock(current->mm);
+	for (i = 0; i < desc->nr_regions; i++) {
+		if (find_vma_intersection(current->mm, regions[i].start,
+					  regions[i].start + regions[i].length)) {
+			ret = -EEXIST;
+			break;
+		}
+	}
+	mmap_read_unlock(current->mm);
+	if (ret)
+		goto out_unlock;
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
 		state->mmap_key = desc->key;
 		state->mmap_generation = generation;
@@ -3754,6 +3827,11 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		}
 		if (ret)
 			break;
+		mapped_regions++;
+		if (test_fail_after_first && mapped_regions == 1) {
+			ret = -EIO;
+			break;
+		}
 	}
 	mutex_lock(&cxlfork_lock);
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
@@ -3895,6 +3973,26 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 
 out_unlock:
 	mutex_unlock(&cxlfork_lock);
+	if (ret && mapped_regions) {
+		u64 rollback_start = ktime_get_ns();
+
+		while (mapped_regions--) {
+			int unmap_ret = vm_munmap(regions[mapped_regions].start,
+						  regions[mapped_regions].length);
+
+			if (unmap_ret)
+				pr_warn("cxlfork: restore rollback start=%llx len=%llx ret=%d\n",
+					regions[mapped_regions].start,
+					regions[mapped_regions].length, unmap_ret);
+		}
+		if (ctx) {
+			unsigned long stats_flags;
+
+			spin_lock_irqsave(&ctx->lock, stats_flags);
+			ctx->stats.rollback_ns += ktime_get_ns() - rollback_start;
+			spin_unlock_irqrestore(&ctx->lock, stats_flags);
+		}
+	}
 	if (ctx) {
 		if (!atomic_read(&ctx->mappings)) {
 			cxlfork_restore_ctx_release_reader(ctx);
@@ -3989,7 +4087,8 @@ static int cxlfork_ioctl_resume_v2(struct file *file,
 		CXLFORK_F_PRIVATE_COW | CXLFORK_F_SHARED_COW |
 		CXLFORK_F_APPLY_MM_STATE | CXLFORK_F_REOPEN_FDS |
 		CXLFORK_F_APPLY_THREAD_STATE | CXLFORK_F_APPLY_TLS_STATE |
-		CXLFORK_F_APPLY_GLOBAL_STATE | CXLFORK_F_HYBRID_TIERING;
+		CXLFORK_F_APPLY_GLOBAL_STATE | CXLFORK_F_HYBRID_TIERING |
+		CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION;
 	struct cxlfork_restore *legacy;
 	struct cxlfork_resume_v2 op;
 	u32 i;
@@ -4003,6 +4102,12 @@ static int cxlfork_ioctl_resume_v2(struct file *file,
 	if (!op.key || !op.generation || !op.regions_ptr ||
 	    !op.region_capacity || (op.flags & ~known_flags))
 		return -EINVAL;
+	if (op.flags & CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION) {
+		if (!IS_ENABLED(CONFIG_CXLFORK_SELFTEST))
+			return -EOPNOTSUPP;
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+	}
 	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
 		if (op.reserved1[i])
 			return -EINVAL;
@@ -4011,7 +4116,7 @@ static int cxlfork_ioctl_resume_v2(struct file *file,
 	if (!legacy)
 		return -ENOMEM;
 	legacy->key = op.key;
-	legacy->flags = op.flags;
+	legacy->flags = op.flags & ~CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION;
 	memset(&op.stats, 0, sizeof(op.stats));
 	op.region_count = 0;
 	op.restore_id = 0;
@@ -4054,6 +4159,14 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 	caps.max_regions = CXLFORK_MAX_REGIONS;
 	caps.max_ptes = CXLFORK_MAX_PTES;
 	caps.descriptor_version = CXLFORK_DESC_VERSION;
+	caps.mm_failfast_mask = CXLFORK_MM_FAILFAST_MPROTECT |
+		CXLFORK_MM_FAILFAST_FORK | CXLFORK_MM_FAILFAST_GUP |
+		CXLFORK_MM_FAILFAST_PARTIAL_MUNMAP |
+		CXLFORK_MM_FAILFAST_MREMAP;
+	caps.shared_leaf_alignment = PMD_SIZE;
+	caps.restore_policy_mask = CXLFORK_F_MAP_READONLY |
+		CXLFORK_F_PRIVATE_COW | CXLFORK_F_SHARED_COW |
+		CXLFORK_F_HYBRID_TIERING;
 	return copy_to_user(uarg, &caps, sizeof(caps)) ? -EFAULT : 0;
 }
 
@@ -4665,6 +4778,39 @@ out_copy:
 	op.token = READ_ONCE(shared->token);
 	return copy_to_user(uarg, &op, sizeof(op)) ? -EFAULT : 0;
 }
+
+static int cxlfork_ioctl_gup_probe_v2(struct cxlfork_gup_probe_v2 __user *uarg)
+{
+	struct cxlfork_gup_probe_v2 op;
+	struct page *page = NULL;
+	unsigned int gup_flags = 0;
+	int ret;
+	u32 i;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	ret = cxlfork_check_v2_header(uarg, sizeof(op));
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (!op.address || !IS_ALIGNED(op.address, PAGE_SIZE) ||
+	    (op.flags & ~CXLFORK_GUP_PROBE_KNOWN_MASK))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+	if (op.flags & CXLFORK_GUP_PROBE_WRITE)
+		gup_flags |= FOLL_WRITE;
+	if (op.flags & CXLFORK_GUP_PROBE_LONGTERM)
+		gup_flags |= FOLL_LONGTERM;
+	ret = pin_user_pages_fast(op.address, 1, gup_flags, &page);
+	if (ret == 1) {
+		unpin_user_page(page);
+		return 0;
+	}
+	return ret;
+}
 #endif
 
 #if 0 /* retained only as an audit diff while the duplicate prototype is removed */
@@ -4850,6 +4996,8 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 #ifdef CONFIG_CXLFORK_SELFTEST
 	case CXLFORK_LITMUS_V2:
 		return cxlfork_ioctl_litmus_v2((void __user *)arg);
+	case CXLFORK_GUP_PROBE_V2:
+		return cxlfork_ioctl_gup_probe_v2((void __user *)arg);
 #endif
 	case CXLFORK_GET_CALL_STATS_V2:
 		return cxlfork_ioctl_get_call_stats_v2((void __user *)arg);

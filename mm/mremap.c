@@ -25,6 +25,7 @@
 #include <linux/uaccess.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/mempolicy.h>
+#include <linux/cxlfork_mm.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
@@ -964,6 +965,10 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	vma = vma_lookup(mm, addr);
 	if (!vma) {
 		ret = -EFAULT;
+		goto out;
+	}
+	if (cxlfork_vma_is_restored(vma)) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 

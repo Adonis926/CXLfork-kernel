@@ -98,6 +98,7 @@
 #include <linux/bpf.h>
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
+#include <linux/cxlfork_mm.h>
 #include <linux/iommu.h>
 
 #include <asm/pgalloc.h>
@@ -687,6 +688,10 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		struct file *file;
 
 		vma_start_write(mpnt);
+		if (cxlfork_vma_is_restored(mpnt)) {
+			retval = -EOPNOTSUPP;
+			goto loop_out;
+		}
 		if (mpnt->vm_flags & VM_DONTCOPY) {
 			vm_stat_account(mm, mpnt->vm_flags, -vma_pages(mpnt));
 			continue;
@@ -1732,6 +1737,10 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 		mmget(oldmm);
 		mm = oldmm;
 	} else {
+		int ret = cxlfork_fork_check_mm(oldmm);
+
+		if (ret)
+			return ret;
 		mm = dup_mm(tsk, current->mm);
 		if (!mm)
 			return -ENOMEM;

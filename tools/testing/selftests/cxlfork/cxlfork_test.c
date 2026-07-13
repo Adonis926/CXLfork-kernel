@@ -34,6 +34,10 @@ _Static_assert(sizeof(struct cxlfork_release_v2) == 64,
 	       "unexpected cxlfork_release_v2 size");
 _Static_assert(sizeof(struct cxlfork_call_stats_v2) == 272,
 	       "unexpected cxlfork_call_stats_v2 size");
+_Static_assert(sizeof(struct cxlfork_query_caps_v2) == 128,
+	       "unexpected cxlfork_query_caps_v2 size");
+_Static_assert(sizeof(struct cxlfork_gup_probe_v2) == 56,
+	       "unexpected cxlfork_gup_probe_v2 size");
 
 static uint64_t fnv_bytes(uint64_t hash, const void *data, size_t bytes)
 {
@@ -1291,6 +1295,230 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	return failed ? 1 : 0;
 }
 
+static int run_v2_rollback_tests(uint64_t key)
+{
+	struct cxlfork_region regions[CXLFORK_MAX_REGIONS] = { 0 };
+	struct cxlfork_prepare_v2 prepare = {
+		.size = sizeof(prepare),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_resume_v2 resume = {
+		.size = sizeof(resume),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.flags = CXLFORK_F_PRIVATE_COW |
+			 CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_inspect_v2 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	struct cxlfork_release_v2 release = {
+		.size = sizeof(release),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	unsigned char *first;
+	unsigned char *second;
+	void *probe0;
+	void *probe1;
+	size_t page = getpagesize();
+	int fd;
+	int failed = 0;
+
+	first = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	second = mmap((char *)TEST_BASE + 2 * page, page,
+		      PROT_READ | PROT_WRITE,
+		      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (first == MAP_FAILED || second == MAP_FAILED) {
+		perror("rollback source mmap");
+		return 1;
+	}
+	fill_region(first, page, key, 0);
+	fill_region(second, page, key, 1);
+	prepare.scan_start = (uintptr_t)first;
+	prepare.scan_end = (uintptr_t)second + page;
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare)) {
+		perror("rollback PREPARE_V2");
+		return 1;
+	}
+	if (prepare.region_count != 2) {
+		fprintf(stderr, "rollback snapshot expected two regions, got %u\n",
+			prepare.region_count);
+		return 1;
+	}
+	resume.generation = prepare.generation;
+	release.generation = prepare.generation;
+	if (munmap(first, page) || munmap(second, page)) {
+		perror("rollback source munmap");
+		return 1;
+	}
+	failed += v2_expect_errno(fd, CXLFORK_RESUME_V2, &resume, EIO,
+				  "injected second-region restore failure");
+	probe0 = mmap((void *)(uintptr_t)regions[0].start, regions[0].length,
+		      PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS |
+		      MAP_FIXED_NOREPLACE, -1, 0);
+	probe1 = mmap((void *)(uintptr_t)regions[1].start, regions[1].length,
+		      PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS |
+		      MAP_FIXED_NOREPLACE, -1, 0);
+	if (probe0 == MAP_FAILED || probe1 == MAP_FAILED) {
+		perror("rollback left a partial mapping");
+		failed++;
+	}
+	if (probe0 != MAP_FAILED)
+		munmap(probe0, regions[0].length);
+	if (probe1 != MAP_FAILED)
+		munmap(probe1, regions[1].length);
+	if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect) || inspect.reader_count) {
+		fprintf(stderr, "rollback retained slot reader=%u\n",
+			inspect.reader_count);
+		failed++;
+	}
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
+		perror("rollback RELEASE_V2");
+		failed++;
+	}
+	close(fd);
+	printf("v2-rollback key=%" PRIu64 " regions=2 verify=%s\n",
+	       key, failed ? "fail" : "ok");
+	return failed ? 1 : 0;
+}
+
+static int run_mm_failfast_tests(uint64_t key)
+{
+	const uint64_t expected_mask = CXLFORK_MM_FAILFAST_MPROTECT |
+		CXLFORK_MM_FAILFAST_FORK | CXLFORK_MM_FAILFAST_GUP |
+		CXLFORK_MM_FAILFAST_PARTIAL_MUNMAP |
+		CXLFORK_MM_FAILFAST_MREMAP;
+	struct cxlfork_region regions[CXLFORK_MAX_REGIONS] = { 0 };
+	struct cxlfork_prepare_v2 prepare = {
+		.size = sizeof(prepare),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_resume_v2 resume = {
+		.size = sizeof(resume),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.flags = CXLFORK_F_PRIVATE_COW,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_release_v2 release = {
+		.size = sizeof(release),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	struct cxlfork_query_caps_v2 caps = {
+		.size = sizeof(caps),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+	};
+	struct cxlfork_gup_probe_v2 probe = {
+		.size = sizeof(probe),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+	};
+	unsigned char *anon;
+	void *base;
+	size_t bytes = 2 * getpagesize();
+	pid_t child;
+	int fd;
+	int failed = 0;
+	unsigned int i;
+	const uint64_t gup_modes[] = {
+		0,
+		CXLFORK_GUP_PROBE_WRITE,
+		CXLFORK_GUP_PROBE_LONGTERM,
+		CXLFORK_GUP_PROBE_WRITE | CXLFORK_GUP_PROBE_LONGTERM,
+	};
+
+	anon = mmap(TEST_BASE, bytes, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED) {
+		perror("mm failfast source mmap");
+		return 1;
+	}
+	fill_region(anon, bytes, key, 0);
+	prepare.scan_start = (uintptr_t)anon;
+	prepare.scan_end = (uintptr_t)anon + bytes;
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare)) {
+		perror("mm failfast PREPARE_V2");
+		return 1;
+	}
+	resume.generation = prepare.generation;
+	release.generation = prepare.generation;
+	if (munmap(anon, bytes) || ioctl(fd, CXLFORK_RESUME_V2, &resume)) {
+		perror("mm failfast RESUME_V2");
+		return 1;
+	}
+	base = (void *)(uintptr_t)regions[0].start;
+	errno = 0;
+	if (mprotect(base, bytes, PROT_READ) != -1 || errno != EOPNOTSUPP) {
+		fprintf(stderr, "mprotect fail-fast ret/errno mismatch: %d\n", errno);
+		failed++;
+	}
+	errno = 0;
+	if (munmap(base, getpagesize()) != -1 || errno != EOPNOTSUPP) {
+		fprintf(stderr, "partial munmap fail-fast ret/errno mismatch: %d\n",
+			errno);
+		failed++;
+	}
+	errno = 0;
+	if (mremap(base, bytes, bytes + getpagesize(), MREMAP_MAYMOVE) !=
+	    MAP_FAILED || errno != EOPNOTSUPP) {
+		fprintf(stderr, "mremap fail-fast ret/errno mismatch: %d\n", errno);
+		failed++;
+	}
+	errno = 0;
+	child = fork();
+	if (child != -1 || errno != EOPNOTSUPP) {
+		fprintf(stderr, "fork fail-fast ret=%d errno=%d\n", child, errno);
+		failed++;
+		if (!child)
+			_exit(1);
+		if (child > 0)
+			waitpid(child, NULL, 0);
+	}
+	probe.address = (uintptr_t)base;
+	for (i = 0; i < sizeof(gup_modes) / sizeof(gup_modes[0]); i++) {
+		probe.flags = gup_modes[i];
+		failed += v2_expect_errno(fd, CXLFORK_GUP_PROBE_V2, &probe,
+					  EOPNOTSUPP, "restored VMA GUP");
+	}
+	if (ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps) ||
+	    caps.mm_failfast_mask != expected_mask) {
+		fprintf(stderr, "MM fail-fast capability mismatch: 0x%" PRIx64 "\n",
+			(uint64_t)caps.mm_failfast_mask);
+		failed++;
+	}
+	if (munmap(base, bytes)) {
+		perror("full restored VMA munmap");
+		failed++;
+	}
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
+		perror("mm failfast RELEASE_V2");
+		failed++;
+	}
+	close(fd);
+	printf("mm-failfast key=%" PRIu64 " mask=0x%" PRIx64 " verify=%s\n",
+	       key, expected_mask, failed ? "fail" : "ok");
+	return failed ? 1 : 0;
+}
+
 static int run_lifecycle_tests(uint64_t key)
 {
 	unsigned char *anon;
@@ -1559,7 +1787,8 @@ int main(int argc, char **argv)
 			"hybrid-prepare KEY | hybrid-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | hold-close KEY SECONDS | "
-			"v2-lifecycle KEY | conflict KEY POLICY\n",
+			"v2-lifecycle KEY | v2-rollback KEY | mm-failfast KEY | "
+			"conflict KEY POLICY\n",
 			argv[0]);
 		return 2;
 	}
@@ -1575,6 +1804,10 @@ int main(int argc, char **argv)
 		return run_lifecycle_tests(key);
 	if (!strcmp(argv[1], "v2-lifecycle") && argc == 3)
 		return run_v2_lifecycle_tests(key);
+	if (!strcmp(argv[1], "v2-rollback") && argc == 3)
+		return run_v2_rollback_tests(key);
+	if (!strcmp(argv[1], "mm-failfast") && argc == 3)
+		return run_mm_failfast_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)
 		return prepare_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "threadctx-prepare") && argc == 4)

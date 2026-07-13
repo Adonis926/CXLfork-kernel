@@ -44,6 +44,8 @@
 #define CXLFORK_F_MIGRATE_ON_WRITE CXLFORK_F_SHARED_COW
 #define CXLFORK_F_HYBRID_TIERING 0x200ULL
 #define CXLFORK_F_FULL_PRIVATE_STATE 0x400ULL
+/* Privileged fault injection; available only with CONFIG_CXLFORK_SELFTEST. */
+#define CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION (1ULL << 63)
 #define CXLFORK_COMM_LEN 16
 
 #define CXLFORK_ABI_VERSION_V2 2U
@@ -64,6 +66,14 @@
 #define CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME (1ULL << 12)
 #define CXLFORK_CAP_GLOBAL_FILE_STATE (1ULL << 13)
 #define CXLFORK_CAP_KNOWN_MASK ((1ULL << 14) - 1)
+
+/* MM operations rejected by a tested kernel hook on restored VMAs. */
+#define CXLFORK_MM_FAILFAST_MPROTECT (1ULL << 0)
+#define CXLFORK_MM_FAILFAST_FORK (1ULL << 1)
+#define CXLFORK_MM_FAILFAST_GUP (1ULL << 2)
+#define CXLFORK_MM_FAILFAST_PARTIAL_MUNMAP (1ULL << 3)
+#define CXLFORK_MM_FAILFAST_MREMAP (1ULL << 4)
+#define CXLFORK_MM_FAILFAST_KNOWN_MASK ((1ULL << 5) - 1)
 
 #define CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID (1ULL << 0)
 #define CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID (1ULL << 1)
@@ -124,7 +134,11 @@ struct cxlfork_query_caps_v2 {
 	__u32 max_regions;
 	__u32 max_ptes;
 	__u32 descriptor_version;
-	__u32 reserved;
+	__u32 reserved1;
+	__u64 mm_failfast_mask;
+	__u64 shared_leaf_alignment;
+	__u64 restore_policy_mask;
+	__u64 reserved2[4];
 };
 
 /*
@@ -207,6 +221,19 @@ struct cxlfork_litmus_v2 {
 	__u64 sequence;
 	__u64 acknowledgement;
 	__u64 token;
+	__u64 reserved1[4];
+};
+
+#define CXLFORK_GUP_PROBE_WRITE (1ULL << 0)
+#define CXLFORK_GUP_PROBE_LONGTERM (1ULL << 1)
+#define CXLFORK_GUP_PROBE_KNOWN_MASK ((1ULL << 2) - 1)
+
+struct cxlfork_gup_probe_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__aligned_u64 address;
+	__u64 flags;
 	__u64 reserved1[4];
 };
 
@@ -565,5 +592,6 @@ struct cxlfork_release {
 #define CXLFORK_PTE_MARK_V2 _IOWR(CXLFORK_IOC_MAGIC, 12, struct cxlfork_v2_header)
 #define CXLFORK_LITMUS_V2 _IOWR(CXLFORK_IOC_MAGIC, 13, struct cxlfork_v2_header)
 #define CXLFORK_GET_CALL_STATS_V2 _IOWR(CXLFORK_IOC_MAGIC, 14, struct cxlfork_v2_header)
+#define CXLFORK_GUP_PROBE_V2 _IOWR(CXLFORK_IOC_MAGIC, 15, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

@@ -6,6 +6,10 @@
 
 #ifdef CONFIG_CXLFORK
 bool cxlfork_pmd_is_shared_leaf(pmd_t pmd);
+bool cxlfork_vma_is_restored(const struct vm_area_struct *vma);
+int cxlfork_gup_check_range(struct mm_struct *mm, unsigned long start,
+			    unsigned long end);
+int cxlfork_fork_check_mm(struct mm_struct *mm);
 void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
 				 unsigned long addr);
 int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
@@ -14,6 +18,22 @@ int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
 static inline bool cxlfork_pmd_is_shared_leaf(pmd_t pmd)
 {
 	return false;
+}
+
+static inline bool cxlfork_vma_is_restored(const struct vm_area_struct *vma)
+{
+	return false;
+}
+
+static inline int cxlfork_gup_check_range(struct mm_struct *mm,
+				   unsigned long start, unsigned long end)
+{
+	return 0;
+}
+
+static inline int cxlfork_fork_check_mm(struct mm_struct *mm)
+{
+	return 0;
 }
 
 static inline void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm,
