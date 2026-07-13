@@ -98,6 +98,39 @@ static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
 					unsigned long addr,
 					unsigned long *pfn_out);
 
+#define CXLFORK_LIFECYCLE_STATE_MASK 0xffULL
+#define CXLFORK_LIFECYCLE_READER_SHIFT 8
+#define CXLFORK_LIFECYCLE_READER_ONE (1ULL << CXLFORK_LIFECYCLE_READER_SHIFT)
+#define CXLFORK_LIFECYCLE_MAX_READERS (U64_MAX >> CXLFORK_LIFECYCLE_READER_SHIFT)
+
+static u64 cxlfork_lifecycle_pack(u32 state, u64 readers)
+{
+	return (readers << CXLFORK_LIFECYCLE_READER_SHIFT) | state;
+}
+
+static u32 cxlfork_lifecycle_state(u64 lifecycle)
+{
+	return lifecycle & CXLFORK_LIFECYCLE_STATE_MASK;
+}
+
+static u64 cxlfork_lifecycle_readers(u64 lifecycle)
+{
+	return lifecycle >> CXLFORK_LIFECYCLE_READER_SHIFT;
+}
+
+static void cxlfork_desc_reset_free(struct cxlfork_desc *desc, u64 generation)
+{
+	size_t state_off = offsetof(struct cxlfork_desc, state);
+	size_t after_state = state_off + sizeof(desc->state);
+
+	/* Keep RELEASING/WRITING visible until every other field is reset. */
+	memset(desc, 0, state_off);
+	memset((char *)desc + after_state, 0, sizeof(*desc) - after_state);
+	desc->generation = generation;
+	smp_store_release(&desc->state,
+			  cxlfork_lifecycle_pack(CXLFORK_SLOT_FREE, 0));
+}
+
 struct cxlfork_checkpoint_sizing {
 	u64 regions;
 	u64 pages;
@@ -153,10 +186,15 @@ struct cxlfork_mapping {
 
 static bool cxlfork_desc_key_ready(const struct cxlfork_desc *desc, u64 key)
 {
+	u64 lifecycle;
+
+	if (!desc)
+		return false;
+	lifecycle = smp_load_acquire(&desc->state);
 	return desc && READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
 		READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
 		READ_ONCE(desc->key) == key &&
-		READ_ONCE(desc->state) == CXLFORK_SLOT_READY &&
+		cxlfork_lifecycle_state(lifecycle) == CXLFORK_SLOT_READY &&
 		READ_ONCE(desc->ready);
 }
 
@@ -166,33 +204,58 @@ static bool cxlfork_desc_generation_matches(const struct cxlfork_desc *desc,
 	return READ_ONCE(desc->generation) == generation;
 }
 
+static void cxlfork_slot_put_reader_locked(struct cxlfork_desc *desc, u64 key,
+					   u64 generation);
+
 static int cxlfork_slot_get_reader_locked(struct cxlfork_desc *desc, u64 key,
 					  u64 generation)
 {
+	u64 lifecycle;
 	u64 readers;
 
-	if (!cxlfork_desc_key_ready(desc, key) ||
-	    !cxlfork_desc_generation_matches(desc, generation))
-		return -ENOENT;
-	do {
-		readers = READ_ONCE(desc->reader_count);
-	} while (cmpxchg(&desc->reader_count, readers, readers + 1) != readers);
-	return 0;
+	for (;;) {
+		if (!cxlfork_desc_key_ready(desc, key))
+			return -ENOENT;
+		if (!cxlfork_desc_generation_matches(desc, generation))
+			return -ESTALE;
+		lifecycle = smp_load_acquire(&desc->state);
+		if (cxlfork_lifecycle_state(lifecycle) != CXLFORK_SLOT_READY)
+			return -EBUSY;
+		readers = cxlfork_lifecycle_readers(lifecycle);
+		if (readers == CXLFORK_LIFECYCLE_MAX_READERS)
+			return -EOVERFLOW;
+		if (cmpxchg(&desc->state, lifecycle,
+			    lifecycle + CXLFORK_LIFECYCLE_READER_ONE) != lifecycle)
+			continue;
+		/* READY cannot be released while our packed reader is present. */
+		if (likely(cxlfork_desc_generation_matches(desc, generation) &&
+			   READ_ONCE(desc->key) == key))
+			return 0;
+		cxlfork_slot_put_reader_locked(desc, key, generation);
+		return -ESTALE;
+	}
 }
 
 static void cxlfork_slot_put_reader_locked(struct cxlfork_desc *desc, u64 key,
 					   u64 generation)
 {
+	u64 lifecycle;
 	u64 readers;
 
-	if (!cxlfork_desc_key_ready(desc, key) ||
+	if (!desc || READ_ONCE(desc->key) != key ||
 	    !cxlfork_desc_generation_matches(desc, generation))
 		return;
-	do {
-		readers = READ_ONCE(desc->reader_count);
+	for (;;) {
+		lifecycle = READ_ONCE(desc->state);
+		if (cxlfork_lifecycle_state(lifecycle) != CXLFORK_SLOT_READY)
+			return;
+		readers = cxlfork_lifecycle_readers(lifecycle);
 		if (!readers)
 			return;
-	} while (cmpxchg(&desc->reader_count, readers, readers - 1) != readers);
+		if (cmpxchg(&desc->state, lifecycle,
+			    lifecycle - CXLFORK_LIFECYCLE_READER_ONE) == lifecycle)
+			return;
+	}
 }
 
 static void cxlfork_slot_put_reader(u64 key, u64 generation)
@@ -2400,8 +2463,10 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	ret = 0;
 
 	mutex_lock(&cxlfork_lock);
-	if (cmpxchg(&desc->state, (u64)CXLFORK_SLOT_FREE,
-		    (u64)CXLFORK_SLOT_WRITING) != CXLFORK_SLOT_FREE) {
+	if (cmpxchg(&desc->state,
+		    cxlfork_lifecycle_pack(CXLFORK_SLOT_FREE, 0),
+		    cxlfork_lifecycle_pack(CXLFORK_SLOT_WRITING, 0)) !=
+	    cxlfork_lifecycle_pack(CXLFORK_SLOT_FREE, 0)) {
 		ret = -EEXIST;
 		goto out_unlock;
 	}
@@ -2412,7 +2477,8 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	desc->magic = CXLFORK_DESC_MAGIC;
 	desc->version = CXLFORK_DESC_VERSION;
 	desc->key = op->key;
-	desc->state = CXLFORK_SLOT_WRITING;
+	desc->state = cxlfork_lifecycle_pack(CXLFORK_SLOT_WRITING, 0);
+	desc->reader_count = 0;
 	desc->generation = generation ?: 1;
 	desc->slot = slot;
 	desc->extent_bytes = CXLFORK_EXTENT_BYTES;
@@ -2631,15 +2697,15 @@ out_mmap_unlock:
 		}
 		smp_wmb();
 		WRITE_ONCE(desc->ready, 1);
-		WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
+		smp_store_release(&desc->state,
+				  cxlfork_lifecycle_pack(CXLFORK_SLOT_READY, 0));
 	}
 
 out_unlock:
 	if (ret && desc && !desc->ready) {
 		u64 generation = desc->generation;
 
-		memset(desc, 0, sizeof(*desc));
-		desc->generation = generation;
+		cxlfork_desc_reset_free(desc, generation);
 	}
 	mutex_unlock(&cxlfork_lock);
 out_free:
@@ -3189,7 +3255,8 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != mapping->key ||
-	    desc->state != CXLFORK_SLOT_READY ||
+	    cxlfork_lifecycle_state(READ_ONCE(desc->state)) !=
+		CXLFORK_SLOT_READY ||
 	    desc->generation != mapping->generation || !desc->ready ||
 	    mapping->region_idx >= desc->nr_regions) {
 		mutex_unlock(&cxlfork_lock);
@@ -3323,7 +3390,8 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != state->mmap_key ||
-	    desc->state != CXLFORK_SLOT_READY ||
+	    cxlfork_lifecycle_state(READ_ONCE(desc->state)) !=
+		CXLFORK_SLOT_READY ||
 	    desc->generation != state->mmap_generation ||
 	    !desc->ready || region_idx >= desc->nr_regions) {
 		ret = -ENOENT;
@@ -3430,7 +3498,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != op->key ||
-	    desc->state != CXLFORK_SLOT_READY || !desc->ready) {
+	    cxlfork_lifecycle_state(smp_load_acquire(&desc->state)) !=
+		CXLFORK_SLOT_READY || !desc->ready) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
@@ -3538,7 +3607,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 		goto out_unlock;
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != op->key ||
-	    desc->state != CXLFORK_SLOT_READY ||
+	    cxlfork_lifecycle_state(READ_ONCE(desc->state)) !=
+		CXLFORK_SLOT_READY ||
 	    desc->generation != generation || !desc->ready) {
 		ret = -ENOENT;
 		goto out_unlock;
@@ -3792,9 +3862,13 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	inspect.state = READ_ONCE(desc->state);
+	{
+		u64 lifecycle = smp_load_acquire(&desc->state);
+
+		inspect.state = cxlfork_lifecycle_state(lifecycle);
+		inspect.reader_count = cxlfork_lifecycle_readers(lifecycle);
+	}
 	inspect.generation = READ_ONCE(desc->generation);
-	inspect.reader_count = READ_ONCE(desc->reader_count);
 	smp_rmb();
 	if (desc->slot != slot ||
 	    desc->nr_regions > desc->region_table_entries ||
@@ -3941,19 +4015,20 @@ static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
 	desc = slot_desc(slot);
 	if (cxlfork_desc_key_ready(desc, rel.key)) {
 		u64 generation = desc->generation;
+		u64 lifecycle = smp_load_acquire(&desc->state);
 
-		if (cmpxchg(&desc->state, (u64)CXLFORK_SLOT_READY,
-			    (u64)CXLFORK_SLOT_RELEASING) != CXLFORK_SLOT_READY) {
+		if (cxlfork_lifecycle_state(lifecycle) != CXLFORK_SLOT_READY ||
+		    cxlfork_lifecycle_readers(lifecycle)) {
 			mutex_unlock(&cxlfork_lock);
 			return -EBUSY;
 		}
-		if (desc->reader_count) {
-			WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
+		if (cmpxchg(&desc->state, lifecycle,
+			    cxlfork_lifecycle_pack(CXLFORK_SLOT_RELEASING, 0)) !=
+		    lifecycle) {
 			mutex_unlock(&cxlfork_lock);
 			return -EBUSY;
 		}
-		memset(desc, 0, sizeof(*desc));
-		desc->generation = generation;
+		cxlfork_desc_reset_free(desc, generation);
 	}
 	mutex_unlock(&cxlfork_lock);
 	return 0;
