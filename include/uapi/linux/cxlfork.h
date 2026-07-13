@@ -80,6 +80,23 @@
 #define CXLFORK_PTE_MARK_SET_DIRTY (1ULL << 3)
 #define CXLFORK_PTE_MARK_KNOWN_MASK ((1ULL << 4) - 1)
 
+/*
+ * Test-only cross-VM memory ordering operations.  The kernel exposes this
+ * interface only when CONFIG_CXLFORK_SELFTEST is enabled and requires
+ * CAP_SYS_ADMIN.  It is not a checkpoint/restore feature capability.
+ */
+enum cxlfork_litmus_op_v2 {
+	CXLFORK_LITMUS_RESET = 0,
+	CXLFORK_LITMUS_RMW = 1,
+	CXLFORK_LITMUS_MESSAGE = 2,
+	CXLFORK_LITMUS_PINGPONG = 3,
+	CXLFORK_LITMUS_QUERY = 4,
+};
+
+#define CXLFORK_LITMUS_ROLE_0 0U
+#define CXLFORK_LITMUS_ROLE_1 1U
+#define CXLFORK_LITMUS_PAYLOAD_WORDS 8U
+
 enum cxlfork_slot_state_v2 {
 	CXLFORK_SLOT_FREE = 0,
 	CXLFORK_SLOT_WRITING = 1,
@@ -173,6 +190,24 @@ struct cxlfork_pte_mark_v2 {
 	__u64 length;
 	__u64 flags;
 	__u64 reserved1;
+};
+
+struct cxlfork_litmus_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u32 op;
+	__u32 role;
+	__u64 run_id;
+	__u64 iterations;
+	__u64 timeout_ns;
+	__u64 counter;
+	__u64 completions;
+	__u64 errors;
+	__u64 sequence;
+	__u64 acknowledgement;
+	__u64 token;
+	__u64 reserved1[4];
 };
 
 struct cxlfork_region {
@@ -421,5 +456,6 @@ struct cxlfork_release {
 #define CXLFORK_QUERY_CAPS_V2 _IOWR(CXLFORK_IOC_MAGIC, 7, struct cxlfork_v2_header)
 #define CXLFORK_INSPECT_V2 _IOWR(CXLFORK_IOC_MAGIC, 11, struct cxlfork_v2_header)
 #define CXLFORK_PTE_MARK_V2 _IOWR(CXLFORK_IOC_MAGIC, 12, struct cxlfork_v2_header)
+#define CXLFORK_LITMUS_V2 _IOWR(CXLFORK_IOC_MAGIC, 13, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

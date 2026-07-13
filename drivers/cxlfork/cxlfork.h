@@ -15,6 +15,8 @@
 #define CXLFORK_DESC_MAGIC 0x43584c464f524b31ULL /* "CXLFORK1" */
 #define CXLFORK_DESC_VERSION 1
 #define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
+#define CXLFORK_LITMUS_OFFSET PAGE_SIZE    /* 预留区内的独立跨 VM memory-order test page。 */
+#define CXLFORK_LITMUS_MAGIC 0x43584c4c49544d32ULL /* "CXLLITM2" */
 #define CXLFORK_MAX_SLOTS 7                /* key%MAX_SLOTS 选择 slot，4G CXL window 下保留 7 个大 slot。 */
 #define CXLFORK_SLOT_BYTES SZ_512M         /* 单个 checkpoint slot 的最大容量。 */
 #define CXLFORK_EXTENT_SHIFT PAGE_SHIFT    /* Phase 12: slot 内 4KiB extent bitmap。 */

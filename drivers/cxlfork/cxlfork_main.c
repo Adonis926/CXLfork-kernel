@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/cdev.h>
+#include <linux/capability.h>
 #include <linux/cgroup.h>
 #include <linux/cxlfork_mm.h>
 #include <linux/cred.h>
@@ -72,6 +73,20 @@ static struct class *cxlfork_class;
 static struct cdev cxlfork_cdev;
 static void __iomem *cxlfork_cxl;
 static DEFINE_MUTEX(cxlfork_lock);
+
+#ifdef CONFIG_CXLFORK_SELFTEST
+struct cxlfork_litmus_shared {
+	u64 magic;
+	u64 run_id;
+	u64 counter;
+	u64 completions;
+	u64 errors;
+	u64 sequence;
+	u64 acknowledgement;
+	u64 token;
+	u64 payload[CXLFORK_LITMUS_PAYLOAD_WORDS];
+};
+#endif
 
 static int key_to_slot(u64 key);
 static struct cxlfork_desc *slot_desc(u64 slot);
@@ -3956,6 +3971,224 @@ static int cxlfork_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+#ifdef CONFIG_CXLFORK_SELFTEST
+static struct cxlfork_litmus_shared *cxlfork_litmus_shared(void)
+{
+	if (!cxl_range_valid(CXLFORK_LITMUS_OFFSET,
+			     sizeof(struct cxlfork_litmus_shared)))
+		return NULL;
+	return cxl_ptr(CXLFORK_LITMUS_OFFSET);
+}
+
+static u64 cxlfork_litmus_payload(u64 run_id, u64 sequence, u32 word)
+{
+	return run_id ^ (sequence * 0x9e3779b97f4a7c15ULL) ^
+		((u64)(word + 1) * 0xd6e8feb86659fd93ULL);
+}
+
+static void cxlfork_litmus_atomic_inc(u64 *value)
+{
+	u64 old;
+
+	do {
+		old = READ_ONCE(*value);
+	} while (cmpxchg(value, old, old + 1) != old);
+}
+
+static int cxlfork_litmus_wait_acquire(u64 *value, u64 expected,
+				       u64 deadline)
+{
+	u64 spins = 0;
+
+	for (;;) {
+		if (smp_load_acquire(value) == expected)
+			return 0;
+		if (ktime_get_ns() >= deadline)
+			return -ETIMEDOUT;
+		cpu_relax();
+		if (!(++spins & 0xffff) && need_resched())
+			cond_resched();
+	}
+}
+
+static int cxlfork_litmus_validate_run(struct cxlfork_litmus_shared *shared,
+				       u64 run_id)
+{
+	if (READ_ONCE(shared->magic) != CXLFORK_LITMUS_MAGIC)
+		return -ENOENT;
+	if (smp_load_acquire(&shared->run_id) != run_id)
+		return -ESTALE;
+	return 0;
+}
+
+static int cxlfork_litmus_rmw(struct cxlfork_litmus_shared *shared,
+			      const struct cxlfork_litmus_v2 *op)
+{
+	u64 i;
+
+	for (i = 0; i < op->iterations; i++)
+		cxlfork_litmus_atomic_inc(&shared->counter);
+	cxlfork_litmus_atomic_inc(&shared->completions);
+	return 0;
+}
+
+static int cxlfork_litmus_message(struct cxlfork_litmus_shared *shared,
+				  const struct cxlfork_litmus_v2 *op,
+				  u64 deadline)
+{
+	u64 sequence;
+	u32 word;
+	int ret;
+
+	if (op->role == CXLFORK_LITMUS_ROLE_0) {
+		for (sequence = 1; sequence <= op->iterations; sequence++) {
+			ret = cxlfork_litmus_wait_acquire(
+				&shared->acknowledgement, sequence - 1, deadline);
+			if (ret)
+				return ret;
+			for (word = 0; word < CXLFORK_LITMUS_PAYLOAD_WORDS; word++)
+				WRITE_ONCE(shared->payload[word],
+					   cxlfork_litmus_payload(op->run_id,
+								   sequence, word));
+			smp_store_release(&shared->sequence, sequence);
+		}
+		ret = cxlfork_litmus_wait_acquire(&shared->acknowledgement,
+						  op->iterations, deadline);
+	} else {
+		for (sequence = 1; sequence <= op->iterations; sequence++) {
+			ret = cxlfork_litmus_wait_acquire(&shared->sequence,
+							  sequence, deadline);
+			if (ret)
+				return ret;
+			for (word = 0; word < CXLFORK_LITMUS_PAYLOAD_WORDS; word++) {
+				u64 expected = cxlfork_litmus_payload(op->run_id,
+								       sequence, word);
+
+				if (READ_ONCE(shared->payload[word]) != expected)
+					cxlfork_litmus_atomic_inc(&shared->errors);
+			}
+			smp_store_release(&shared->acknowledgement, sequence);
+		}
+		ret = 0;
+	}
+	if (!ret)
+		cxlfork_litmus_atomic_inc(&shared->completions);
+	return ret;
+}
+
+static int cxlfork_litmus_pingpong(struct cxlfork_litmus_shared *shared,
+				   const struct cxlfork_litmus_v2 *op,
+				   u64 deadline)
+{
+	u64 sequence;
+	int ret;
+
+	for (sequence = 1; sequence <= op->iterations; sequence++) {
+		if (op->role == CXLFORK_LITMUS_ROLE_0) {
+			ret = cxlfork_litmus_wait_acquire(&shared->token, 0,
+							  deadline);
+			if (ret)
+				return ret;
+			WRITE_ONCE(shared->payload[0],
+				   cxlfork_litmus_payload(op->run_id, sequence, 0));
+			smp_store_release(&shared->token, 1);
+		} else {
+			u64 expected;
+
+			ret = cxlfork_litmus_wait_acquire(&shared->token, 1,
+							  deadline);
+			if (ret)
+				return ret;
+			expected = cxlfork_litmus_payload(op->run_id, sequence, 0);
+			if (READ_ONCE(shared->payload[0]) != expected)
+				cxlfork_litmus_atomic_inc(&shared->errors);
+			smp_store_release(&shared->token, 0);
+		}
+	}
+	if (op->role == CXLFORK_LITMUS_ROLE_0) {
+		ret = cxlfork_litmus_wait_acquire(&shared->token, 0, deadline);
+		if (ret)
+			return ret;
+	}
+	cxlfork_litmus_atomic_inc(&shared->completions);
+	return 0;
+}
+
+static int cxlfork_ioctl_litmus_v2(struct cxlfork_litmus_v2 __user *uarg)
+{
+	struct cxlfork_litmus_shared *shared;
+	struct cxlfork_litmus_v2 op;
+	u64 deadline;
+	int ret = 0;
+	u32 i;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (op.size != sizeof(op))
+		return -EINVAL;
+	if (op.abi_version != CXLFORK_ABI_VERSION_V2)
+		return -EPROTONOSUPPORT;
+	if (op.reserved0)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+	if (op.op > CXLFORK_LITMUS_QUERY ||
+	    op.role > CXLFORK_LITMUS_ROLE_1)
+		return -EINVAL;
+	shared = cxlfork_litmus_shared();
+	if (!shared)
+		return -ENOSPC;
+
+	if (op.op == CXLFORK_LITMUS_RESET) {
+		if (!op.run_id)
+			return -EINVAL;
+		memset(shared, 0, sizeof(*shared));
+		WRITE_ONCE(shared->magic, CXLFORK_LITMUS_MAGIC);
+		smp_store_release(&shared->run_id, op.run_id);
+		goto out_copy;
+	}
+
+	ret = cxlfork_litmus_validate_run(shared, op.run_id);
+	if (ret)
+		return ret;
+	if (op.op == CXLFORK_LITMUS_QUERY)
+		goto out_copy;
+	if (!op.iterations || op.iterations > 10000000ULL ||
+	    !op.timeout_ns || op.timeout_ns > 60000000000ULL)
+		return -EINVAL;
+	if (check_add_overflow(ktime_get_ns(), op.timeout_ns, &deadline))
+		return -EINVAL;
+
+	switch (op.op) {
+	case CXLFORK_LITMUS_RMW:
+		ret = cxlfork_litmus_rmw(shared, &op);
+		break;
+	case CXLFORK_LITMUS_MESSAGE:
+		ret = cxlfork_litmus_message(shared, &op, deadline);
+		break;
+	case CXLFORK_LITMUS_PINGPONG:
+		ret = cxlfork_litmus_pingpong(shared, &op, deadline);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+	if (ret)
+		return ret;
+
+out_copy:
+	op.counter = READ_ONCE(shared->counter);
+	op.completions = READ_ONCE(shared->completions);
+	op.errors = READ_ONCE(shared->errors);
+	op.sequence = READ_ONCE(shared->sequence);
+	op.acknowledgement = READ_ONCE(shared->acknowledgement);
+	op.token = READ_ONCE(shared->token);
+	return copy_to_user(uarg, &op, sizeof(op)) ? -EFAULT : 0;
+}
+#endif
+
 #if 0 /* retained only as an audit diff while the duplicate prototype is removed */
 static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uarg)
 {
@@ -4124,6 +4357,10 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		return cxlfork_ioctl_inspect_v2((void __user *)arg);
 	case CXLFORK_PTE_MARK_V2:
 		return cxlfork_ioctl_pte_mark_v2((void __user *)arg);
+#ifdef CONFIG_CXLFORK_SELFTEST
+	case CXLFORK_LITMUS_V2:
+		return cxlfork_ioctl_litmus_v2((void __user *)arg);
+#endif
 	default:
 		return -ENOTTY;
 	}

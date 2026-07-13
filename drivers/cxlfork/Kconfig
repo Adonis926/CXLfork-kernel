@@ -7,3 +7,12 @@ config CXLFORK
 	  /dev/cxlfork，编译为 m 时需要手动 insmod cxlfork.ko。
 	  Build the CXLfork prototype device. It checkpoints process state
 	  into a shared CXL memory window and restores it from remote VMs.
+
+config CXLFORK_SELFTEST
+	bool "CXLfork privileged shared-backend selftests"
+	depends on CXLFORK
+	default y
+	help
+	  Enable privileged ioctls used to verify cross-VM atomic RMW,
+	  release/acquire ordering, and cache coherence before relying on the
+	  shared slot lifecycle protocol. These ioctls require CAP_SYS_ADMIN.

@@ -2,5 +2,6 @@
 CFLAGS += -Wall -Wextra -Werror -O2 -no-pie $(KHDR_INCLUDES)
 LDLIBS += -pthread
 TEST_GEN_PROGS := cxlfork_test
+TEST_GEN_FILES := cxlfork_litmus
 
 include ../lib.mk
