@@ -429,6 +429,11 @@ static u64 slot_offset(u64 slot)
 	return CXLFORK_DATA_OFFSET + slot * CXLFORK_SLOT_BYTES;
 }
 
+static u64 slot_payload_offset(u64 slot)
+{
+	return slot_offset(slot) + PAGE_ALIGN(sizeof(struct cxlfork_desc));
+}
+
 static struct cxlfork_desc *slot_desc(u64 slot)
 {
 	return cxl_ptr(slot_offset(slot));
@@ -471,7 +476,7 @@ static bool cxlfork_desc_matches_slot(const struct cxlfork_desc *desc,
 	if (READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
 	    READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
 	    READ_ONCE(desc->slot) == slot &&
-	    READ_ONCE(desc->data_offset) == slot_offset(slot) + SZ_2M)
+	    READ_ONCE(desc->data_offset) == slot_payload_offset(slot))
 		return true;
 	return false;
 }
@@ -1362,6 +1367,78 @@ static int cxlfork_checkpoint_vma_supported(struct vm_area_struct *vma,
 	return 0;
 }
 
+static int cxlfork_preflight_checkpoint(struct mm_struct *mm,
+					const struct cxlfork_checkpoint *op,
+					u64 slot)
+{
+	struct vm_area_struct *vma;
+	unsigned long scan_start = op->scan_start;
+	unsigned long scan_end = op->scan_end;
+	u64 regions = 0;
+	u64 pages = 0;
+	u64 pmd_groups = 0;
+	u64 bytes;
+	u64 tmp;
+
+	VMA_ITERATOR(vmi, mm, scan_start);
+	for_each_vma_range(vmi, vma, scan_end) {
+		unsigned long start;
+		unsigned long end;
+		u64 vma_pages;
+
+		int ret = cxlfork_checkpoint_vma_supported(vma, op);
+
+		if (ret)
+			return ret;
+		start = max(vma->vm_start, scan_start);
+		end = min(vma->vm_end, scan_end);
+		start = PAGE_ALIGN(start);
+		end &= PAGE_MASK;
+		if (start >= end)
+			continue;
+
+		if (++regions > CXLFORK_MAX_REGIONS)
+			return -ENOSPC;
+		vma_pages = (end - start) >> PAGE_SHIFT;
+		if (check_add_overflow(pages, vma_pages, &pages) ||
+		    pages > CXLFORK_MAX_PTES)
+			return -ENOSPC;
+		pmd_groups += DIV_ROUND_UP(end - start, PMD_SIZE);
+		if (pmd_groups > CXLFORK_MAX_PT_PAGE_IMAGES)
+			return -ENOSPC;
+	}
+
+	bytes = slot_payload_offset(slot) - slot_offset(slot);
+	if (check_mul_overflow(pages, (u64)PAGE_SIZE, &tmp) ||
+	    check_add_overflow(bytes, tmp, &bytes))
+		return -ENOSPC;
+	if (check_mul_overflow(pages,
+			       (u64)sizeof(struct cxlfork_leaf_pte_image),
+			       &tmp) ||
+	    check_add_overflow(bytes, PAGE_ALIGN(tmp), &bytes))
+		return -ENOSPC;
+	if (check_mul_overflow(pmd_groups,
+			       (u64)sizeof(struct cxlfork_pt_page_image),
+			       &tmp) ||
+	    check_add_overflow(bytes, PAGE_ALIGN(tmp), &bytes))
+		return -ENOSPC;
+	if (check_add_overflow(bytes, (pmd_groups + 8) * (u64)PAGE_SIZE, &bytes))
+		return -ENOSPC;
+	tmp = PAGE_ALIGN(sizeof(struct cxlfork_vma_tree_image)) +
+	      PAGE_ALIGN(regions * sizeof(struct cxlfork_vma_node_image));
+	if (check_add_overflow(bytes, tmp, &bytes) ||
+	    check_add_overflow(bytes,
+			       (u64)PAGE_ALIGN(sizeof(struct cxlfork_state_image)),
+			       &bytes) ||
+	    check_add_overflow(bytes,
+			       (u64)PAGE_ALIGN(sizeof(struct cxlfork_private_rebase_image)),
+			       &bytes))
+		return -ENOSPC;
+	if (bytes > CXLFORK_SLOT_BYTES || bytes > cxl_size - slot_offset(slot))
+		return -ENOSPC;
+	return pages ? 0 : -EINVAL;
+}
+
 static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 				    struct vm_area_struct *vma,
 				    struct cxlfork_region_desc *r,
@@ -2120,7 +2197,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	desc->state = CXLFORK_SLOT_WRITING;
 	desc->generation = generation ?: 1;
 	desc->slot = slot;
-	desc->data_offset = slot_offset(slot) + SZ_2M;
+	desc->data_offset = slot_payload_offset(slot);
 	}
 	data_off = desc->data_offset;
 	start_ns = ktime_get_ns();
@@ -2132,6 +2209,9 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	}
 
 	mmap_read_lock(mm);
+	ret = cxlfork_preflight_checkpoint(mm, op, slot);
+	if (ret)
+		goto out_mmap_unlock;
 	cxlfork_capture_task_state(&desc->task_state,
 				   op->flags & CXLFORK_F_FULL_PRIVATE_STATE);
 	cxlfork_capture_mm_state(&desc->mm_state, mm);
@@ -3738,7 +3818,8 @@ static int __init cxlfork_init(void)
 	/* 模块初始化：映射共享 CXL window，并注册 /dev/cxlfork 字符设备。 */
 	int ret;
 
-	if (cxl_size < CXLFORK_DATA_OFFSET + CXLFORK_SLOT_BYTES)
+	if (cxl_size < (u64)CXLFORK_DATA_OFFSET +
+		       (u64)CXLFORK_MAX_SLOTS * (u64)CXLFORK_SLOT_BYTES)
 		return -EINVAL;
 
 	cxlfork_cxl = ioremap_cache(cxl_phys, cxl_size);

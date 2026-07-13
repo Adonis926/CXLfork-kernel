@@ -149,6 +149,18 @@ static int run_abi_tests(void)
 	return failed ? 1 : 0;
 }
 
+static uint64_t query_max_slots_fd(int fd)
+{
+	struct cxlfork_query_caps_v2 caps = {
+		.size = sizeof(caps),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+	};
+
+	if (ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps) || !caps.max_slots)
+		return 16;
+	return caps.max_slots;
+}
+
 static void fill_region(unsigned char *p, size_t bytes, uint64_t key,
 			unsigned int region)
 {
@@ -1030,6 +1042,7 @@ static int run_lifecycle_tests(uint64_t key)
 	size_t page = getpagesize();
 	uint64_t generation_before = 0;
 	uint64_t generation_after = 0;
+	uint64_t same_slot_key;
 	uint32_t readers = 0;
 	pid_t child;
 	int status;
@@ -1048,6 +1061,7 @@ static int run_lifecycle_tests(uint64_t key)
 		close(fd);
 		return 1;
 	}
+	same_slot_key = key + query_max_slots_fd(fd);
 	fill_region(anon, page, key, 0);
 	if (prepare_existing_range(fd, key, anon, page)) {
 		perror("lifecycle prepare");
@@ -1060,12 +1074,12 @@ static int run_lifecycle_tests(uint64_t key)
 	}
 
 	errno = 0;
-	if (prepare_existing_range(fd, key + 16, anon, page) != -1 ||
+	if (prepare_existing_range(fd, same_slot_key, anon, page) != -1 ||
 	    errno != EEXIST) {
 		fprintf(stderr, "lifecycle: same-slot collision did not EEXIST\n");
 		failed++;
 	}
-	if (inspect_missing(fd, key + 16)) {
+	if (inspect_missing(fd, same_slot_key)) {
 		fprintf(stderr, "lifecycle: collision key became visible\n");
 		failed++;
 	}

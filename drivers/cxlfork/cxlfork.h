@@ -15,12 +15,12 @@
 #define CXLFORK_DESC_MAGIC 0x43584c464f524b31ULL /* "CXLFORK1" */
 #define CXLFORK_DESC_VERSION 1
 #define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
-#define CXLFORK_MAX_SLOTS 16               /* key%MAX_SLOTS 选择 slot，当前原型不做动态扩容。 */
-#define CXLFORK_SLOT_BYTES SZ_128M         /* 单个 checkpoint slot 的最大容量。 */
-#define CXLFORK_MAX_REGIONS 64             /* 一次 checkpoint 最多记录的 VMA/region 数。 */
-#define CXLFORK_MAX_PTES 32768             /* 一次 checkpoint 最多记录的叶子 PTE 数。 */
+#define CXLFORK_MAX_SLOTS 7                /* key%MAX_SLOTS 选择 slot，4G CXL window 下保留 7 个大 slot。 */
+#define CXLFORK_SLOT_BYTES SZ_512M         /* 单个 checkpoint slot 的最大容量。 */
+#define CXLFORK_MAX_REGIONS 64             /* legacy ioctl 当前最多回填的 VMA/region 数。 */
+#define CXLFORK_MAX_PTES 131072            /* 一次 checkpoint 最多记录的叶子 PTE 数。 */
 #define CXLFORK_MAX_PRIVATE_PTRS 12        /* rebase image 中可跟踪的内部指针数量。 */
-#define CXLFORK_MAX_PT_PAGE_IMAGES 1024    /* 页表页镜像上限，用于直接 PTE attach 实验。 */
+#define CXLFORK_MAX_PT_PAGE_IMAGES 4096    /* 页表页镜像上限，用于直接 PTE attach 实验。 */
 #define CXLFORK_PT_TREE_MAGIC 0x43584c5054545245ULL /* "CXLPTTRE" */
 #define CXLFORK_VMA_TREE_MAGIC 0x43584c564d415452ULL /* "CXLVMATR" */
 
