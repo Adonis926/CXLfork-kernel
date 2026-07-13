@@ -82,6 +82,16 @@ static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
 					unsigned long addr,
 					unsigned long *pfn_out);
 
+struct cxlfork_checkpoint_sizing {
+	u64 regions;
+	u64 pages;
+	u64 pmd_groups;
+	u64 fd_table_bytes;
+	u64 region_table_bytes;
+	u64 pte_table_bytes;
+	u64 estimated_bytes;
+};
+
 struct cxlfork_file_state {
 	/* 每个打开的 /dev/cxlfork fd 保存一次 mmap/restore 的临时上下文。 */
 	u64 mmap_key;
@@ -570,8 +580,8 @@ static int cxlfork_compute_checksums(const struct cxlfork_desc *desc,
 	u64 i;
 
 	if (!desc || desc->slot >= CXLFORK_MAX_SLOTS ||
-	    desc->nr_regions > CXLFORK_MAX_REGIONS ||
-	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	    desc->nr_regions > desc->region_table_entries ||
+	    desc->nr_ptes > desc->pte_table_entries ||
 	    desc->total_pages != desc->nr_ptes)
 		return -EILSEQ;
 	if (desc->nr_ptes && !ptes)
@@ -1439,7 +1449,8 @@ static int cxlfork_checkpoint_vma_supported(struct vm_area_struct *vma,
 
 static int cxlfork_preflight_checkpoint(struct mm_struct *mm,
 					const struct cxlfork_checkpoint *op,
-					u64 slot)
+					u64 slot,
+					struct cxlfork_checkpoint_sizing *sizing)
 {
 	struct vm_area_struct *vma;
 	unsigned long scan_start = op->scan_start;
@@ -1449,6 +1460,8 @@ static int cxlfork_preflight_checkpoint(struct mm_struct *mm,
 	u64 pmd_groups = 0;
 	u64 bytes;
 	u64 tmp;
+
+	memset(sizing, 0, sizeof(*sizing));
 
 	VMA_ITERATOR(vmi, mm, scan_start);
 	for_each_vma_range(vmi, vma, scan_end) {
@@ -1479,15 +1492,18 @@ static int cxlfork_preflight_checkpoint(struct mm_struct *mm,
 	}
 
 	bytes = slot_payload_offset(slot) - slot_offset(slot);
-	if (check_add_overflow(bytes,
-			       (u64)PAGE_ALIGN(CXLFORK_MAX_FDS *
-			       sizeof(struct cxlfork_fd_state)), &bytes) ||
-	    check_add_overflow(bytes,
-			       (u64)PAGE_ALIGN(CXLFORK_MAX_REGIONS *
-			       sizeof(struct cxlfork_region_desc)), &bytes) ||
-	    check_add_overflow(bytes,
-			       (u64)PAGE_ALIGN(CXLFORK_MAX_PTES *
-			       sizeof(struct cxlfork_pte_desc)), &bytes))
+	sizing->regions = regions;
+	sizing->pages = pages;
+	sizing->pmd_groups = pmd_groups;
+	sizing->fd_table_bytes = PAGE_ALIGN(CXLFORK_MAX_FDS *
+					    sizeof(struct cxlfork_fd_state));
+	sizing->region_table_bytes = PAGE_ALIGN(regions *
+						sizeof(struct cxlfork_region_desc));
+	sizing->pte_table_bytes = PAGE_ALIGN(pages *
+					     sizeof(struct cxlfork_pte_desc));
+	if (check_add_overflow(bytes, sizing->fd_table_bytes, &bytes) ||
+	    check_add_overflow(bytes, sizing->region_table_bytes, &bytes) ||
+	    check_add_overflow(bytes, sizing->pte_table_bytes, &bytes))
 		return -ENOSPC;
 	if (check_mul_overflow(pages, (u64)PAGE_SIZE, &tmp) ||
 	    check_add_overflow(bytes, tmp, &bytes))
@@ -1516,6 +1532,7 @@ static int cxlfork_preflight_checkpoint(struct mm_struct *mm,
 		return -ENOSPC;
 	if (bytes > CXLFORK_SLOT_BYTES || bytes > cxl_size - slot_offset(slot))
 		return -ENOSPC;
+	sizing->estimated_bytes = bytes;
 	return pages ? 0 : -EINVAL;
 }
 
@@ -2245,6 +2262,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	struct cxlfork_desc *desc;
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct cxlfork_checkpoint_sizing sizing;
 	u64 data_off;
 	u64 slot;
 	u64 start_ns;
@@ -2313,7 +2331,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	}
 
 	mmap_read_lock(mm);
-	ret = cxlfork_preflight_checkpoint(mm, op, slot);
+	ret = cxlfork_preflight_checkpoint(mm, op, slot, &sizing);
 	if (ret)
 		goto out_mmap_unlock;
 	ret = cxlfork_alloc_table(slot, &data_off, CXLFORK_MAX_FDS,
@@ -2322,18 +2340,21 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 				  &desc->fd_table_bytes);
 	if (ret)
 		goto out_mmap_unlock;
-	ret = cxlfork_alloc_table(slot, &data_off, CXLFORK_MAX_REGIONS,
+	desc->fd_table_entries = CXLFORK_MAX_FDS;
+	ret = cxlfork_alloc_table(slot, &data_off, sizing.regions,
 				  sizeof(struct cxlfork_region_desc),
 				  &desc->region_table_offset,
 				  &desc->region_table_bytes);
 	if (ret)
 		goto out_mmap_unlock;
-	ret = cxlfork_alloc_table(slot, &data_off, CXLFORK_MAX_PTES,
+	desc->region_table_entries = sizing.regions;
+	ret = cxlfork_alloc_table(slot, &data_off, sizing.pages,
 				  sizeof(struct cxlfork_pte_desc),
 				  &desc->pte_table_offset,
 				  &desc->pte_table_bytes);
 	if (ret)
 		goto out_mmap_unlock;
+	desc->pte_table_entries = sizing.pages;
 	desc->data_offset = data_off;
 	cxlfork_capture_task_state(&desc->task_state,
 				   op->flags & CXLFORK_F_FULL_PRIVATE_STATE);
@@ -2358,7 +2379,9 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		struct cxlfork_region_desc *regions = cxlfork_desc_regions(desc);
 		struct cxlfork_pte_desc *ptes = cxlfork_desc_ptes(desc);
 
-		if (!regions || !ptes) {
+		if (!regions || !ptes ||
+		    desc->region_table_entries != sizing.regions ||
+		    desc->pte_table_entries != sizing.pages) {
 			ret = -EILSEQ;
 			goto out_mmap_unlock;
 		}
@@ -2370,7 +2393,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		ret = cxlfork_checkpoint_vma_supported(vma, op);
 		if (ret)
 			break;
-		if (desc->nr_regions >= CXLFORK_MAX_REGIONS) {
+		if (desc->nr_regions >= desc->region_table_entries) {
 			ret = -ENOSPC;
 			break;
 		}
@@ -2392,7 +2415,7 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 		for (addr = start; addr < end; addr += PAGE_SIZE) {
 			struct cxlfork_pte_desc *pte;
 
-			if (desc->nr_ptes >= CXLFORK_MAX_PTES) {
+			if (desc->nr_ptes >= desc->pte_table_entries) {
 				ret = -ENOSPC;
 				break;
 			}
@@ -2466,13 +2489,15 @@ out_mmap_unlock:
 	}
 
 	if (!ret) {
-		int i;
+		u64 i;
+		u64 nr_out_regions;
 		struct cxlfork_region_desc *regions = cxlfork_desc_regions(desc);
 
 		desc->create_ns = ktime_get_ns() - start_ns;
-		smp_wmb();
-		WRITE_ONCE(desc->ready, 1);
-		WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
+		if (!regions) {
+			ret = -EILSEQ;
+			goto out_unlock;
+		}
 		memset(op, 0, sizeof(*op));
 		op->key = desc->key;
 		op->nr_regions = desc->nr_regions;
@@ -2483,7 +2508,8 @@ out_mmap_unlock:
 		op->dirty_file_pages = desc->dirty_file_pages;
 		op->checkpoint_ns = desc->create_ns;
 		cxlfork_copy_mm_state_to_checkpoint(op, desc);
-		for (i = 0; i < desc->nr_regions; i++) {
+		nr_out_regions = min_t(u64, desc->nr_regions, CXLFORK_MAX_REGIONS);
+		for (i = 0; i < nr_out_regions; i++) {
 			op->regions[i].start = regions[i].start;
 			op->regions[i].length = regions[i].length;
 			op->regions[i].prot = regions[i].prot;
@@ -2493,8 +2519,13 @@ out_mmap_unlock:
 			op->regions[i].clean_file_pages = regions[i].clean_file_pages;
 			op->regions[i].dirty_file_pages = regions[i].dirty_file_pages;
 		}
-		if (copy_to_user(uarg, op, sizeof(*op)))
+		if (copy_to_user(uarg, op, sizeof(*op))) {
 			ret = -EFAULT;
+			goto out_unlock;
+		}
+		smp_wmb();
+		WRITE_ONCE(desc->ready, 1);
+		WRITE_ONCE(desc->state, CXLFORK_SLOT_READY);
 	}
 
 out_unlock:
@@ -3449,7 +3480,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 	op->dirty_prefault_ns = bd.dirty_prefault_ns;
 	op->dirty_prefault_pages = bd.dirty_prefault_pages;
 	cxlfork_capture_namespace_state(&op->restore_ns_state);
-	for (i = 0; i < desc->nr_regions; i++) {
+	for (i = 0; i < min_t(u64, desc->nr_regions, CXLFORK_MAX_REGIONS); i++) {
 		op->regions[i].start = regions[i].start;
 		op->regions[i].length = regions[i].length;
 		op->regions[i].prot = regions[i].prot;
@@ -3659,8 +3690,9 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 	inspect.generation = READ_ONCE(desc->generation);
 	inspect.reader_count = READ_ONCE(desc->reader_count);
 	smp_rmb();
-	if (desc->slot != slot || desc->nr_regions > CXLFORK_MAX_REGIONS ||
-	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	if (desc->slot != slot ||
+	    desc->nr_regions > desc->region_table_entries ||
+	    desc->nr_ptes > desc->pte_table_entries ||
 	    desc->image_bytes > CXLFORK_SLOT_BYTES) {
 		ret = -EILSEQ;
 		goto out_unlock;
@@ -3685,6 +3717,17 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 	inspect.shared_map_pages = desc->shared_map_pages;
 	inspect.local_copy_pages = desc->local_copy_pages;
 	inspect.leaf_copy_pages = desc->leaf_copy_pages;
+	inspect.fd_table_offset = desc->fd_table_offset;
+	inspect.fd_table_entries = desc->fd_table_entries;
+	inspect.fd_table_bytes = desc->fd_table_bytes;
+	inspect.region_table_offset = desc->region_table_offset;
+	inspect.region_table_entries = desc->region_table_entries;
+	inspect.region_table_bytes = desc->region_table_bytes;
+	inspect.pte_table_offset = desc->pte_table_offset;
+	inspect.pte_table_entries = desc->pte_table_entries;
+	inspect.pte_table_bytes = desc->pte_table_bytes;
+	inspect.page_data_offset = desc->data_offset;
+	inspect.page_data_bytes = desc->total_pages << PAGE_SHIFT;
 	if (desc->nr_ptes) {
 		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
 			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;
@@ -3868,8 +3911,9 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 		return -EAGAIN;
 	}
 	smp_rmb();
-	if (desc->slot != slot || desc->nr_regions > CXLFORK_MAX_REGIONS ||
-	    desc->nr_ptes > CXLFORK_MAX_PTES ||
+	if (desc->slot != slot ||
+	    desc->nr_regions > desc->region_table_entries ||
+	    desc->nr_ptes > desc->pte_table_entries ||
 	    desc->image_bytes > CXLFORK_SLOT_BYTES) {
 		mutex_unlock(&cxlfork_lock);
 		return -EILSEQ;
@@ -3896,6 +3940,17 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 	inspect.shared_map_pages = desc->shared_map_pages;
 	inspect.local_copy_pages = desc->local_copy_pages;
 	inspect.leaf_copy_pages = desc->leaf_copy_pages;
+	inspect.fd_table_offset = desc->fd_table_offset;
+	inspect.fd_table_entries = desc->fd_table_entries;
+	inspect.fd_table_bytes = desc->fd_table_bytes;
+	inspect.region_table_offset = desc->region_table_offset;
+	inspect.region_table_entries = desc->region_table_entries;
+	inspect.region_table_bytes = desc->region_table_bytes;
+	inspect.pte_table_offset = desc->pte_table_offset;
+	inspect.pte_table_entries = desc->pte_table_entries;
+	inspect.pte_table_bytes = desc->pte_table_bytes;
+	inspect.page_data_offset = desc->data_offset;
+	inspect.page_data_bytes = desc->total_pages << PAGE_SHIFT;
 	if (desc->nr_ptes)
 		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
 			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;

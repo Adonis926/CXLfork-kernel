@@ -148,6 +148,17 @@ struct cxlfork_inspect_v2 {
 	__u64 vma_maple_nodes;
 	__u64 vma_lookup_start;
 	__u64 vma_lookup_end;
+	__u64 fd_table_offset;
+	__u64 fd_table_entries;
+	__u64 fd_table_bytes;
+	__u64 region_table_offset;
+	__u64 region_table_entries;
+	__u64 region_table_bytes;
+	__u64 pte_table_offset;
+	__u64 pte_table_entries;
+	__u64 pte_table_bytes;
+	__u64 page_data_offset;
+	__u64 page_data_bytes;
 };
 
 struct cxlfork_pte_mark_v2 {

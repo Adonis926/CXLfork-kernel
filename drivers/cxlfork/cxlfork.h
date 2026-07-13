@@ -232,10 +232,13 @@ struct cxlfork_desc {
 	u64 global_detach_ns;
 	u64 global_attach_ns;
 	u64 fd_table_offset;
+	u64 fd_table_entries;
 	u64 fd_table_bytes;
 	u64 region_table_offset;
+	u64 region_table_entries;
 	u64 region_table_bytes;
 	u64 pte_table_offset;
+	u64 pte_table_entries;
 	u64 pte_table_bytes;
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;
