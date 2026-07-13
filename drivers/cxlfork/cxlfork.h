@@ -231,13 +231,16 @@ struct cxlfork_desc {
 	u64 vma_maple_root_offset;
 	u64 global_detach_ns;
 	u64 global_attach_ns;
+	u64 fd_table_offset;
+	u64 fd_table_bytes;
+	u64 region_table_offset;
+	u64 region_table_bytes;
+	u64 pte_table_offset;
+	u64 pte_table_bytes;
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;
 	struct cxlfork_thread_state thread_state;
 	struct cxlfork_global_state global_state;
-	struct cxlfork_fd_state fds[CXLFORK_MAX_FDS];
-	struct cxlfork_region_desc regions[CXLFORK_MAX_REGIONS];
-	struct cxlfork_pte_desc ptes[CXLFORK_MAX_PTES];
 };
 
 #endif /* _CXLFORK_INTERNAL_H */
