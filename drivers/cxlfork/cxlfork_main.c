@@ -151,6 +151,10 @@ struct cxlfork_restore_ctx {
 	atomic64_t shared_map_pages;
 	atomic64_t local_copy_pages;
 	atomic64_t leaf_copy_pages;
+	atomic64_t fault_dispatch_ns;
+	atomic64_t leaf_materialize_ns;
+	atomic64_t data_cow_ns;
+	atomic64_t cxl_to_local_copy_ns;
 	struct cxlfork_restore_stats_v2 stats;
 };
 
@@ -186,6 +190,12 @@ struct cxlfork_restore_breakdown {
 	u64 private_rebase_validate_ns;
 	u64 dirty_prefault_ns;
 	u64 dirty_prefault_pages;
+	u64 manifest_validate_ns;
+	u64 lock_wait_ns;
+	u64 lifecycle_ns;
+	u64 vma_create_ns;
+	u64 upper_pt_alloc_ns;
+	u64 rollback_ns;
 };
 
 struct cxlfork_mapping {
@@ -337,6 +347,14 @@ cxlfork_restore_ctx_create(u64 key, u64 generation)
 	ctx->generation = generation;
 	ctx->reader_held = true;
 	atomic_set(&ctx->mappings, 0);
+	atomic64_set(&ctx->faults, 0);
+	atomic64_set(&ctx->shared_map_pages, 0);
+	atomic64_set(&ctx->local_copy_pages, 0);
+	atomic64_set(&ctx->leaf_copy_pages, 0);
+	atomic64_set(&ctx->fault_dispatch_ns, 0);
+	atomic64_set(&ctx->leaf_materialize_ns, 0);
+	atomic64_set(&ctx->data_cow_ns, 0);
+	atomic64_set(&ctx->cxl_to_local_copy_ns, 0);
 	restore_id = atomic64_inc_return(&cxlfork_next_restore_id);
 	if (!restore_id)
 		restore_id = atomic64_inc_return(&cxlfork_next_restore_id);
@@ -1683,13 +1701,24 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 	void *dst;
 	int ret;
 
-	ret = cxlfork_read_pte_snapshot(mm, addr, &pte_before, &pfn_before);
+	{
+		u64 t = ktime_get_ns();
+
+		ret = cxlfork_read_pte_snapshot(mm, addr, &pte_before,
+						&pfn_before);
+		desc->pte_walk_ns += ktime_get_ns() - t;
+	}
 	if (ret)
 		return ret;
 	if (!pte_present(__pte(pte_before)))
 		return -EFAULT;
 
-	ret = get_user_pages_fast(addr, 1, 0, &page);
+	{
+		u64 t = ktime_get_ns();
+
+		ret = get_user_pages_fast(addr, 1, 0, &page);
+		desc->gup_ns += ktime_get_ns() - t;
+	}
 	if (ret != 1)
 		return -EFAULT;
 	if (!PageAnon(page) || page_maybe_dma_pinned(page)) {
@@ -1707,11 +1736,22 @@ static int cxlfork_copy_page_to_cxl(unsigned long addr, u64 cxl_off,
 		return -ENOSPC;
 	}
 
-	src = kmap_local_page(page);
-	memcpy(dst, src, PAGE_SIZE);
-	kunmap_local(src);
+	{
+		u64 t = ktime_get_ns();
 
-	ret = cxlfork_read_pte_snapshot(mm, addr, &pte_after, &pfn_after);
+		src = kmap_local_page(page);
+		memcpy(dst, src, PAGE_SIZE);
+		kunmap_local(src);
+		desc->page_copy_ns += ktime_get_ns() - t;
+	}
+
+	{
+		u64 t = ktime_get_ns();
+
+		ret = cxlfork_read_pte_snapshot(mm, addr, &pte_after,
+						&pfn_after);
+		desc->pte_recheck_ns += ktime_get_ns() - t;
+	}
 	if (ret) {
 		put_page(page);
 		return ret;
@@ -2478,6 +2518,8 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	u64 data_off;
 	u64 slot;
 	u64 start_ns;
+	u64 lock_start;
+	u64 lifecycle_start;
 	int ret = 0;
 	bool reopen_fds;
 
@@ -2508,7 +2550,12 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	}
 	ret = 0;
 
+	start_ns = ktime_get_ns();
+	lock_start = ktime_get_ns();
 	mutex_lock(&cxlfork_lock);
+	/* The checkpoint slot transition and descriptor initialization are the
+	 * lifecycle portion; lock wait is kept separate. */
+	lifecycle_start = ktime_get_ns();
 	if (cmpxchg(&desc->state,
 		    cxlfork_lifecycle_pack(CXLFORK_SLOT_FREE, 0),
 		    cxlfork_lifecycle_pack(CXLFORK_SLOT_WRITING, 0)) !=
@@ -2537,7 +2584,8 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	desc->data_offset = slot_payload_offset(slot);
 	}
 	data_off = desc->data_offset;
-	start_ns = ktime_get_ns();
+	desc->lock_wait_ns = ktime_get_ns() - lock_start;
+	desc->lifecycle_ns = ktime_get_ns() - lifecycle_start;
 
 	mm = get_task_mm(current);
 	if (!mm) {
@@ -2546,7 +2594,12 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	}
 
 	mmap_read_lock(mm);
-	ret = cxlfork_preflight_checkpoint(mm, op, slot, &sizing);
+	{
+		u64 preflight_start = ktime_get_ns();
+
+		ret = cxlfork_preflight_checkpoint(mm, op, slot, &sizing);
+		desc->vma_preflight_ns = ktime_get_ns() - preflight_start;
+	}
 	if (ret)
 		goto out_mmap_unlock;
 	ret = cxlfork_alloc_table(desc, slot, &data_off, CXLFORK_MAX_FDS,
@@ -2697,6 +2750,13 @@ out_mmap_unlock:
 		desc->private_rebase_ns = ktime_get_ns() - rebase_start;
 	}
 	if (!ret) {
+		desc->metadata_build_ns = desc->pte_image_build_ns +
+			desc->pt_page_image_build_ns + desc->vma_tree_build_ns +
+			desc->state_image_build_ns + desc->private_rebase_ns;
+	}
+	if (!ret) {
+		u64 checksum_start = ktime_get_ns();
+
 		if (!cxlfork_desc_matches_slot(desc, slot)) {
 			ret = -EILSEQ;
 			goto out_unlock;
@@ -2704,6 +2764,7 @@ out_mmap_unlock:
 		desc->image_bytes = data_off - slot_offset(slot);
 		ret = cxlfork_compute_checksums(desc, &desc->page_checksum,
 						&desc->leaf_checksum);
+		desc->checksum_seal_ns = ktime_get_ns() - checksum_start;
 	}
 
 	if (!ret) {
@@ -2748,12 +2809,26 @@ out_mmap_unlock:
 			v2->total_pages = desc->total_pages;
 			v2->page_checksum = desc->page_checksum;
 			v2->stats.total_ns = desc->create_ns;
-			v2->stats.metadata_build_ns =
-				desc->pte_image_build_ns +
-				desc->pt_page_image_build_ns +
-				desc->vma_tree_build_ns +
-				desc->state_image_build_ns +
-				desc->private_rebase_ns;
+			v2->stats.supported_mask = CXLFORK_PREP_STAT_KNOWN_MASK;
+			v2->stats.valid_mask = CXLFORK_PREP_STAT_LOCK_WAIT |
+				CXLFORK_PREP_STAT_LIFECYCLE |
+				CXLFORK_PREP_STAT_VMA_PREFLIGHT |
+				CXLFORK_PREP_STAT_PTE_WALK |
+				CXLFORK_PREP_STAT_GUP |
+				CXLFORK_PREP_STAT_PAGE_COPY |
+				CXLFORK_PREP_STAT_PTE_RECHECK |
+				CXLFORK_PREP_STAT_METADATA |
+				CXLFORK_PREP_STAT_CHECKSUM |
+				CXLFORK_PREP_STAT_PUBLISH;
+			v2->stats.lock_wait_ns = desc->lock_wait_ns;
+			v2->stats.lifecycle_ns = desc->lifecycle_ns;
+			v2->stats.vma_preflight_ns = desc->vma_preflight_ns;
+			v2->stats.pte_walk_ns = desc->pte_walk_ns;
+			v2->stats.gup_ns = desc->gup_ns;
+			v2->stats.page_copy_ns = desc->page_copy_ns;
+			v2->stats.pte_recheck_ns = desc->pte_recheck_ns;
+			v2->stats.metadata_build_ns = desc->metadata_build_ns;
+			v2->stats.checksum_seal_ns = desc->checksum_seal_ns;
 			if (nr_out_regions &&
 			    copy_to_user(u64_to_user_ptr(v2->regions_ptr),
 					 op->regions,
@@ -2766,10 +2841,20 @@ out_mmap_unlock:
 				goto out_unlock;
 			}
 		}
-		smp_wmb();
+		{
+			u64 publish_start = ktime_get_ns();
+
+			smp_wmb();
 		WRITE_ONCE(desc->ready, 1);
 		smp_store_release(&desc->state,
 				  cxlfork_lifecycle_pack(CXLFORK_SLOT_READY, 0));
+			desc->publish_ns = ktime_get_ns() - publish_start;
+			if (v2) {
+				v2->stats.publish_ns = desc->publish_ns;
+				if (copy_to_user(v2_uarg, v2, sizeof(*v2)))
+					pr_warn("cxlfork: prepare stats publish copy failed\n");
+			}
+		}
 	}
 
 out_unlock:
@@ -2808,14 +2893,18 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 	unsigned long addr = r->start;
 	unsigned long mapped;
 	u64 install_start;
+	u64 vma_start;
 	u64 i;
 	int ret;
 
 	if (!pte_table)
 		return -EILSEQ;
+	vma_start = ktime_get_ns();
 	mapped = vm_mmap(NULL, r->start, r->length,
 			 PROT_READ | ((r->prot & PROT_EXEC) ? PROT_EXEC : 0),
 			 MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, 0);
+	if (bd)
+		bd->vma_create_ns += ktime_get_ns() - vma_start;
 	if (IS_ERR_VALUE(mapped)) {
 		if (mapped != -EEXIST)
 			pr_warn("cxlfork: vm_mmap start=%llx len=%llx ret=%ld\n",
@@ -2942,6 +3031,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 		MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
 	int ret = 0;
 	u64 attach_start;
+	u64 vma_start;
 	bool attached = false;
 
 	if (!IS_ALIGNED(r->start, PMD_SIZE) || !IS_ALIGNED(r->length, PMD_SIZE))
@@ -2949,8 +3039,11 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	if (writable_vma && (r->prot & PROT_WRITE))
 		prot |= PROT_WRITE;
 
+	vma_start = ktime_get_ns();
 	mapped = vm_mmap(NULL, r->start, r->length,
 			 prot, mmap_flags, 0);
+	if (bd)
+		bd->vma_create_ns += ktime_get_ns() - vma_start;
 	if (IS_ERR_VALUE(mapped))
 		return (int)mapped;
 	if (mapped != r->start) {
@@ -2985,15 +3078,18 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	attach_start = ktime_get_ns();
 	for (addr = r->start; addr < r->start + r->length; addr += PMD_SIZE) {
 		unsigned long leaf_pfn;
+		u64 upper_start;
 
 		ret = cxlfork_find_shared_leaf_pfn(desc, addr, &leaf_pfn);
 		if (ret)
 			goto out_unlock;
+		upper_start = ktime_get_ns();
 		ret = cxlfork_install_shared_leaf_pmd(current->mm, addr, leaf_pfn);
+		if (bd && !ret)
+			bd->upper_pt_alloc_ns += ktime_get_ns() - upper_start;
 		if (ret)
 			goto out_unlock;
 		if (bd) {
-			bd->direct_pte_install_pages += PMD_SIZE >> PAGE_SHIFT;
 			bd->shared_leaf_attach_pages += PMD_SIZE >> PAGE_SHIFT;
 		}
 		desc->shared_map_pages += PMD_SIZE >> PAGE_SHIFT;
@@ -3001,7 +3097,6 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	if (bd) {
 		u64 elapsed = ktime_get_ns() - attach_start;
 
-		bd->direct_pte_install_ns += elapsed;
 		bd->shared_leaf_attach_ns += elapsed;
 	}
 
@@ -3259,6 +3354,13 @@ static int cxlfork_prefault_dirty_local(struct vm_area_struct *vma,
 	return 0;
 }
 
+static void cxlfork_fault_dispatch_done(struct cxlfork_restore_ctx *ctx,
+						u64 start_ns)
+{
+	if (ctx)
+		atomic64_add(ktime_get_ns() - start_ns, &ctx->fault_dispatch_ns);
+}
+
 static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 {
 	/* COW/tiering fault 主路径：MoW 读共享、MoA 首次访问复制、hybrid 按热页/写入复制。 */
@@ -3273,24 +3375,29 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 	void *dst;
 	void *src;
 	u64 page_idx;
+	u64 fault_start = ktime_get_ns();
+	u64 copy_start;
 	int slot;
 
 	if (!mapping)
 		return VM_FAULT_SIGBUS;
 
 	slot = key_to_slot(mapping->key);
-	if (slot < 0)
+	if (slot < 0) {
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
+	}
 
 	mutex_lock(&cxlfork_lock);
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != mapping->key ||
-	    cxlfork_lifecycle_state(READ_ONCE(desc->state)) !=
+		cxlfork_lifecycle_state(READ_ONCE(desc->state)) !=
 		CXLFORK_SLOT_READY ||
-	    desc->generation != mapping->generation || !desc->ready ||
-	    mapping->region_idx >= desc->nr_regions) {
+		desc->generation != mapping->generation || !desc->ready ||
+		mapping->region_idx >= desc->nr_regions) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -3298,22 +3405,26 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 	ptes = cxlfork_desc_ptes(desc);
 	if (!regions || !ptes) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
 	}
 	r = &regions[mapping->region_idx];
 	addr = vmf->address & PAGE_MASK;
 	if (addr < r->start || addr >= r->start + r->length) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
 	}
 	page_idx = (addr - r->start) >> PAGE_SHIFT;
 	if (page_idx >= r->pages || r->pgoff_first + page_idx >= desc->nr_ptes) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
 	}
 	pte = &ptes[r->pgoff_first + page_idx];
 	if (pte->va != addr || !cxl_ptr(pte->cxl_offset)) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -3338,6 +3449,7 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 			}
 		}
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return ret;
 	}
 
@@ -3349,14 +3461,19 @@ copy_local:
 	page = alloc_page(GFP_HIGHUSER);
 	if (!page) {
 		mutex_unlock(&cxlfork_lock);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return VM_FAULT_OOM;
 	}
 
+	copy_start = ktime_get_ns();
 	dst = kmap_local_page(page);
 	src = cxl_ptr(pte->cxl_offset);
 	memcpy(dst, src, PAGE_SIZE);
 	kunmap_local(dst);
 	flush_dcache_page(page);
+	if (mapping->ctx)
+		atomic64_add(ktime_get_ns() - copy_start,
+				     &mapping->ctx->cxl_to_local_copy_ns);
 	desc->faults++;
 	desc->local_copy_pages++;
 	if (mapping->ctx) {
@@ -3369,6 +3486,7 @@ copy_local:
 		vm_fault_t ret = vmf_insert_page(vmf->vma, addr, page);
 
 		put_page(page);
+		cxlfork_fault_dispatch_done(mapping->ctx, fault_start);
 		return ret;
 	}
 }
@@ -3542,6 +3660,8 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	struct cxlfork_file_state *state = file->private_data;
 	struct cxlfork_desc *desc = NULL;
 	u64 start_ns;
+	u64 lock_start;
+	u64 lifecycle_start;
 	bool readonly;
 	bool private_cow;
 	bool shared_cow;
@@ -3575,7 +3695,11 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		goto out_return;
 	}
 
+	start_ns = ktime_get_ns();
+	lock_start = ktime_get_ns();
 	mutex_lock(&cxlfork_lock);
+	bd.lock_wait_ns += ktime_get_ns() - lock_start;
+	lifecycle_start = ktime_get_ns();
 	desc = slot_desc(slot);
 	if (!desc || desc->magic != CXLFORK_DESC_MAGIC ||
 	    desc->version != CXLFORK_DESC_VERSION || desc->key != op->key ||
@@ -3604,8 +3728,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		cxlfork_slot_put_reader_locked(desc, op->key, generation);
 		goto out_unlock;
 	}
-
-	start_ns = ktime_get_ns();
+	bd.lifecycle_ns += ktime_get_ns() - lifecycle_start;
 	readonly = op->flags & CXLFORK_F_MAP_READONLY;
 	private_cow = op->flags & CXLFORK_F_PRIVATE_COW;
 	shared_cow = op->flags & CXLFORK_F_SHARED_COW;
@@ -3625,7 +3748,12 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		ret = -EINVAL;
 		goto out_unlock;
 	}
-	ret = cxlfork_validate_restore_manifest(desc);
+	{
+		u64 validation_start = ktime_get_ns();
+
+		ret = cxlfork_validate_restore_manifest(desc);
+		bd.manifest_validate_ns = ktime_get_ns() - validation_start;
+	}
 	if (ret)
 		goto out_unlock;
 	if (full_validation) {
@@ -3690,15 +3818,21 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	}
 	mutex_unlock(&cxlfork_lock);
 	for (i = 0; i < desc->nr_regions; i++) {
-		u64 map_start = ktime_get_ns();
-
 		if (shared_cow) {
 			ret = cxlfork_map_region_shared_leaf(desc, &regions[i],
 							     CXLFORK_F_SHARED_COW,
 							     true, &bd, ctx);
-			if (ret == -EOPNOTSUPP)
+			if (ret == -EOPNOTSUPP) {
+				u64 fallback_start = ktime_get_ns();
+
 				ret = cxlfork_map_region_cow(file, &regions[i],
 							     i, false);
+				if (!ret) {
+					bd.pte_image_reconstruct_ns +=
+						ktime_get_ns() - fallback_start;
+					bd.pte_image_reconstruct_pages += regions[i].pages;
+				}
+			}
 		} else if (private_cow || hybrid_tiering) {
 			ret = cxlfork_map_region_cow(file, &regions[i], i,
 						     private_cow);
@@ -3713,10 +3847,6 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 			ret = cxlfork_map_region(desc, &regions[i],
 							 readonly, &bd, ctx);
 		}
-		if (!ret && shared_cow) {
-			bd.pte_image_reconstruct_ns += ktime_get_ns() - map_start;
-			bd.pte_image_reconstruct_pages += regions[i].pages;
-		}
 		if (ret)
 			break;
 		mapped_regions++;
@@ -3725,7 +3855,9 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 			break;
 		}
 	}
+	lock_start = ktime_get_ns();
 	mutex_lock(&cxlfork_lock);
+	bd.lock_wait_ns += ktime_get_ns() - lock_start;
 	if ((private_cow || shared_cow || hybrid_tiering) && state) {
 		bd.pte_image_validate_ns += state->pte_image_validate_ns;
 		bd.direct_pte_install_ns += state->direct_pte_install_ns;
@@ -3805,6 +3937,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	}
 	if (ctx) {
 		unsigned long stats_flags;
+		u64 accounted;
 		u64 path_mask = full_validation ?
 			CXLFORK_RESTORE_PATH_FULL_VALIDATION : CXLFORK_RESTORE_PATH_FAST;
 
@@ -3822,12 +3955,35 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 			path_mask |= CXLFORK_RESTORE_PATH_THREAD;
 
 		spin_lock_irqsave(&ctx->lock, stats_flags);
+		ctx->stats.supported_mask = CXLFORK_RESTORE_STAT_KNOWN_MASK &
+			~(CXLFORK_RESTORE_STAT_LEAF_MATERIALIZE |
+			  CXLFORK_RESTORE_STAT_DATA_COW);
+		ctx->stats.valid_mask = CXLFORK_RESTORE_STAT_LOCK_WAIT |
+			CXLFORK_RESTORE_STAT_LIFECYCLE |
+			CXLFORK_RESTORE_STAT_VALIDATION;
+		if (bd.vma_create_ns)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_VMA_CREATE;
+		if (bd.upper_pt_alloc_ns)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_UPPER_PT;
+		if (bd.shared_leaf_attach_pages)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_SHARED_LEAF;
+		if (bd.pte_image_reconstruct_pages)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_FALLBACK;
+		if (bd.dirty_prefault_pages)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_DIRTY_PREF;
+		if (bd.global_restore_ns)
+			ctx->stats.valid_mask |= CXLFORK_RESTORE_STAT_GLOBAL;
 		ctx->stats.total_ns = op->restore_ns;
+		ctx->stats.lock_wait_ns = bd.lock_wait_ns;
+		ctx->stats.lifecycle_ns = bd.lifecycle_ns;
 		ctx->stats.path_mask = path_mask;
-		ctx->stats.validation_ns = bd.pte_image_validate_ns +
+		ctx->stats.validation_ns = bd.manifest_validate_ns +
+			bd.pte_image_validate_ns +
 			bd.pt_page_image_validate_ns + bd.vma_tree_validate_ns +
 			bd.state_image_validate_ns +
 			bd.private_rebase_validate_ns;
+		ctx->stats.vma_create_ns = bd.vma_create_ns;
+		ctx->stats.upper_pt_alloc_ns = bd.upper_pt_alloc_ns;
 		ctx->stats.shared_leaf_attach_ns = bd.shared_leaf_attach_ns;
 		ctx->stats.fallback_reconstruct_ns =
 			bd.pte_image_reconstruct_ns;
@@ -3837,6 +3993,14 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		ctx->stats.fallback_pages = bd.pte_image_reconstruct_pages;
 		ctx->stats.dirty_prefault_pages = bd.dirty_prefault_pages;
 		ctx->stats.validated_ptes = full_validation ? desc->nr_ptes : 0;
+		accounted = ctx->stats.lock_wait_ns + ctx->stats.lifecycle_ns +
+			ctx->stats.validation_ns + ctx->stats.vma_create_ns +
+			ctx->stats.upper_pt_alloc_ns +
+			ctx->stats.shared_leaf_attach_ns +
+			ctx->stats.fallback_reconstruct_ns +
+			ctx->stats.dirty_prefault_ns + ctx->stats.global_restore_ns;
+		ctx->stats.other_ns = op->restore_ns > accounted ?
+			op->restore_ns - accounted : 0;
 		spin_unlock_irqrestore(&ctx->lock, stats_flags);
 	}
 	if (legacy_uarg && copy_to_user(legacy_uarg, op, sizeof(*op))) {
@@ -4453,6 +4617,15 @@ cxlfork_ioctl_get_call_stats_v2(struct cxlfork_call_stats_v2 __user *uarg)
 	op.stats.shared_leaf_pages = atomic64_read(&ctx->shared_map_pages);
 	op.stats.local_copy_pages = atomic64_read(&ctx->local_copy_pages);
 	op.stats.leaf_copy_pages = atomic64_read(&ctx->leaf_copy_pages);
+	op.stats.fault_dispatch_ns = atomic64_read(&ctx->fault_dispatch_ns);
+	op.stats.leaf_materialize_ns = atomic64_read(&ctx->leaf_materialize_ns);
+	op.stats.data_cow_ns = atomic64_read(&ctx->data_cow_ns);
+	op.stats.cxl_to_local_copy_ns =
+		atomic64_read(&ctx->cxl_to_local_copy_ns);
+	if (op.stats.faults)
+		op.stats.valid_mask |= CXLFORK_RESTORE_STAT_FAULT_DISPATCH;
+	if (op.stats.cxl_to_local_copy_ns)
+		op.stats.valid_mask |= CXLFORK_RESTORE_STAT_CXL_COPY;
 	memset(op.reserved1, 0, sizeof(op.reserved1));
 	ret = copy_to_user(uarg, &op, sizeof(op)) ? -EFAULT : 0;
 

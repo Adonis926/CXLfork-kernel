@@ -237,6 +237,17 @@ struct cxlfork_desc {
 	u64 vma_maple_root_offset;
 	u64 global_detach_ns;
 	u64 global_attach_ns;
+	/* Internal timing sources for the v2 prepare breakdown. */
+	u64 lock_wait_ns;
+	u64 lifecycle_ns;
+	u64 vma_preflight_ns;
+	u64 pte_walk_ns;
+	u64 gup_ns;
+	u64 page_copy_ns;
+	u64 pte_recheck_ns;
+	u64 metadata_build_ns;
+	u64 checksum_seal_ns;
+	u64 publish_ns;
 	u64 fd_table_offset;
 	u64 fd_table_entries;
 	u64 fd_table_bytes;

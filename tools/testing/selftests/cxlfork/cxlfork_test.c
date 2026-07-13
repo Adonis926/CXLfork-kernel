@@ -781,7 +781,8 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	     !op.shared_leaf_attach_pages ||
 	     op.shared_leaf_attach_pages > op.total_pages ||
 	     !op.direct_pte_install_ns ||
-	     op.direct_pte_install_pages != op.total_pages)) {
+	     op.direct_pte_install_pages + op.shared_leaf_attach_pages !=
+		     op.total_pages)) {
 		fprintf(stderr, "%s restore missing shared-leaf/direct-install breakdown"
 			" shared_leaf_ns=%" PRIu64 " shared_leaf_pages=%" PRIu64
 			" direct_ns=%" PRIu64 " direct_pages=%" PRIu64 "\n",
@@ -793,7 +794,8 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	}
 	if (!strcmp(policy, "mow") &&
 	    (!op.pte_image_reconstruct_ns ||
-	     op.pte_image_reconstruct_pages != op.total_pages ||
+	     op.pte_image_reconstruct_pages + op.shared_leaf_attach_pages !=
+		     op.total_pages ||
 	     op.pte_attach_ns != op.pte_image_reconstruct_ns ||
 	     op.pte_attach_pages != op.pte_image_reconstruct_pages)) {
 		fprintf(stderr, "MoW restore missing PTE-image reconstruction breakdown"
@@ -1207,6 +1209,15 @@ static int run_v2_lifecycle_tests(uint64_t key)
 		fprintf(stderr, "PREPARE_V2 outputs invalid\n");
 		return 1;
 	}
+	if ((prepare.stats.valid_mask & CXLFORK_PREP_STAT_KNOWN_MASK) !=
+	    CXLFORK_PREP_STAT_KNOWN_MASK ||
+	    !prepare.stats.page_copy_ns || !prepare.stats.pte_walk_ns ||
+	    !prepare.stats.gup_ns || !prepare.stats.pte_recheck_ns ||
+	    !prepare.stats.metadata_build_ns || !prepare.stats.checksum_seal_ns ||
+	    !prepare.stats.publish_ns) {
+		fprintf(stderr, "PREPARE_V2 measurement breakdown invalid\n");
+		failed++;
+	}
 	generation1 = prepare.generation;
 	resume.generation = generation1;
 	if (munmap(anon, page)) {
@@ -1222,6 +1233,13 @@ static int run_v2_lifecycle_tests(uint64_t key)
 		fprintf(stderr, "RESUME_V2 outputs invalid\n");
 		return 1;
 	}
+	if (!(resume.stats.valid_mask & CXLFORK_RESTORE_STAT_LOCK_WAIT) ||
+	    !(resume.stats.valid_mask & CXLFORK_RESTORE_STAT_LIFECYCLE) ||
+	    !(resume.stats.valid_mask & CXLFORK_RESTORE_STAT_VALIDATION) ||
+	    !resume.stats.validation_ns) {
+		fprintf(stderr, "RESUME_V2 measurement breakdown invalid\n");
+		failed++;
+	}
 	restore_id = resume.restore_id;
 	close(fd);
 	((volatile unsigned char *)(uintptr_t)regions[0].start)[0] ^= 0x55;
@@ -1235,7 +1253,11 @@ static int run_v2_lifecycle_tests(uint64_t key)
 		perror("GET_CALL_STATS_V2 after fd close");
 		return 1;
 	}
-	if (!stats.stats.faults || !stats.stats.local_copy_pages) {
+	if (!stats.stats.faults || !stats.stats.local_copy_pages ||
+	    !(stats.stats.valid_mask & CXLFORK_RESTORE_STAT_FAULT_DISPATCH) ||
+	    !(stats.stats.valid_mask & CXLFORK_RESTORE_STAT_CXL_COPY) ||
+	    !stats.stats.fault_dispatch_ns ||
+	    !stats.stats.cxl_to_local_copy_ns) {
 		fprintf(stderr, "per-call fault stats missing after fd close\n");
 		failed++;
 	}
@@ -1423,6 +1445,8 @@ static int run_v2_fastpath_tests(uint64_t key, size_t bytes)
 	size_t page = getpagesize();
 	uint64_t fast_ns;
 	uint64_t full_ns;
+	uint64_t fast_total_ns;
+	uint64_t full_total_ns;
 	uint64_t pages;
 	int fd;
 	int failed = 0;
@@ -1455,6 +1479,7 @@ static int run_v2_fastpath_tests(uint64_t key, size_t bytes)
 		return 1;
 	}
 	fast_ns = resume.stats.validation_ns;
+	fast_total_ns = resume.stats.total_ns;
 	if (!(resume.stats.path_mask & CXLFORK_RESTORE_PATH_FAST) ||
 	    resume.stats.validated_ptes ||
 	    !(resume.stats.path_mask & CXLFORK_RESTORE_PATH_SHARED_LEAF)) {
@@ -1473,6 +1498,7 @@ static int run_v2_fastpath_tests(uint64_t key, size_t bytes)
 		return 1;
 	}
 	full_ns = resume.stats.validation_ns;
+	full_total_ns = resume.stats.total_ns;
 	if (!(resume.stats.path_mask & CXLFORK_RESTORE_PATH_FULL_VALIDATION) ||
 	    resume.stats.validated_ptes != pages ||
 	    !(resume.stats.path_mask & CXLFORK_RESTORE_PATH_SHARED_LEAF)) {
@@ -1487,8 +1513,14 @@ static int run_v2_fastpath_tests(uint64_t key, size_t bytes)
 	}
 	close(fd);
 	printf("v2-fastpath key=%" PRIu64 " pages=%" PRIu64
+	       " fast_total_ns=%" PRIu64 " full_total_ns=%" PRIu64
 	       " fast_validation_ns=%" PRIu64 " full_validation_ns=%" PRIu64
-	       " verify=%s\n", key, pages, fast_ns, full_ns,
+	       " shared_leaf_ns=%" PRIu64 " fallback_ns=%" PRIu64
+	       " upper_pt_ns=%" PRIu64 " verify=%s\n", key, pages,
+	       fast_total_ns, full_total_ns, fast_ns, full_ns,
+	       (uint64_t)resume.stats.shared_leaf_attach_ns,
+	       (uint64_t)resume.stats.fallback_reconstruct_ns,
+	       (uint64_t)resume.stats.upper_pt_alloc_ns,
 	       failed ? "fail" : "ok");
 	return failed ? 1 : 0;
 }
