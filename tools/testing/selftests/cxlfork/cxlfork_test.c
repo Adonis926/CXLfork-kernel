@@ -592,6 +592,9 @@ static int mark_self_pte_range(int fd, void *addr, size_t len, uint64_t flags)
 	return 0;
 }
 
+static int inspect_addr(int fd, uint64_t key, uint64_t addr,
+			struct cxlfork_inspect_v2 *out);
+
 static int prepare_hybrid_snapshot(uint64_t key)
 {
 	struct cxlfork_checkpoint op = { 0 };
@@ -630,6 +633,93 @@ static int prepare_hybrid_snapshot(uint64_t key)
 	}
 	printf("hybrid-prepare key=%" PRIu64 " pages=%" PRIu64
 	       " verify=ok\n", key, (uint64_t)op.total_pages);
+	close(fd);
+	return 0;
+}
+
+/* Independent feasibility gate: does a hardware read set the A bit in the
+ * shared CXL PTE leaf?  A negative result is a recorded KVM/EPT limitation,
+ * not a failure of the core restore/CoW path. */
+static int prepare_abit_snapshot(uint64_t key)
+{
+	struct cxlfork_checkpoint op = { 0 };
+	unsigned char *p;
+	size_t bytes = 2 * 1024 * 1024;
+	int fd;
+
+	p = mmap(TEST_BASE, bytes, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED) {
+		perror("mmap abit");
+		return 1;
+	}
+	fill_region(p, bytes, key, 20);
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (mark_self_pte_range(fd, p, bytes,
+				CXLFORK_PTE_MARK_CLEAR_ACCESSED |
+				CXLFORK_PTE_MARK_CLEAR_DIRTY)) {
+		close(fd);
+		return 1;
+	}
+	op.key = key;
+	op.scan_start = (uintptr_t)p;
+	op.scan_end = (uintptr_t)p + bytes;
+	if (ioctl(fd, CXLFORK_FORK_PREPARE, &op)) {
+		perror("FORK_PREPARE abit");
+		close(fd);
+		return 1;
+	}
+	munmap(p, bytes);
+	close(fd);
+	printf("abit-prepare key=%" PRIu64 " pages=%" PRIu64
+	       " orig_accessed_cleared=1 verify=ok\n", key,
+	       (uint64_t)op.total_pages);
+	return 0;
+}
+
+static int restore_abit_snapshot(uint64_t key)
+{
+	struct cxlfork_restore op = {
+		.key = key,
+		.flags = CXLFORK_F_MAP_READONLY,
+	};
+	struct cxlfork_inspect_v2 before, after;
+	volatile unsigned char *p;
+	int fd;
+	const char *status = "unsupported";
+
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME abit");
+		close(fd);
+		return 1;
+	}
+	if (!op.nr_regions || inspect_addr(fd, key, op.regions[0].start,
+					   &before)) {
+		perror("INSPECT abit before");
+		goto out_unmap;
+	}
+	p = (volatile unsigned char *)(uintptr_t)op.regions[0].start;
+	(void)*p;
+	if (inspect_addr(fd, key, op.regions[0].start, &after)) {
+		perror("INSPECT abit after");
+		goto out_unmap;
+	}
+	if (!(before.orig_pte & X86_PTE_ACCESSED) &&
+	    !(before.current_pte & X86_PTE_ACCESSED) &&
+	    (after.current_pte & X86_PTE_ACCESSED))
+		status = "verified";
+	printf("abit-restore key=%" PRIu64 " before_pte=%" PRIx64
+	       " after_pte=%" PRIx64 " status=%s verify=ok\n", key,
+	       (uint64_t)before.current_pte, (uint64_t)after.current_pte,
+	       status);
+
+out_unmap:
+	munmap((void *)(uintptr_t)op.regions[0].start, op.regions[0].length);
 	close(fd);
 	return 0;
 }
@@ -1916,6 +2006,7 @@ int main(int argc, char **argv)
 			"threadctx-prepare KEY BYTES | threadctx-restore KEY POLICY | "
 			"fdglobal-prepare KEY BYTES | fdglobal-restore KEY POLICY | "
 			"hybrid-prepare KEY | hybrid-restore KEY | "
+			"abit-prepare KEY | abit-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | hold-close KEY SECONDS | "
 			"v2-lifecycle KEY | v2-rollback KEY | v2-fastpath KEY BYTES | "
@@ -1956,6 +2047,10 @@ int main(int argc, char **argv)
 		return prepare_hybrid_snapshot(key);
 	if (!strcmp(argv[1], "hybrid-restore") && argc == 3)
 		return restore_hybrid_snapshot(key);
+	if (!strcmp(argv[1], "abit-prepare") && argc == 3)
+		return prepare_abit_snapshot(key);
+	if (!strcmp(argv[1], "abit-restore") && argc == 3)
+		return restore_abit_snapshot(key);
 	if (!strcmp(argv[1], "restore") && argc == 4)
 		return restore_snapshot(key, argv[3]);
 	if (!strcmp(argv[1], "conflict") && argc == 4)
