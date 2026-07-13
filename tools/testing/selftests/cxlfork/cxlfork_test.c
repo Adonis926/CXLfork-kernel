@@ -1062,6 +1062,35 @@ static int hold_restore(uint64_t key, unsigned int seconds)
 	return 0;
 }
 
+static int hold_restore_after_close(uint64_t key, unsigned int seconds)
+{
+	struct cxlfork_restore op = {
+		.key = key,
+		.flags = CXLFORK_F_PRIVATE_COW,
+	};
+	volatile unsigned char *p;
+	uint64_t i;
+	int fd;
+
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+		perror("FORK_RESUME hold-close");
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	for (i = 0; i < op.nr_regions; i++) {
+		p = (void *)(uintptr_t)op.regions[i].start;
+		p[0] ^= 0x3c;
+	}
+	sleep(seconds);
+	printf("hold-close key=%" PRIu64 " regions=%" PRIu64
+	       " verify=ok\n", key, (uint64_t)op.nr_regions);
+	return 0;
+}
+
 static int run_lifecycle_tests(uint64_t key)
 {
 	unsigned char *anon;
@@ -1329,13 +1358,17 @@ int main(int argc, char **argv)
 			"fdglobal-prepare KEY BYTES | fdglobal-restore KEY POLICY | "
 			"hybrid-prepare KEY | hybrid-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
-			"lifecycle KEY | hold KEY SECONDS | conflict KEY POLICY\n",
+			"lifecycle KEY | hold KEY SECONDS | hold-close KEY SECONDS | "
+			"conflict KEY POLICY\n",
 			argv[0]);
 		return 2;
 	}
 	key = parse_u64(argv[2]);
 	if (!strcmp(argv[1], "hold") && argc == 4)
 		return hold_restore(key, (unsigned int)parse_u64(argv[3]));
+	if (!strcmp(argv[1], "hold-close") && argc == 4)
+		return hold_restore_after_close(key,
+						(unsigned int)parse_u64(argv[3]));
 	if (!strcmp(argv[1], "failures") && argc == 3)
 		return run_failure_tests(key);
 	if (!strcmp(argv[1], "lifecycle") && argc == 3)

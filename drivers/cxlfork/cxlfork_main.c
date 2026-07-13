@@ -12,6 +12,7 @@
 #include <linux/fs_struct.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
+#include <linux/kref.h>
 #include <linux/maple_tree.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
@@ -35,6 +36,7 @@
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
 #include <linux/vmalloc.h>
+#include <linux/xarray.h>
 #include <asm/fsgsbase.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable.h>
@@ -73,6 +75,8 @@ static struct class *cxlfork_class;
 static struct cdev cxlfork_cdev;
 static void __iomem *cxlfork_cxl;
 static DEFINE_MUTEX(cxlfork_lock);
+static DEFINE_XARRAY(cxlfork_restore_contexts);
+static atomic64_t cxlfork_next_restore_id = ATOMIC64_INIT(0);
 
 #ifdef CONFIG_CXLFORK_SELFTEST
 struct cxlfork_litmus_shared {
@@ -141,6 +145,21 @@ struct cxlfork_checkpoint_sizing {
 	u64 estimated_bytes;
 };
 
+struct cxlfork_restore_ctx {
+	struct kref ref;
+	spinlock_t lock;
+	u64 restore_id;
+	u64 key;
+	u64 generation;
+	atomic_t mappings;
+	bool reader_held;
+	bool registered;
+	atomic64_t faults;
+	atomic64_t shared_map_pages;
+	atomic64_t local_copy_pages;
+	atomic64_t leaf_copy_pages;
+};
+
 struct cxlfork_file_state {
 	/* 每个打开的 /dev/cxlfork fd 保存一次 mmap/restore 的临时上下文。 */
 	u64 mmap_key;
@@ -153,6 +172,8 @@ struct cxlfork_file_state {
 	u64 direct_pte_install_pages;
 	u64 dirty_prefault_ns;
 	u64 dirty_prefault_pages;
+	struct cxlfork_restore_ctx *mmap_ctx;
+	struct cxlfork_restore_ctx *last_ctx;
 };
 
 struct cxlfork_restore_breakdown {
@@ -180,8 +201,8 @@ struct cxlfork_mapping {
 	u64 region_idx;
 	u64 flags;
 	u64 tiering_hot_stride_pages;
-	bool holds_slot_reader;
 	refcount_t refs;
+	struct cxlfork_restore_ctx *ctx;
 };
 
 static bool cxlfork_desc_key_ready(const struct cxlfork_desc *desc, u64 key)
@@ -272,20 +293,126 @@ static void cxlfork_slot_put_reader(u64 key, u64 generation)
 	mutex_unlock(&cxlfork_lock);
 }
 
-static int cxlfork_slot_get_reader(u64 key, u64 generation)
+static void cxlfork_restore_ctx_free(struct kref *ref)
 {
-	struct cxlfork_desc *desc;
-	int slot;
+	struct cxlfork_restore_ctx *ctx =
+		container_of(ref, struct cxlfork_restore_ctx, ref);
+
+	kfree(ctx);
+}
+
+static void cxlfork_restore_ctx_get(struct cxlfork_restore_ctx *ctx)
+{
+	kref_get(&ctx->ref);
+}
+
+static void cxlfork_restore_ctx_put(struct cxlfork_restore_ctx *ctx)
+{
+	if (ctx)
+		kref_put(&ctx->ref, cxlfork_restore_ctx_free);
+}
+
+static void cxlfork_restore_ctx_release_reader(struct cxlfork_restore_ctx *ctx)
+{
+	unsigned long flags;
+	bool release = false;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (ctx->reader_held) {
+		ctx->reader_held = false;
+		release = true;
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	if (release)
+		cxlfork_slot_put_reader(ctx->key, ctx->generation);
+}
+
+static struct cxlfork_restore_ctx *
+cxlfork_restore_ctx_create(u64 key, u64 generation)
+{
+	struct cxlfork_restore_ctx *ctx;
+	u64 restore_id;
 	int ret;
 
-	slot = key_to_slot(key);
-	if (slot < 0)
-		return slot;
-	mutex_lock(&cxlfork_lock);
-	desc = slot_desc(slot);
-	ret = cxlfork_slot_get_reader_locked(desc, key, generation);
-	mutex_unlock(&cxlfork_lock);
-	return ret;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+	kref_init(&ctx->ref);
+	spin_lock_init(&ctx->lock);
+	ctx->key = key;
+	ctx->generation = generation;
+	ctx->reader_held = true;
+	atomic_set(&ctx->mappings, 0);
+	restore_id = atomic64_inc_return(&cxlfork_next_restore_id);
+	if (!restore_id)
+		restore_id = atomic64_inc_return(&cxlfork_next_restore_id);
+	ctx->restore_id = restore_id;
+
+	/* The xarray owns a reference until slot release or failed restore. */
+	cxlfork_restore_ctx_get(ctx);
+	ret = xa_err(xa_store(&cxlfork_restore_contexts,
+			      (unsigned long)restore_id, ctx, GFP_KERNEL));
+	if (ret) {
+		cxlfork_restore_ctx_put(ctx);
+		cxlfork_restore_ctx_put(ctx);
+		return ERR_PTR(ret);
+	}
+	ctx->registered = true;
+	return ctx;
+}
+
+static void cxlfork_restore_ctx_unregister(struct cxlfork_restore_ctx *ctx)
+{
+	unsigned long flags;
+	bool unregister = false;
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (ctx->registered) {
+		ctx->registered = false;
+		unregister = true;
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	if (unregister) {
+		xa_erase(&cxlfork_restore_contexts,
+			 (unsigned long)ctx->restore_id);
+		cxlfork_restore_ctx_put(ctx);
+	}
+}
+
+static void cxlfork_restore_ctx_mapping_get(struct cxlfork_restore_ctx *ctx)
+{
+	cxlfork_restore_ctx_get(ctx);
+	atomic_inc(&ctx->mappings);
+}
+
+static void cxlfork_restore_ctx_mapping_put(struct cxlfork_restore_ctx *ctx)
+{
+	if (atomic_dec_and_test(&ctx->mappings))
+		cxlfork_restore_ctx_release_reader(ctx);
+	cxlfork_restore_ctx_put(ctx);
+}
+
+static void cxlfork_file_set_restore_ctx(struct cxlfork_file_state *state,
+					 struct cxlfork_restore_ctx *ctx)
+{
+	struct cxlfork_restore_ctx *old = state->last_ctx;
+
+	if (ctx)
+		cxlfork_restore_ctx_get(ctx);
+	state->last_ctx = ctx;
+	if (old)
+		cxlfork_restore_ctx_put(old);
+}
+
+static void cxlfork_restore_ctx_purge(u64 key, u64 generation)
+{
+	struct cxlfork_restore_ctx *ctx;
+	unsigned long index;
+
+	xa_for_each(&cxlfork_restore_contexts, index, ctx) {
+		if (ctx->key == key && ctx->generation == generation)
+			cxlfork_restore_ctx_unregister(ctx);
+	}
 }
 
 static void *cxl_ptr(u64 off)
@@ -2716,7 +2843,8 @@ out_free:
 static int cxlfork_map_region(struct cxlfork_desc *desc,
 			      struct cxlfork_region_desc *r,
 			      bool readonly,
-			      struct cxlfork_restore_breakdown *bd)
+			      struct cxlfork_restore_breakdown *bd,
+			      struct cxlfork_restore_ctx *ctx)
 {
 	/* 非 COW 路径：直接把 CXL 物理页 remap 到目标进程地址。 */
 	struct cxlfork_pte_desc *pte_table = cxlfork_desc_ptes(desc);
@@ -2750,13 +2878,9 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 	mapping->key = desc->key;
 	mapping->generation = desc->generation;
 	mapping->flags = readonly ? CXLFORK_F_MAP_READONLY : 0;
-	mapping->holds_slot_reader = true;
 	refcount_set(&mapping->refs, 1);
-	ret = cxlfork_slot_get_reader(mapping->key, mapping->generation);
-	if (ret) {
-		kfree(mapping);
-		return ret;
-	}
+	mapping->ctx = ctx;
+	cxlfork_restore_ctx_mapping_get(ctx);
 
 	addr = r->start;
 	mmap_write_lock(current->mm);
@@ -2771,8 +2895,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 			pr_warn("cxlfork: no vma for addr=%lx start=%llx len=%llx\n",
 				addr, r->start, r->length);
 			mmap_write_unlock(current->mm);
-			cxlfork_slot_put_reader(mapping->key,
-						mapping->generation);
+			cxlfork_restore_ctx_mapping_put(mapping->ctx);
 			kfree(mapping);
 			return -EFAULT;
 		}
@@ -2786,8 +2909,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 				bd->direct_pte_install_ns +=
 					ktime_get_ns() - install_start;
 			mmap_write_unlock(current->mm);
-			cxlfork_slot_put_reader(mapping->key,
-						mapping->generation);
+			cxlfork_restore_ctx_mapping_put(mapping->ctx);
 			kfree(mapping);
 			return ret;
 		}
@@ -2802,8 +2924,7 @@ static int cxlfork_map_region(struct cxlfork_desc *desc,
 		if (!vma || vma->vm_start != r->start ||
 		    vma->vm_end != r->start + r->length) {
 			mmap_write_unlock(current->mm);
-			cxlfork_slot_put_reader(mapping->key,
-						mapping->generation);
+			cxlfork_restore_ctx_mapping_put(mapping->ctx);
 			kfree(mapping);
 			return -EFAULT;
 		}
@@ -2845,7 +2966,8 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 					  struct cxlfork_region_desc *r,
 					  u64 mapping_flags,
 					  bool writable_vma,
-					  struct cxlfork_restore_breakdown *bd)
+					  struct cxlfork_restore_breakdown *bd,
+					  struct cxlfork_restore_ctx *ctx)
 {
 	/*
 	 * Shared leaf gate: PMD-aligned, full-PMD regions only.
@@ -2861,6 +2983,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 		MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
 	int ret = 0;
 	u64 attach_start;
+	bool attached = false;
 
 	if (!IS_ALIGNED(r->start, PMD_SIZE) || !IS_ALIGNED(r->length, PMD_SIZE))
 		return -EOPNOTSUPP;
@@ -2884,14 +3007,9 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	mapping->key = desc->key;
 	mapping->generation = desc->generation;
 	mapping->flags = mapping_flags;
-	mapping->holds_slot_reader = true;
 	refcount_set(&mapping->refs, 1);
-	ret = cxlfork_slot_get_reader(mapping->key, mapping->generation);
-	if (ret) {
-		kfree(mapping);
-		vm_munmap(r->start, r->length);
-		return ret;
-	}
+	mapping->ctx = ctx;
+	cxlfork_restore_ctx_mapping_get(ctx);
 
 	mmap_write_lock(current->mm);
 	vma = find_vma(current->mm, r->start);
@@ -2903,6 +3021,7 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_ops = &cxlfork_vm_ops;
 	vma->vm_private_data = mapping;
+	attached = true;
 
 	attach_start = ktime_get_ns();
 	for (addr = r->start; addr < r->start + r->length; addr += PMD_SIZE) {
@@ -2929,8 +3048,13 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 
 out_unlock:
 	mmap_write_unlock(current->mm);
-	if (ret)
+	if (ret && attached)
 		vm_munmap(r->start, r->length);
+	else if (ret) {
+		cxlfork_restore_ctx_mapping_put(mapping->ctx);
+		kfree(mapping);
+		vm_munmap(r->start, r->length);
+	}
 	return ret;
 }
 
@@ -3301,6 +3425,10 @@ static vm_fault_t cxlfork_fault(struct vm_fault *vmf)
 		if (!(ret & VM_FAULT_ERROR)) {
 			desc->faults++;
 			desc->shared_map_pages++;
+			if (mapping->ctx) {
+				atomic64_inc(&mapping->ctx->faults);
+				atomic64_inc(&mapping->ctx->shared_map_pages);
+			}
 		}
 		mutex_unlock(&cxlfork_lock);
 		return ret;
@@ -3324,6 +3452,10 @@ copy_local:
 	flush_dcache_page(page);
 	desc->faults++;
 	desc->local_copy_pages++;
+	if (mapping->ctx) {
+		atomic64_inc(&mapping->ctx->faults);
+		atomic64_inc(&mapping->ctx->local_copy_pages);
+	}
 	mutex_unlock(&cxlfork_lock);
 
 	{
@@ -3352,8 +3484,8 @@ static void cxlfork_vma_close(struct vm_area_struct *vma)
 		return;
 	if (!refcount_dec_and_test(&mapping->refs))
 		return;
-	if (mapping->holds_slot_reader)
-		cxlfork_slot_put_reader(mapping->key, mapping->generation);
+	if (mapping->ctx)
+		cxlfork_restore_ctx_mapping_put(mapping->ctx);
 	kfree(mapping);
 }
 
@@ -3377,7 +3509,7 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	int slot;
 	int ret = 0;
 
-	if (!state || !state->mmap_key)
+	if (!state || !state->mmap_key || !state->mmap_ctx)
 		return -EINVAL;
 	if (vma->vm_pgoff != expected_pgoff)
 		return -EINVAL;
@@ -3420,13 +3552,8 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	mapping->flags = state->mmap_flags;
 	mapping->tiering_hot_stride_pages = state->tiering_hot_stride_pages;
 	refcount_set(&mapping->refs, 1);
-	ret = cxlfork_slot_get_reader_locked(desc, mapping->key,
-					     mapping->generation);
-	if (ret) {
-		kfree(mapping);
-		goto out_unlock;
-	}
-	mapping->holds_slot_reader = true;
+	mapping->ctx = state->mmap_ctx;
+	cxlfork_restore_ctx_mapping_get(mapping->ctx);
 
 	if (mapping->flags & CXLFORK_F_SHARED_COW)
 		ret = cxlfork_prefault_shared_cxl(vma, desc, r, state);
@@ -3436,9 +3563,7 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 			ret = cxlfork_prefault_dirty_local(vma, desc, r, state);
 	}
 	if (ret) {
-		if (mapping->holds_slot_reader)
-			cxlfork_slot_put_reader_locked(desc, mapping->key,
-						       mapping->generation);
+		cxlfork_restore_ctx_mapping_put(mapping->ctx);
 		kfree(mapping);
 		goto out_unlock;
 	}
@@ -3471,7 +3596,8 @@ static int cxlfork_ioctl_restore(struct file *file,
 	struct cxlfork_region_desc *regions;
 	u64 nr_fds_restored = 0;
 	u64 generation = 0;
-	bool restore_reader = false;
+	struct cxlfork_restore_ctx *ctx = NULL;
+	bool file_ctx_attached = false;
 	int slot;
 	int ret = 0;
 	int i;
@@ -3507,7 +3633,13 @@ static int cxlfork_ioctl_restore(struct file *file,
 	ret = cxlfork_slot_get_reader_locked(desc, op->key, generation);
 	if (ret)
 		goto out_unlock;
-	restore_reader = true;
+	ctx = cxlfork_restore_ctx_create(op->key, generation);
+	if (IS_ERR(ctx)) {
+		ret = PTR_ERR(ctx);
+		ctx = NULL;
+		cxlfork_slot_put_reader_locked(desc, op->key, generation);
+		goto out_unlock;
+	}
 
 	start_ns = ktime_get_ns();
 	readonly = op->flags & CXLFORK_F_MAP_READONLY;
@@ -3553,6 +3685,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 		state->direct_pte_install_pages = 0;
 		state->dirty_prefault_ns = 0;
 		state->dirty_prefault_pages = 0;
+		state->mmap_ctx = ctx;
 	}
 	mutex_unlock(&cxlfork_lock);
 	for (i = 0; i < desc->nr_regions; i++) {
@@ -3561,7 +3694,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 		if (shared_cow) {
 			ret = cxlfork_map_region_shared_leaf(desc, &regions[i],
 							     CXLFORK_F_SHARED_COW,
-							     true, &bd);
+							     true, &bd, ctx);
 			if (ret == -EOPNOTSUPP)
 				ret = cxlfork_map_region_cow(file, &regions[i],
 							     i, false);
@@ -3571,13 +3704,13 @@ static int cxlfork_ioctl_restore(struct file *file,
 		} else if (readonly) {
 			ret = cxlfork_map_region_shared_leaf(desc, &regions[i],
 							     CXLFORK_F_MAP_READONLY,
-							     false, &bd);
+							     false, &bd, ctx);
 			if (ret == -EOPNOTSUPP)
 				ret = cxlfork_map_region(desc, &regions[i],
-							 readonly, &bd);
+							 readonly, &bd, ctx);
 		} else {
 			ret = cxlfork_map_region(desc, &regions[i],
-						 readonly, &bd);
+							 readonly, &bd, ctx);
 		}
 		if (!ret && shared_cow) {
 			bd.pte_image_reconstruct_ns += ktime_get_ns() - map_start;
@@ -3602,6 +3735,7 @@ static int cxlfork_ioctl_restore(struct file *file,
 		state->direct_pte_install_pages = 0;
 		state->dirty_prefault_ns = 0;
 		state->dirty_prefault_pages = 0;
+		state->mmap_ctx = NULL;
 	}
 	if (ret)
 		goto out_unlock;
@@ -3667,6 +3801,10 @@ static int cxlfork_ioctl_restore(struct file *file,
 		ret = -EFAULT;
 		goto out_unlock;
 	}
+	if (state) {
+		cxlfork_file_set_restore_ctx(state, ctx);
+		file_ctx_attached = true;
+	}
 	if (apply_thread_state) {
 		ret = cxlfork_validate_thread_state(&desc->thread_state);
 		if (ret)
@@ -3678,10 +3816,16 @@ static int cxlfork_ioctl_restore(struct file *file,
 		ret = cxlfork_apply_thread_state(desc);
 
 out_unlock:
-	if (restore_reader && desc && cxlfork_desc_key_ready(desc, op->key) &&
-	    desc->generation == generation)
-		cxlfork_slot_put_reader_locked(desc, op->key, generation);
 	mutex_unlock(&cxlfork_lock);
+	if (ctx) {
+		if (!atomic_read(&ctx->mappings)) {
+			cxlfork_restore_ctx_release_reader(ctx);
+			cxlfork_restore_ctx_unregister(ctx);
+		}
+		if (ret && file_ctx_attached && state)
+			cxlfork_file_set_restore_ctx(state, NULL);
+		cxlfork_restore_ctx_put(ctx);
+	}
 out_free:
 	kfree(op);
 	return ret;
@@ -4028,6 +4172,7 @@ static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
 			mutex_unlock(&cxlfork_lock);
 			return -EBUSY;
 		}
+		cxlfork_restore_ctx_purge(rel.key, generation);
 		cxlfork_desc_reset_free(desc, generation);
 	}
 	mutex_unlock(&cxlfork_lock);
@@ -4407,7 +4552,13 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 
 static int cxlfork_release_file(struct inode *inode, struct file *file)
 {
-	kfree(file->private_data);
+	struct cxlfork_file_state *state = file->private_data;
+
+	if (state) {
+		if (state->last_ctx)
+			cxlfork_restore_ctx_put(state->last_ctx);
+		kfree(state);
+	}
 	file->private_data = NULL;
 	return 0;
 }
