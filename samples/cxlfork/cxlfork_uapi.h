@@ -5,10 +5,16 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 
+typedef uint8_t __u8;
+typedef uint16_t __u16;
+typedef uint32_t __u32;
+typedef uint64_t __u64;
+
 /*
- * CXLfork 用户态 ABI 的 standalone 拷贝：
- * - 供 benchmark 在普通用户态环境直接编译，不依赖内核 UAPI include 路径。
- * - 字段布局需要和 include/uapi/linux/cxlfork.h 保持一致。
+ * CXLfork 用户态 ABI：
+ * - 用户程序通过 /dev/cxlfork 发起 prepare/resume/stats/release。
+ * - VM0 通常执行 CXLFORK_FORK_PREPARE，把状态写到共享 CXL window。
+ * - VM1 通常执行 CXLFORK_FORK_RESUME，把 CXL window 中的状态映射/恢复到本进程。
  */
 #define CXLFORK_DEVICE "/dev/cxlfork"
 #define CXLFORK_MAX_REGIONS 64
@@ -45,123 +51,252 @@
 #define CXLFORK_F_FULL_PRIVATE_STATE 0x400ULL
 #define CXLFORK_COMM_LEN 16
 
+#define CXLFORK_ABI_VERSION_V2 2U
+
+/* QUERY_CAPS capability bits. Unset bits are deliberately unsupported. */
+#define CXLFORK_CAP_V2_ABI (1ULL << 0)
+#define CXLFORK_CAP_PTE_IMAGE_RECONSTRUCTION (1ULL << 1)
+#define CXLFORK_CAP_REAL_SHARED_PTE_LEAF (1ULL << 2)
+#define CXLFORK_CAP_PTE_LEAF_COW (1ULL << 3)
+#define CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION (1ULL << 4)
+#define CXLFORK_CAP_REAL_SHARED_VMA_LEAF (1ULL << 5)
+#define CXLFORK_CAP_MOW_DATA_COW (1ULL << 6)
+#define CXLFORK_CAP_MOA_DATA_COPY (1ULL << 7)
+#define CXLFORK_CAP_CONSISTENT_SINGLE_THREAD (1ULL << 8)
+#define CXLFORK_CAP_RELIABLE_SLOT_GENERATION (1ULL << 9)
+#define CXLFORK_CAP_FULL_PRIVATE_STATE (1ULL << 10)
+#define CXLFORK_CAP_A_BIT_HYBRID (1ULL << 11)
+#define CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME (1ULL << 12)
+#define CXLFORK_CAP_GLOBAL_FILE_STATE (1ULL << 13)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 14) - 1)
+
+#define CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID (1ULL << 0)
+#define CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID (1ULL << 1)
+#define CXLFORK_INSPECT_F_CURRENT_PTE_VALID (1ULL << 2)
+#define CXLFORK_INSPECT_F_CHECKSUM_MISMATCH (1ULL << 3)
+#define CXLFORK_INSPECT_F_SHARED_LEAF_VALID (1ULL << 4)
+#define CXLFORK_INSPECT_F_CURRENT_PMD_VALID (1ULL << 5)
+#define CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID (1ULL << 6)
+#define CXLFORK_INSPECT_F_ORIG_PTE_VALID (1ULL << 7)
+
+#define CXLFORK_PTE_MARK_CLEAR_ACCESSED (1ULL << 0)
+#define CXLFORK_PTE_MARK_CLEAR_DIRTY (1ULL << 1)
+#define CXLFORK_PTE_MARK_SET_ACCESSED (1ULL << 2)
+#define CXLFORK_PTE_MARK_SET_DIRTY (1ULL << 3)
+#define CXLFORK_PTE_MARK_KNOWN_MASK ((1ULL << 4) - 1)
+
+enum cxlfork_slot_state_v2 {
+	CXLFORK_SLOT_FREE = 0,
+	CXLFORK_SLOT_WRITING = 1,
+	CXLFORK_SLOT_READY = 2,
+	CXLFORK_SLOT_RELEASING = 3,
+};
+
+struct cxlfork_v2_header {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved;
+};
+
+struct cxlfork_query_caps_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 capabilities;
+	__u64 cxl_phys;
+	__u64 cxl_size;
+	__u64 slot_bytes;
+	__u64 data_offset;
+	__u32 page_size;
+	__u32 max_slots;
+	__u32 max_regions;
+	__u32 max_ptes;
+	__u32 descriptor_version;
+	__u32 reserved;
+};
+
+/*
+ * INSPECT is read-only. key and address are inputs; all other fields are
+ * outputs. generation is zero until the reliable slot protocol is enabled.
+ */
+struct cxlfork_inspect_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 address;
+	__u64 flags;
+	__u32 slot;
+	__u32 state;
+	__u32 reader_count;
+	__u32 reserved;
+	__u64 nr_regions;
+	__u64 nr_ptes;
+	__u64 total_pages;
+	__u64 image_bytes;
+	__u64 page_checksum;
+	__u64 observed_page_checksum;
+	__u64 leaf_checksum;
+	__u64 observed_leaf_checksum;
+	__u64 shared_pfn;
+	__u64 current_pfn;
+	__u64 current_pte;
+	__u64 orig_pte;
+	__u64 shared_map_pages;
+	__u64 local_copy_pages;
+	__u64 leaf_copy_pages;
+	__u64 shared_leaf_pfn;
+	__u64 current_pmd;
+	__u64 current_pmd_pfn;
+	__u64 vma_maple_root_pfn;
+	__u64 vma_maple_nodes;
+	__u64 vma_lookup_start;
+	__u64 vma_lookup_end;
+	__u64 fd_table_offset;
+	__u64 fd_table_entries;
+	__u64 fd_table_bytes;
+	__u64 region_table_offset;
+	__u64 region_table_entries;
+	__u64 region_table_bytes;
+	__u64 pte_table_offset;
+	__u64 pte_table_entries;
+	__u64 pte_table_bytes;
+	__u64 page_data_offset;
+	__u64 page_data_bytes;
+	__u64 extent_bytes;
+	__u64 extent_count;
+	__u64 extent_bitmap_words;
+	__u64 allocated_extents;
+};
+
+struct cxlfork_pte_mark_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 start;
+	__u64 length;
+	__u64 flags;
+	__u64 reserved1;
+};
+
 struct cxlfork_region {
 	/* 对外暴露的 VMA/region 摘要，便于 benchmark 记录页分类。 */
-	uint64_t start;
-	uint64_t length;
-	uint64_t prot;
-	uint64_t flags;
-	uint64_t pages;
-	uint64_t anon_pages;
-	uint64_t clean_file_pages;
-	uint64_t dirty_file_pages;
+	__u64 start;
+	__u64 length;
+	__u64 prot;
+	__u64 flags;
+	__u64 pages;
+	__u64 anon_pages;
+	__u64 clean_file_pages;
+	__u64 dirty_file_pages;
 };
 
 struct cxlfork_mm_state {
 	/* mm_struct 中和进程地址空间相关的可观测元数据。 */
-	uint64_t start_code;
-	uint64_t end_code;
-	uint64_t start_data;
-	uint64_t end_data;
-	uint64_t start_brk;
-	uint64_t brk;
-	uint64_t start_stack;
-	uint64_t arg_start;
-	uint64_t arg_end;
-	uint64_t env_start;
-	uint64_t env_end;
-	uint64_t saved_auxv[46];
-	uint32_t pid;
-	uint32_t tgid;
-	uint8_t comm[CXLFORK_COMM_LEN];
+	__u64 start_code;
+	__u64 end_code;
+	__u64 start_data;
+	__u64 end_data;
+	__u64 start_brk;
+	__u64 brk;
+	__u64 start_stack;
+	__u64 arg_start;
+	__u64 arg_end;
+	__u64 env_start;
+	__u64 env_end;
+	__u64 saved_auxv[46];
+	__u32 pid;
+	__u32 tgid;
+	__u8 comm[CXLFORK_COMM_LEN];
 };
 
 
 struct cxlfork_task_state {
 	/* task/cred/capability 摘要，用来模拟跨 OS 任务状态迁移成本。 */
-	uint32_t pid;
-	uint32_t tgid;
-	uint32_t ppid;
-	uint32_t uid;
-	uint32_t gid;
-	uint32_t euid;
-	uint32_t egid;
-	uint32_t suid;
-	uint32_t sgid;
-	uint32_t fsuid;
-	uint32_t fsgid;
-	uint32_t exit_signal;
-	uint32_t policy;
-	uint32_t prio;
-	uint32_t static_prio;
-	uint32_t normal_prio;
-	uint64_t flags;
-	uint64_t personality;
-	uint64_t cap_inheritable;
-	uint64_t cap_permitted;
-	uint64_t cap_effective;
-	uint64_t cap_bset;
-	uint64_t cap_ambient;
-	uint32_t full_private_state;
-	uint32_t reserved;
+	__u32 pid;
+	__u32 tgid;
+	__u32 ppid;
+	__u32 uid;
+	__u32 gid;
+	__u32 euid;
+	__u32 egid;
+	__u32 suid;
+	__u32 sgid;
+	__u32 fsuid;
+	__u32 fsgid;
+	__u32 exit_signal;
+	__u32 policy;
+	__u32 prio;
+	__u32 static_prio;
+	__u32 normal_prio;
+	__u64 flags;
+	__u64 personality;
+	__u64 cap_inheritable;
+	__u64 cap_permitted;
+	__u64 cap_effective;
+	__u64 cap_bset;
+	__u64 cap_ambient;
+	__u32 full_private_state;
+	__u32 reserved;
 	unsigned char comm[CXLFORK_COMM_LEN];
 };
 
 struct cxlfork_fd_state {
 	/* 文件描述符快照；当前原型记录 path/pos/flag 并在 restore 时尝试重开。 */
-	uint32_t fd;
-	uint32_t flags;
-	uint64_t pos;
-	uint64_t inode;
-	uint64_t dev;
-	uint8_t path[CXLFORK_PATH_LEN];
+	__u32 fd;
+	__u32 flags;
+	__u64 pos;
+	__u64 inode;
+	__u64 dev;
+	__u8 path[CXLFORK_PATH_LEN];
 };
 
 struct cxlfork_thread_state {
 	/* x86-64 线程寄存器/TLS 摘要，当前主要用于记录与可选 apply。 */
-	uint64_t ip;
-	uint64_t sp;
-	uint64_t flags;
-	uint64_t ax;
-	uint64_t bx;
-	uint64_t cx;
-	uint64_t dx;
-	uint64_t si;
-	uint64_t di;
-	uint64_t bp;
-	uint64_t fsbase;
-	uint64_t gsbase;
+	__u64 ip;
+	__u64 sp;
+	__u64 flags;
+	__u64 ax;
+	__u64 bx;
+	__u64 cx;
+	__u64 dx;
+	__u64 si;
+	__u64 di;
+	__u64 bp;
+	__u64 fsbase;
+	__u64 gsbase;
 };
 
 struct cxlfork_rlimit_state {
 	/* rlimit 快照，属于 global state 的一部分。 */
-	uint64_t rlim_cur;
-	uint64_t rlim_max;
+	__u64 rlim_cur;
+	__u64 rlim_max;
 };
 
 struct cxlfork_namespace_state {
 	/* namespace 身份和序列化/继承标记。 */
-	uint64_t mnt_ns;
-	uint64_t pid_ns;
-	uint64_t net_ns;
-	uint64_t cgroup_ns;
-	uint32_t pid_ns_level;
-	uint32_t flags;
+	__u64 mnt_ns;
+	__u64 pid_ns;
+	__u64 net_ns;
+	__u64 cgroup_ns;
+	__u32 pid_ns_level;
+	__u32 flags;
 };
 
 struct cxlfork_global_state {
 	/* cwd/root/umask/signal/rlimit/namespace 等进程全局状态。 */
-	uint32_t umask;
-	uint32_t nr_rlimits;
-	uint64_t sas_ss_sp;
-	uint64_t sas_ss_size;
-	uint32_t sas_ss_flags;
-	uint32_t reserved;
-	uint64_t sig_blocked[CXLFORK_SIGSET_WORDS];
+	__u32 umask;
+	__u32 nr_rlimits;
+	__u64 sas_ss_sp;
+	__u64 sas_ss_size;
+	__u32 sas_ss_flags;
+	__u32 reserved;
+	__u64 sig_blocked[CXLFORK_SIGSET_WORDS];
 	struct cxlfork_rlimit_state rlimits[CXLFORK_MAX_RLIMITS];
 	struct cxlfork_namespace_state ns_state;
-	uint8_t cwd[CXLFORK_PATH_LEN];
-	uint8_t root[CXLFORK_PATH_LEN];
+	__u8 cwd[CXLFORK_PATH_LEN];
+	__u8 root[CXLFORK_PATH_LEN];
 };
 
 struct cxlfork_checkpoint {
@@ -169,33 +304,33 @@ struct cxlfork_checkpoint {
 	 * prepare 输入/输出：
 	 * 输入 key、scan_start/scan_end 和 flags；输出各类元数据构建耗时与页统计。
 	 */
-	uint64_t key;
-	uint64_t scan_start;
-	uint64_t scan_end;
-	uint64_t flags;
-	uint64_t nr_regions;
-	uint64_t nr_ptes;
-	uint64_t total_pages;
-	uint64_t anon_pages;
-	uint64_t clean_file_pages;
-	uint64_t dirty_file_pages;
-	uint64_t checkpoint_ns;
-	uint64_t nr_fds;
-	uint64_t global_checkpoint_ns;
-	uint64_t pte_image_build_ns;
-	uint64_t pte_image_pages;
-	uint64_t pt_page_image_build_ns;
-	uint64_t pt_page_image_pages;
-	uint64_t pt_page_image_entries;
-	uint64_t vma_tree_build_ns;
-	uint64_t vma_tree_pages;
-	uint64_t vma_tree_nodes;
-	uint64_t state_image_build_ns;
-	uint64_t state_image_pages;
-	uint64_t private_rebase_ns;
-	uint64_t private_rebase_entries;
-	uint64_t private_rebase_pages;
-	uint64_t global_detach_ns;
+	__u64 key;
+	__u64 scan_start;
+	__u64 scan_end;
+	__u64 flags;
+	__u64 nr_regions;
+	__u64 nr_ptes;
+	__u64 total_pages;
+	__u64 anon_pages;
+	__u64 clean_file_pages;
+	__u64 dirty_file_pages;
+	__u64 checkpoint_ns;
+	__u64 nr_fds;
+	__u64 global_checkpoint_ns;
+	__u64 pte_image_build_ns;
+	__u64 pte_image_pages;
+	__u64 pt_page_image_build_ns;
+	__u64 pt_page_image_pages;
+	__u64 pt_page_image_entries;
+	__u64 vma_tree_build_ns;
+	__u64 vma_tree_pages;
+	__u64 vma_tree_nodes;
+	__u64 state_image_build_ns;
+	__u64 state_image_pages;
+	__u64 private_rebase_ns;
+	__u64 private_rebase_entries;
+	__u64 private_rebase_pages;
+	__u64 global_detach_ns;
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;
 	struct cxlfork_thread_state thread_state;
@@ -209,43 +344,49 @@ struct cxlfork_restore {
 	 * resume 输入/输出：
 	 * 输入 key、flags 和 tiering_hot_stride_pages；输出 restore/attach/validate breakdown。
 	 */
-	uint64_t key;
-	uint64_t flags;
-	uint64_t nr_regions;
-	uint64_t nr_ptes;
-	uint64_t total_pages;
-	uint64_t anon_pages;
-	uint64_t clean_file_pages;
-	uint64_t dirty_file_pages;
-	uint64_t restore_ns;
-	uint64_t nr_fds;
-	uint64_t nr_fds_restored;
-	uint64_t global_restore_ns;
-	uint64_t tiering_hot_stride_pages;
-	uint64_t pte_attach_ns;
-	uint64_t pte_attach_pages;
-	uint64_t direct_pte_install_ns;
-	uint64_t direct_pte_install_pages;
-	uint64_t pte_image_validate_ns;
-	uint64_t pte_image_build_ns;
-	uint64_t pte_image_pages;
-	uint64_t pt_page_image_validate_ns;
-	uint64_t pt_page_image_build_ns;
-	uint64_t pt_page_image_pages;
-	uint64_t pt_page_image_entries;
-	uint64_t vma_tree_validate_ns;
-	uint64_t vma_tree_build_ns;
-	uint64_t vma_tree_pages;
-	uint64_t vma_tree_nodes;
-	uint64_t state_image_validate_ns;
-	uint64_t state_image_build_ns;
-	uint64_t state_image_pages;
-	uint64_t private_rebase_validate_ns;
-	uint64_t private_rebase_ns;
-	uint64_t private_rebase_entries;
-	uint64_t private_rebase_pages;
-	uint64_t global_detach_ns;
-	uint64_t global_attach_ns;
+	__u64 key;
+	__u64 flags;
+	__u64 nr_regions;
+	__u64 nr_ptes;
+	__u64 total_pages;
+	__u64 anon_pages;
+	__u64 clean_file_pages;
+	__u64 dirty_file_pages;
+	__u64 restore_ns;
+	__u64 nr_fds;
+	__u64 nr_fds_restored;
+	__u64 global_restore_ns;
+	__u64 tiering_hot_stride_pages;
+	__u64 pte_attach_ns;
+	__u64 pte_attach_pages;
+	__u64 direct_pte_install_ns;
+	__u64 direct_pte_install_pages;
+	__u64 pte_image_validate_ns;
+	__u64 pte_image_build_ns;
+	__u64 pte_image_pages;
+	__u64 pt_page_image_validate_ns;
+	__u64 pt_page_image_build_ns;
+	__u64 pt_page_image_pages;
+	__u64 pt_page_image_entries;
+	__u64 vma_tree_validate_ns;
+	__u64 vma_tree_build_ns;
+	__u64 vma_tree_pages;
+	__u64 vma_tree_nodes;
+	__u64 state_image_validate_ns;
+	__u64 state_image_build_ns;
+	__u64 state_image_pages;
+	__u64 private_rebase_validate_ns;
+	__u64 private_rebase_ns;
+	__u64 private_rebase_entries;
+	__u64 private_rebase_pages;
+	__u64 global_detach_ns;
+	__u64 global_attach_ns;
+	__u64 pte_image_reconstruct_ns;
+	__u64 pte_image_reconstruct_pages;
+	__u64 shared_leaf_attach_ns;
+	__u64 shared_leaf_attach_pages;
+	__u64 dirty_prefault_ns;
+	__u64 dirty_prefault_pages;
 	struct cxlfork_namespace_state restore_ns_state;
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;
@@ -257,21 +398,21 @@ struct cxlfork_restore {
 
 struct cxlfork_stats {
 	/* 查询某个 key 对应 slot 的当前状态，faults 是 fault handler 累计计数。 */
-	uint64_t key;
-	uint64_t ready;
-	uint64_t slot;
-	uint64_t nr_regions;
-	uint64_t nr_ptes;
-	uint64_t total_pages;
-	uint64_t anon_pages;
-	uint64_t clean_file_pages;
-	uint64_t dirty_file_pages;
-	uint64_t faults;
+	__u64 key;
+	__u64 ready;
+	__u64 slot;
+	__u64 nr_regions;
+	__u64 nr_ptes;
+	__u64 total_pages;
+	__u64 anon_pages;
+	__u64 clean_file_pages;
+	__u64 dirty_file_pages;
+	__u64 faults;
 };
 
 struct cxlfork_release {
 	/* 释放某个 key 对应 slot，下一轮 prepare 前通常先调用。 */
-	uint64_t key;
+	__u64 key;
 };
 
 #define CXLFORK_IOC_MAGIC 'C'
@@ -282,5 +423,8 @@ struct cxlfork_release {
 #define CXLFORK_RELEASE _IOW(CXLFORK_IOC_MAGIC, 4, struct cxlfork_release)
 #define CXLFORK_FORK_PREPARE _IOWR(CXLFORK_IOC_MAGIC, 5, struct cxlfork_checkpoint)
 #define CXLFORK_FORK_RESUME _IOWR(CXLFORK_IOC_MAGIC, 6, struct cxlfork_restore)
+#define CXLFORK_QUERY_CAPS_V2 _IOWR(CXLFORK_IOC_MAGIC, 7, struct cxlfork_v2_header)
+#define CXLFORK_INSPECT_V2 _IOWR(CXLFORK_IOC_MAGIC, 11, struct cxlfork_v2_header)
+#define CXLFORK_PTE_MARK_V2 _IOWR(CXLFORK_IOC_MAGIC, 12, struct cxlfork_v2_header)
 
 #endif /* _CXLFORK_SAMPLE_UAPI_H */
