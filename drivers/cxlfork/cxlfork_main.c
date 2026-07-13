@@ -4614,7 +4614,12 @@ cxlfork_ioctl_get_call_stats_v2(struct cxlfork_call_stats_v2 __user *uarg)
 	op.stats = ctx->stats;
 	spin_unlock_irqrestore(&ctx->lock, flags);
 	op.stats.faults = atomic64_read(&ctx->faults);
-	op.stats.shared_leaf_pages = atomic64_read(&ctx->shared_map_pages);
+	/*
+	 * shared_leaf_pages is the number of data pages covered by CXL PTE
+	 * leaves attached during RESUME_V2.  shared_map_pages counts a different
+	 * event (4 KiB CXL mappings inserted by the fault path), so it must not
+	 * overwrite the per-call attach breakdown copied above.
+	 */
 	op.stats.local_copy_pages = atomic64_read(&ctx->local_copy_pages);
 	op.stats.leaf_copy_pages = atomic64_read(&ctx->leaf_copy_pages);
 	op.stats.fault_dispatch_ns = atomic64_read(&ctx->fault_dispatch_ns);
