@@ -44,6 +44,7 @@
 #define CXLFORK_F_MIGRATE_ON_WRITE CXLFORK_F_SHARED_COW
 #define CXLFORK_F_HYBRID_TIERING 0x200ULL
 #define CXLFORK_F_FULL_PRIVATE_STATE 0x400ULL
+#define CXLFORK_F_VALIDATE_FULL 0x800ULL
 /* Privileged fault injection; available only with CONFIG_CXLFORK_SELFTEST. */
 #define CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION (1ULL << 63)
 #define CXLFORK_COMM_LEN 16
@@ -65,7 +66,8 @@
 #define CXLFORK_CAP_A_BIT_HYBRID (1ULL << 11)
 #define CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME (1ULL << 12)
 #define CXLFORK_CAP_GLOBAL_FILE_STATE (1ULL << 13)
-#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 14) - 1)
+#define CXLFORK_CAP_RESTORE_FAST_PATH (1ULL << 14)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 15) - 1)
 
 /* MM operations rejected by a tested kernel hook on restored VMAs. */
 #define CXLFORK_MM_FAILFAST_MPROTECT (1ULL << 0)
@@ -83,6 +85,17 @@
 #define CXLFORK_INSPECT_F_CURRENT_PMD_VALID (1ULL << 5)
 #define CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID (1ULL << 6)
 #define CXLFORK_INSPECT_F_ORIG_PTE_VALID (1ULL << 7)
+#define CXLFORK_INSPECT_F_VMA_IMAGE_LOOKUP_VALID (1ULL << 8)
+
+#define CXLFORK_RESTORE_PATH_FAST (1ULL << 0)
+#define CXLFORK_RESTORE_PATH_FULL_VALIDATION (1ULL << 1)
+#define CXLFORK_RESTORE_PATH_SHARED_LEAF (1ULL << 2)
+#define CXLFORK_RESTORE_PATH_FALLBACK_RECONSTRUCT (1ULL << 3)
+#define CXLFORK_RESTORE_PATH_MOA (1ULL << 4)
+#define CXLFORK_RESTORE_PATH_HYBRID (1ULL << 5)
+#define CXLFORK_RESTORE_PATH_GLOBAL (1ULL << 6)
+#define CXLFORK_RESTORE_PATH_THREAD (1ULL << 7)
+#define CXLFORK_RESTORE_PATH_ROLLBACK (1ULL << 8)
 
 #define CXLFORK_PTE_MARK_CLEAR_ACCESSED (1ULL << 0)
 #define CXLFORK_PTE_MARK_CLEAR_DIRTY (1ULL << 1)
@@ -179,6 +192,10 @@ struct cxlfork_inspect_v2 {
 	__u64 vma_maple_nodes;
 	__u64 vma_lookup_start;
 	__u64 vma_lookup_end;
+	__u64 vma_image_root_offset;
+	__u64 vma_image_nodes;
+	__u64 vma_image_lookup_start;
+	__u64 vma_image_lookup_end;
 	__u64 fd_table_offset;
 	__u64 fd_table_entries;
 	__u64 fd_table_bytes;

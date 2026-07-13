@@ -815,11 +815,11 @@ static int restore_snapshot(uint64_t key, const char *policy)
 		fprintf(stderr, "restored checksum mismatch\n");
 		return 1;
 	}
-	if (!(before.flags & CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID) ||
-	    !before.vma_maple_root_pfn ||
-	    !before.vma_maple_nodes ||
-	    before.vma_lookup_start > op.regions[0].start ||
-	    before.vma_lookup_end < op.regions[0].start + page) {
+	if (!(before.flags & CXLFORK_INSPECT_F_VMA_IMAGE_LOOKUP_VALID) ||
+	    !before.vma_image_root_offset ||
+	    !before.vma_image_nodes ||
+	    before.vma_image_lookup_start > op.regions[0].start ||
+	    before.vma_image_lookup_end < op.regions[0].start + page) {
 		fprintf(stderr, "%s restore did not attach a CXL Maple VMA node\n",
 			policy);
 		return 1;
@@ -901,8 +901,8 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       " after_pfn=%" PRIu64 " second_pfn=%" PRIu64
 	       " shared_leaf_pfn=%" PRIu64 " current_pmd_pfn=%" PRIu64
 	       " after_pmd_pfn=%" PRIu64 " second_pmd_pfn=%" PRIu64
-	       " vma_root_pfn=%" PRIu64 " vma_nodes=%" PRIu64
-	       " vma_lookup=%" PRIx64 "-%" PRIx64
+	       " vma_image_root=%" PRIx64 " vma_image_nodes=%" PRIu64
+	       " vma_image_lookup=%" PRIx64 "-%" PRIx64
 	       " direct_pages=%" PRIu64 " shared_leaf_pages=%" PRIu64
 	       " reconstruct_pages=%" PRIu64
 	       " verify=ok\n",
@@ -914,10 +914,10 @@ static int restore_snapshot(uint64_t key, const char *policy)
 	       (uint64_t)before.current_pmd_pfn,
 	       (uint64_t)after.current_pmd_pfn,
 	       (uint64_t)after_second.current_pmd_pfn,
-	       (uint64_t)before.vma_maple_root_pfn,
-	       (uint64_t)before.vma_maple_nodes,
-	       (uint64_t)before.vma_lookup_start,
-	       (uint64_t)before.vma_lookup_end,
+	       (uint64_t)before.vma_image_root_offset,
+	       (uint64_t)before.vma_image_nodes,
+	       (uint64_t)before.vma_image_lookup_start,
+	       (uint64_t)before.vma_image_lookup_end,
 	       (uint64_t)op.direct_pte_install_pages,
 	       (uint64_t)op.shared_leaf_attach_pages,
 	       (uint64_t)op.pte_image_reconstruct_pages);
@@ -999,8 +999,8 @@ static int inspect_snapshot(uint64_t key, uint64_t address)
 	       " observed_page_checksum=%" PRIu64 " leaf_checksum=%" PRIu64
 	       " observed_leaf_checksum=%" PRIu64 " shared_pfn=%" PRIu64
 	       " current_pfn=%" PRIu64 " shared_leaf_pfn=%" PRIu64
-	       " current_pmd_pfn=%" PRIu64 " vma_root_pfn=%" PRIu64
-	       " vma_nodes=%" PRIu64 " vma_lookup=%" PRIx64 "-%" PRIx64
+	       " current_pmd_pfn=%" PRIu64 " vma_image_root=%" PRIx64
+	       " vma_image_nodes=%" PRIu64 " vma_image_lookup=%" PRIx64 "-%" PRIx64
 	       " flags=%" PRIu64 "\n",
 	       (uint64_t)op.key, (uint64_t)op.generation, op.slot, op.state,
 	       op.reader_count, (uint64_t)op.nr_regions,
@@ -1008,9 +1008,10 @@ static int inspect_snapshot(uint64_t key, uint64_t address)
 	       (uint64_t)op.observed_page_checksum, (uint64_t)op.leaf_checksum,
 	       (uint64_t)op.observed_leaf_checksum, (uint64_t)op.shared_pfn,
 	       (uint64_t)op.current_pfn, (uint64_t)op.shared_leaf_pfn,
-	       (uint64_t)op.current_pmd_pfn, (uint64_t)op.vma_maple_root_pfn,
-	       (uint64_t)op.vma_maple_nodes,
-	       (uint64_t)op.vma_lookup_start, (uint64_t)op.vma_lookup_end,
+	       (uint64_t)op.current_pmd_pfn, (uint64_t)op.vma_image_root_offset,
+	       (uint64_t)op.vma_image_nodes,
+	       (uint64_t)op.vma_image_lookup_start,
+	       (uint64_t)op.vma_image_lookup_end,
 	       (uint64_t)op.flags);
 	close(fd);
 	return 0;
@@ -1391,6 +1392,104 @@ static int run_v2_rollback_tests(uint64_t key)
 	close(fd);
 	printf("v2-rollback key=%" PRIu64 " regions=2 verify=%s\n",
 	       key, failed ? "fail" : "ok");
+	return failed ? 1 : 0;
+}
+
+static int run_v2_fastpath_tests(uint64_t key, size_t bytes)
+{
+	struct cxlfork_region regions[CXLFORK_MAX_REGIONS] = { 0 };
+	struct cxlfork_prepare_v2 prepare = {
+		.size = sizeof(prepare),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_resume_v2 resume = {
+		.size = sizeof(resume),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.flags = CXLFORK_F_MAP_READONLY,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_release_v2 release = {
+		.size = sizeof(release),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	unsigned char *anon;
+	void *mapped;
+	size_t page = getpagesize();
+	uint64_t fast_ns;
+	uint64_t full_ns;
+	uint64_t pages;
+	int fd;
+	int failed = 0;
+
+	bytes = (bytes + page - 1) & ~(page - 1);
+	if (bytes < 2 * 1024 * 1024)
+		bytes = 2 * 1024 * 1024;
+	anon = mmap(TEST_BASE, bytes, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED) {
+		perror("fastpath source mmap");
+		return 1;
+	}
+	fill_region(anon, bytes, key, 0);
+	prepare.scan_start = (uintptr_t)anon;
+	prepare.scan_end = (uintptr_t)anon + bytes;
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare) ||
+	    munmap(anon, bytes)) {
+		perror("fastpath prepare");
+		return 1;
+	}
+	pages = prepare.total_pages;
+	resume.generation = prepare.generation;
+	release.generation = prepare.generation;
+	if (ioctl(fd, CXLFORK_RESUME_V2, &resume)) {
+		perror("fastpath resume");
+		return 1;
+	}
+	fast_ns = resume.stats.validation_ns;
+	if (!(resume.stats.path_mask & CXLFORK_RESTORE_PATH_FAST) ||
+	    resume.stats.validated_ptes ||
+	    !(resume.stats.path_mask & CXLFORK_RESTORE_PATH_SHARED_LEAF)) {
+		fprintf(stderr, "fast path mask/validated_ptes mismatch\n");
+		failed++;
+	}
+	mapped = (void *)(uintptr_t)regions[0].start;
+	if (munmap(mapped, regions[0].length))
+		failed++;
+	resume.flags = CXLFORK_F_MAP_READONLY | CXLFORK_F_VALIDATE_FULL;
+	resume.restore_id = 0;
+	resume.region_count = 0;
+	memset(&resume.stats, 0, sizeof(resume.stats));
+	if (ioctl(fd, CXLFORK_RESUME_V2, &resume)) {
+		perror("full-validation resume");
+		return 1;
+	}
+	full_ns = resume.stats.validation_ns;
+	if (!(resume.stats.path_mask & CXLFORK_RESTORE_PATH_FULL_VALIDATION) ||
+	    resume.stats.validated_ptes != pages ||
+	    !(resume.stats.path_mask & CXLFORK_RESTORE_PATH_SHARED_LEAF)) {
+		fprintf(stderr, "full path mask/validated_ptes mismatch\n");
+		failed++;
+	}
+	if (munmap((void *)(uintptr_t)regions[0].start, regions[0].length))
+		failed++;
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
+		perror("fastpath release");
+		failed++;
+	}
+	close(fd);
+	printf("v2-fastpath key=%" PRIu64 " pages=%" PRIu64
+	       " fast_validation_ns=%" PRIu64 " full_validation_ns=%" PRIu64
+	       " verify=%s\n", key, pages, fast_ns, full_ns,
+	       failed ? "fail" : "ok");
 	return failed ? 1 : 0;
 }
 
@@ -1787,7 +1886,8 @@ int main(int argc, char **argv)
 			"hybrid-prepare KEY | hybrid-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | hold-close KEY SECONDS | "
-			"v2-lifecycle KEY | v2-rollback KEY | mm-failfast KEY | "
+			"v2-lifecycle KEY | v2-rollback KEY | v2-fastpath KEY BYTES | "
+			"mm-failfast KEY | "
 			"conflict KEY POLICY\n",
 			argv[0]);
 		return 2;
@@ -1806,6 +1906,8 @@ int main(int argc, char **argv)
 		return run_v2_lifecycle_tests(key);
 	if (!strcmp(argv[1], "v2-rollback") && argc == 3)
 		return run_v2_rollback_tests(key);
+	if (!strcmp(argv[1], "v2-fastpath") && argc == 4)
+		return run_v2_fastpath_tests(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "mm-failfast") && argc == 3)
 		return run_mm_failfast_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)

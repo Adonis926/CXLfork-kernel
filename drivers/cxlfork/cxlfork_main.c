@@ -53,13 +53,6 @@
  * - VM1 执行 resume，从相同 slot 恢复 VMA/PTE/状态并运行 workload。
  */
 #define CXLFORK_REGION_PGOFF_STEP (CXLFORK_SLOT_BYTES >> PAGE_SHIFT)
-#define CXLFORK_VMA_MAPLE_SCRATCH_BYTES SZ_2M
-#define CXLFORK_MAPLE_ROOT_NODE 0x02UL
-#define CXLFORK_MAPLE_ENODE_NULL 0x04UL
-#define CXLFORK_MAPLE_ENODE_TYPE_SHIFT 0x03UL
-#define CXLFORK_MA_ROOT_PARENT 1UL
-#define CXLFORK_MAPLE_PARENT_RANGE64 0x06UL
-#define CXLFORK_MAPLE_PARENT_SLOT_SHIFT 3
 
 /* 共享 CXL window 的物理参数，必须和 QEMU kernel cmdline 中的参数一致。 */
 static phys_addr_t cxl_phys = 0x484000000ULL;
@@ -481,137 +474,6 @@ static int cxlfork_alloc_table(struct cxlfork_desc *desc, u64 slot, u64 *data_of
 	*offset = *data_off;
 	*bytes = table_bytes;
 	*data_off += table_bytes;
-	return 0;
-}
-
-static enum maple_type cxlfork_mte_type(const void *entry)
-{
-	return ((unsigned long)entry >> CXLFORK_MAPLE_ENODE_TYPE_SHIFT) &
-		MAPLE_NODE_TYPE_MASK;
-}
-
-static struct maple_node *cxlfork_mte_node(const void *entry)
-{
-	return (struct maple_node *)((unsigned long)entry & ~MAPLE_NODE_MASK);
-}
-
-static void *cxlfork_mt_mk_node(const struct maple_node *node,
-				enum maple_type type)
-{
-	return (void *)((unsigned long)node |
-			((unsigned long)type << CXLFORK_MAPLE_ENODE_TYPE_SHIFT) |
-			CXLFORK_MAPLE_ENODE_NULL);
-}
-
-static void *cxlfork_mte_mk_root(const void *node)
-{
-	return (void *)((unsigned long)node | CXLFORK_MAPLE_ROOT_NODE);
-}
-
-static bool cxlfork_mte_is_node(const void *entry)
-{
-	return entry && cxlfork_mte_type(entry) != maple_dense;
-}
-
-static void __rcu **cxlfork_ma_slots(struct maple_node *node, enum maple_type type)
-{
-	switch (type) {
-	case maple_arange_64:
-		return node->ma64.slot;
-	case maple_range_64:
-	case maple_leaf_64:
-		return node->mr64.slot;
-	default:
-		return NULL;
-	}
-}
-
-static unsigned int cxlfork_ma_slot_count(enum maple_type type)
-{
-	switch (type) {
-	case maple_arange_64:
-		return MAPLE_ARANGE64_SLOTS;
-	case maple_range_64:
-	case maple_leaf_64:
-		return MAPLE_RANGE64_SLOTS;
-	default:
-		return 0;
-	}
-}
-
-static void cxlfork_maple_set_root_parent(struct maple_tree *mt,
-					  struct maple_node *node)
-{
-	node->parent = (struct maple_pnode *)((unsigned long)mt |
-					     CXLFORK_MA_ROOT_PARENT);
-}
-
-static void cxlfork_maple_set_parent(struct maple_node *child,
-				     const struct maple_node *parent,
-				     unsigned int slot)
-{
-	unsigned long val = (unsigned long)parent;
-
-	val &= ~MAPLE_NODE_MASK;
-	val |= (slot << CXLFORK_MAPLE_PARENT_SLOT_SHIFT) |
-		CXLFORK_MAPLE_PARENT_RANGE64;
-	child->parent = (struct maple_pnode *)val;
-}
-
-struct cxlfork_maple_copy_ctx {
-	u64 next;
-	u64 end;
-	u64 nodes;
-};
-
-static int cxlfork_copy_maple_node_to_cxl(struct cxlfork_maple_copy_ctx *ctx,
-					  void *old_entry, void **new_entry,
-					  struct maple_node *new_parent,
-					  unsigned int parent_slot)
-{
-	struct maple_node *old_node = cxlfork_mte_node(old_entry);
-	struct maple_node *new_node;
-	enum maple_type type = cxlfork_mte_type(old_entry);
-	void __rcu **slots;
-	unsigned int i;
-	u64 node_off;
-
-	if (type != maple_leaf_64 && type != maple_range_64 &&
-	    type != maple_arange_64)
-		return -EOPNOTSUPP;
-	if (ctx->next + sizeof(*new_node) > ctx->end)
-		return -ENOSPC;
-	node_off = ALIGN(ctx->next, MAPLE_NODE_MASK + 1);
-	if (node_off + sizeof(*new_node) > ctx->end)
-		return -ENOSPC;
-	new_node = cxl_ptr(node_off);
-	if (!new_node)
-		return -ENOSPC;
-	memcpy(new_node, old_node, sizeof(*new_node));
-	ctx->next = node_off + sizeof(*new_node);
-	ctx->nodes++;
-
-	*new_entry = cxlfork_mt_mk_node(new_node, type);
-	if (new_parent)
-		cxlfork_maple_set_parent(new_node, new_parent, parent_slot);
-
-	if (type == maple_leaf_64)
-		return 0;
-
-	slots = cxlfork_ma_slots(new_node, type);
-	for (i = 0; i < cxlfork_ma_slot_count(type); i++) {
-		void *child = rcu_dereference_protected(slots[i], true);
-		void *new_child;
-		int ret;
-
-		if (!cxlfork_mte_is_node(child))
-			continue;
-		ret = cxlfork_copy_maple_node_to_cxl(ctx, child, &new_child,
-						     new_node, i);
-		if (ret)
-			return ret;
-		rcu_assign_pointer(slots[i], new_child);
-	}
 	return 0;
 }
 
@@ -2542,6 +2404,67 @@ static int cxlfork_validate_private_rebase_image(const struct cxlfork_desc *desc
 	return 0;
 }
 
+/* Fast restore admission: validate only the sealed manifest and its bounds. */
+static int cxlfork_validate_restore_manifest(const struct cxlfork_desc *desc)
+{
+	u64 bytes;
+
+	if (!desc || !cxlfork_desc_matches_slot(desc, desc->slot) ||
+	    !desc->key || !desc->generation || !desc->ready ||
+	    cxlfork_lifecycle_state(smp_load_acquire(&desc->state)) !=
+		CXLFORK_SLOT_READY ||
+	    desc->nr_regions == 0 || desc->nr_regions > CXLFORK_MAX_REGIONS ||
+	    desc->nr_ptes == 0 || desc->total_pages != desc->nr_ptes ||
+	    desc->region_table_entries != desc->nr_regions ||
+	    desc->pte_table_entries != desc->nr_ptes ||
+	    !desc->region_table_bytes || !desc->pte_table_bytes ||
+	    check_mul_overflow(desc->total_pages, (u64)PAGE_SIZE, &bytes) ||
+	    !desc->data_offset || !cxlfork_slot_range_valid(desc,
+							 desc->data_offset, bytes) ||
+	    check_mul_overflow(desc->nr_regions,
+				       (u64)sizeof(struct cxlfork_region_desc), &bytes) ||
+	    desc->region_table_bytes < PAGE_ALIGN(bytes) ||
+	    !cxlfork_slot_range_valid(desc, desc->region_table_offset,
+					       desc->region_table_bytes) ||
+	    check_mul_overflow(desc->nr_ptes,
+				       (u64)sizeof(struct cxlfork_pte_desc), &bytes) ||
+	    desc->pte_table_bytes < PAGE_ALIGN(bytes) ||
+	    !cxlfork_slot_range_valid(desc, desc->pte_table_offset,
+					       desc->pte_table_bytes) ||
+	    desc->pte_image_entries != desc->nr_ptes ||
+	    !desc->pte_image_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->pte_image_offset,
+					       desc->pte_image_pages * PAGE_SIZE) ||
+	    !desc->pt_page_image_entries || !desc->pt_page_image_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->pt_page_image_offset,
+					       desc->pt_page_image_pages * PAGE_SIZE) ||
+	    !desc->pt_tree_image_offset || !desc->pt_tree_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->pt_tree_image_offset,
+					       (desc->pt_tree_pages + 1) * PAGE_SIZE) ||
+	    !desc->pt_tree_root_offset ||
+	    !cxlfork_slot_range_valid(desc, desc->pt_tree_root_offset,
+					       PAGE_SIZE) ||
+	    !desc->vma_tree_image_offset || !desc->vma_tree_nodes ||
+	    !desc->vma_tree_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->vma_tree_image_offset,
+					       desc->vma_tree_pages * PAGE_SIZE) ||
+	    !desc->vma_tree_root_offset ||
+	    !cxlfork_slot_range_valid(desc, desc->vma_tree_root_offset,
+					       sizeof(struct cxlfork_vma_node_image)) ||
+	    !desc->state_image_offset || !desc->state_image_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->state_image_offset,
+					       desc->state_image_pages * PAGE_SIZE) ||
+	    !desc->private_rebase_offset || !desc->private_rebase_pages ||
+	    !cxlfork_slot_range_valid(desc, desc->private_rebase_offset,
+					       desc->private_rebase_pages * PAGE_SIZE) ||
+	    !desc->image_bytes ||
+	    desc->image_bytes > CXLFORK_SLOT_BYTES ||
+	    !desc->page_checksum || !desc->leaf_checksum)
+		return -EILSEQ;
+
+	return 0;
+}
+
 static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 				 struct cxlfork_checkpoint __user *legacy_uarg,
 				 struct cxlfork_prepare_v2 *v2,
@@ -3094,85 +3017,37 @@ out_unlock:
 	return ret;
 }
 
-static int cxlfork_probe_cxl_vma_maple(struct cxlfork_desc *desc,
-				       unsigned long address,
-				       struct cxlfork_inspect_v2 *inspect)
+static int cxlfork_inspect_vma_image(const struct cxlfork_desc *desc,
+				     unsigned long address,
+				     struct cxlfork_inspect_v2 *inspect)
 {
-	struct cxlfork_maple_copy_ctx ctx;
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
-	void *old_root;
-	void *new_root;
-	unsigned int old_flags;
-	bool attached = false;
-	u64 start_ns = ktime_get_ns();
-	u64 scratch = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES -
-		CXLFORK_VMA_MAPLE_SCRATCH_BYTES;
-	u64 used_end = slot_offset(desc->slot) + desc->image_bytes;
-	int ret;
+	u64 node_offset = desc->vma_tree_root_offset;
+	u64 visited = 0;
 
-	if (used_end > scratch)
-		return -ENOSPC;
-	if (!cxl_range_valid(scratch, CXLFORK_VMA_MAPLE_SCRATCH_BYTES))
-		return -ENOSPC;
+	while (node_offset && visited++ < desc->vma_tree_nodes) {
+		const struct cxlfork_vma_node_image *node;
 
-	memset(cxl_ptr(scratch), 0, CXLFORK_VMA_MAPLE_SCRATCH_BYTES);
-	ctx.next = scratch;
-	ctx.end = slot_offset(desc->slot) + CXLFORK_SLOT_BYTES;
-	ctx.nodes = 0;
-
-	mmap_write_lock(mm);
-	mtree_lock(&mm->mm_mt);
-	old_root = rcu_dereference_protected(mm->mm_mt.ma_root, true);
-	old_flags = mm->mm_mt.ma_flags;
-	if (old_flags & MT_FLAGS_CXLFORK_CXL_NODES) {
-		ret = -EBUSY;
-		goto out_unlock;
+		if (!cxlfork_slot_range_valid(desc, node_offset, sizeof(*node)))
+			return -EILSEQ;
+		node = cxl_ptr(node_offset);
+		if (!node)
+			return -EILSEQ;
+		if (address < node->start)
+			node_offset = node->left_offset;
+		else if (address >= node->end)
+			node_offset = node->right_offset;
+		else {
+			inspect->vma_image_root_offset =
+				desc->vma_tree_root_offset;
+			inspect->vma_image_nodes = desc->vma_tree_nodes;
+			inspect->vma_image_lookup_start = node->start;
+			inspect->vma_image_lookup_end = node->end;
+			inspect->flags |=
+				CXLFORK_INSPECT_F_VMA_IMAGE_LOOKUP_VALID;
+			return 0;
+		}
 	}
-	if (!old_root || !((unsigned long)old_root & CXLFORK_MAPLE_ROOT_NODE)) {
-		ret = -EOPNOTSUPP;
-		goto out_unlock;
-	}
-
-	ret = cxlfork_copy_maple_node_to_cxl(&ctx,
-					     (void *)((unsigned long)old_root &
-						      ~CXLFORK_MAPLE_ROOT_NODE),
-					     &new_root, NULL, 0);
-	if (ret)
-		goto out_unlock;
-	cxlfork_maple_set_root_parent(&mm->mm_mt, cxlfork_mte_node(new_root));
-	rcu_assign_pointer(mm->mm_mt.ma_root, cxlfork_mte_mk_root(new_root));
-	mm->mm_mt.ma_flags = old_flags | MT_FLAGS_CXLFORK_CXL_NODES;
-	attached = true;
-	mtree_unlock(&mm->mm_mt);
-
-	vma = find_vma(mm, address);
-
-	mtree_lock(&mm->mm_mt);
-	rcu_assign_pointer(mm->mm_mt.ma_root, old_root);
-	mm->mm_mt.ma_flags = old_flags;
-	desc->vma_maple_nodes = ctx.nodes;
-	desc->vma_maple_root_offset =
-		(char *)cxlfork_mte_node(new_root) - (char *)cxl_ptr(0);
-	desc->vma_maple_attach_ns = ktime_get_ns() - start_ns;
-	inspect->vma_maple_root_pfn =
-		(cxl_phys + desc->vma_maple_root_offset) >> PAGE_SHIFT;
-	inspect->vma_maple_nodes = desc->vma_maple_nodes;
-	if (vma) {
-		inspect->vma_lookup_start = vma->vm_start;
-		inspect->vma_lookup_end = vma->vm_end;
-	}
-	inspect->flags |= CXLFORK_INSPECT_F_CXL_VMA_NODE_VALID;
-	ret = 0;
-
-out_unlock:
-	if (attached) {
-		rcu_assign_pointer(mm->mm_mt.ma_root, old_root);
-		mm->mm_mt.ma_flags = old_flags;
-	}
-	mtree_unlock(&mm->mm_mt);
-	mmap_write_unlock(mm);
-	return ret;
+	return -ENOENT;
 }
 
 static int cxlfork_map_region_cow(struct file *file,
@@ -3236,24 +3111,18 @@ static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
 					unsigned long addr,
 					unsigned long *pfn_out)
 {
-	const struct cxlfork_pt_page_image *meta;
-	u64 i;
+	u64 *ptes;
+	u64 offset;
+	int ret;
 
-	if (!desc->pt_page_image_offset || !desc->pt_page_image_entries)
-		return -EINVAL;
-	meta = cxl_ptr(desc->pt_page_image_offset);
-	if (!meta)
-		return -EINVAL;
-	addr &= PMD_MASK;
-	for (i = 0; i < desc->pt_page_image_entries; i++) {
-		if (meta[i].va_base != addr)
-			continue;
-		if (!cxl_range_valid(meta[i].pte_page_offset, PAGE_SIZE))
-			return -EINVAL;
-		*pfn_out = (cxl_phys + meta[i].pte_page_offset) >> PAGE_SHIFT;
-		return 0;
-	}
-	return -ENOENT;
+	ret = cxlfork_pt_tree_walk(desc, addr & PMD_MASK, &ptes);
+	if (ret)
+		return ret;
+	offset = (char *)ptes - (char *)cxl_ptr(0);
+	if (!cxlfork_slot_range_valid(desc, offset, PAGE_SIZE))
+		return -EILSEQ;
+	*pfn_out = (cxl_phys + offset) >> PAGE_SHIFT;
+	return 0;
 }
 
 static int cxlfork_prefault_shared_cxl(struct vm_area_struct *vma,
@@ -3682,6 +3551,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	bool apply_global_state;
 	bool apply_thread_state;
 	bool apply_tls_state;
+	bool full_validation;
 	bool test_fail_after_first = false;
 	struct cxlfork_restore_breakdown bd = {};
 	struct cxlfork_region_desc *regions;
@@ -3745,6 +3615,9 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	apply_global_state = op->flags & CXLFORK_F_APPLY_GLOBAL_STATE;
 	apply_thread_state = op->flags & CXLFORK_F_APPLY_THREAD_STATE;
 	apply_tls_state = op->flags & CXLFORK_F_APPLY_TLS_STATE;
+	full_validation = !v2 || (op->flags & CXLFORK_F_VALIDATE_FULL) ||
+		apply_mm_state || apply_global_state || reopen_fds ||
+		apply_thread_state || apply_tls_state;
 	if (v2)
 		test_fail_after_first =
 			v2->flags & CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION;
@@ -3752,20 +3625,39 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		ret = -EINVAL;
 		goto out_unlock;
 	}
-	ret = cxlfork_validate_vma_tree_image(desc, &bd.vma_tree_validate_ns);
+	ret = cxlfork_validate_restore_manifest(desc);
 	if (ret)
 		goto out_unlock;
-	ret = cxlfork_validate_state_image(desc, &bd.state_image_validate_ns);
-	if (ret)
-		goto out_unlock;
-	ret = cxlfork_validate_pt_page_image(desc,
+	if (full_validation) {
+		ret = cxlfork_validate_vma_tree_image(desc,
+					       &bd.vma_tree_validate_ns);
+		if (ret)
+			goto out_unlock;
+		ret = cxlfork_validate_state_image(desc,
+					       &bd.state_image_validate_ns);
+		if (ret)
+			goto out_unlock;
+		ret = cxlfork_validate_pt_page_image(desc,
 					       &bd.pt_page_image_validate_ns);
-	if (ret)
-		goto out_unlock;
-	ret = cxlfork_validate_private_rebase_image(desc,
+		if (ret)
+			goto out_unlock;
+		ret = cxlfork_validate_private_rebase_image(desc,
 						   &bd.private_rebase_validate_ns);
-	if (ret)
-		goto out_unlock;
+		if (ret)
+			goto out_unlock;
+		{
+			u64 observed_page;
+			u64 observed_leaf;
+
+			ret = cxlfork_compute_checksums(desc, &observed_page,
+							&observed_leaf);
+			if (ret || observed_page != desc->page_checksum ||
+			    observed_leaf != desc->leaf_checksum) {
+				ret = -EILSEQ;
+				goto out_unlock;
+			}
+		}
+	}
 	regions = cxlfork_desc_regions(desc);
 	if (!regions) {
 		ret = -EILSEQ;
@@ -3913,9 +3805,25 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 	}
 	if (ctx) {
 		unsigned long stats_flags;
+		u64 path_mask = full_validation ?
+			CXLFORK_RESTORE_PATH_FULL_VALIDATION : CXLFORK_RESTORE_PATH_FAST;
+
+		if (bd.shared_leaf_attach_pages)
+			path_mask |= CXLFORK_RESTORE_PATH_SHARED_LEAF;
+		if (bd.pte_image_reconstruct_pages)
+			path_mask |= CXLFORK_RESTORE_PATH_FALLBACK_RECONSTRUCT;
+		if (private_cow)
+			path_mask |= CXLFORK_RESTORE_PATH_MOA;
+		if (hybrid_tiering)
+			path_mask |= CXLFORK_RESTORE_PATH_HYBRID;
+		if (apply_global_state || reopen_fds)
+			path_mask |= CXLFORK_RESTORE_PATH_GLOBAL;
+		if (apply_thread_state || apply_tls_state)
+			path_mask |= CXLFORK_RESTORE_PATH_THREAD;
 
 		spin_lock_irqsave(&ctx->lock, stats_flags);
 		ctx->stats.total_ns = op->restore_ns;
+		ctx->stats.path_mask = path_mask;
 		ctx->stats.validation_ns = bd.pte_image_validate_ns +
 			bd.pt_page_image_validate_ns + bd.vma_tree_validate_ns +
 			bd.state_image_validate_ns +
@@ -3928,6 +3836,7 @@ static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
 		ctx->stats.shared_leaf_pages = bd.shared_leaf_attach_pages;
 		ctx->stats.fallback_pages = bd.pte_image_reconstruct_pages;
 		ctx->stats.dirty_prefault_pages = bd.dirty_prefault_pages;
+		ctx->stats.validated_ptes = full_validation ? desc->nr_ptes : 0;
 		spin_unlock_irqrestore(&ctx->lock, stats_flags);
 	}
 	if (legacy_uarg && copy_to_user(legacy_uarg, op, sizeof(*op))) {
@@ -4088,6 +3997,7 @@ static int cxlfork_ioctl_resume_v2(struct file *file,
 		CXLFORK_F_APPLY_MM_STATE | CXLFORK_F_REOPEN_FDS |
 		CXLFORK_F_APPLY_THREAD_STATE | CXLFORK_F_APPLY_TLS_STATE |
 		CXLFORK_F_APPLY_GLOBAL_STATE | CXLFORK_F_HYBRID_TIERING |
+		CXLFORK_F_VALIDATE_FULL |
 		CXLFORK_F_TEST_FAIL_AFTER_FIRST_REGION;
 	struct cxlfork_restore *legacy;
 	struct cxlfork_resume_v2 op;
@@ -4149,6 +4059,7 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
 		CXLFORK_CAP_GLOBAL_FILE_STATE |
+		CXLFORK_CAP_RESTORE_FAST_PATH |
 		CXLFORK_CAP_A_BIT_HYBRID;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
@@ -4366,7 +4277,7 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 			inspect.shared_leaf_pfn = leaf_pfn;
 			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
 		}
-		cxlfork_probe_cxl_vma_maple(desc, address, &inspect);
+		cxlfork_inspect_vma_image(desc, address, &inspect);
 		mmap_read_lock(current->mm);
 		ret = cxlfork_read_pmd_snapshot(current->mm, address,
 						&inspect.current_pmd,
@@ -4931,7 +4842,7 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 			inspect.shared_leaf_pfn = leaf_pfn;
 			inspect.flags |= CXLFORK_INSPECT_F_SHARED_LEAF_VALID;
 		}
-		cxlfork_probe_cxl_vma_maple(desc, address, &inspect);
+		cxlfork_inspect_vma_image(desc, address, &inspect);
 		mmap_read_lock(current->mm);
 		ret = cxlfork_read_pmd_snapshot(current->mm, address,
 						&inspect.current_pmd,
