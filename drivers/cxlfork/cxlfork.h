@@ -17,6 +17,10 @@
 #define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
 #define CXLFORK_MAX_SLOTS 7                /* key%MAX_SLOTS 选择 slot，4G CXL window 下保留 7 个大 slot。 */
 #define CXLFORK_SLOT_BYTES SZ_512M         /* 单个 checkpoint slot 的最大容量。 */
+#define CXLFORK_EXTENT_SHIFT PAGE_SHIFT    /* Phase 12: slot 内 4KiB extent bitmap。 */
+#define CXLFORK_EXTENT_BYTES (1UL << CXLFORK_EXTENT_SHIFT)
+#define CXLFORK_EXTENTS_PER_SLOT (CXLFORK_SLOT_BYTES >> CXLFORK_EXTENT_SHIFT)
+#define CXLFORK_EXTENT_BITMAP_WORDS (CXLFORK_EXTENTS_PER_SLOT / 64)
 #define CXLFORK_MAX_REGIONS 64             /* legacy ioctl 当前最多回填的 VMA/region 数。 */
 #define CXLFORK_MAX_PTES 131072            /* 一次 checkpoint 最多记录的叶子 PTE 数。 */
 #define CXLFORK_MAX_PRIVATE_PTRS 12        /* rebase image 中可跟踪的内部指针数量。 */
@@ -240,6 +244,11 @@ struct cxlfork_desc {
 	u64 pte_table_offset;
 	u64 pte_table_entries;
 	u64 pte_table_bytes;
+	u64 extent_bytes;
+	u64 extent_count;
+	u64 extent_bitmap_words;
+	u64 allocated_extents;
+	u64 extent_bitmap[CXLFORK_EXTENT_BITMAP_WORDS];
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;
 	struct cxlfork_thread_state thread_state;

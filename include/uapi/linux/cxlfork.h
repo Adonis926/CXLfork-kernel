@@ -159,6 +159,10 @@ struct cxlfork_inspect_v2 {
 	__u64 pte_table_bytes;
 	__u64 page_data_offset;
 	__u64 page_data_bytes;
+	__u64 extent_bytes;
+	__u64 extent_count;
+	__u64 extent_bitmap_words;
+	__u64 allocated_extents;
 };
 
 struct cxlfork_pte_mark_v2 {

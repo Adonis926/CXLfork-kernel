@@ -76,6 +76,7 @@ static DEFINE_MUTEX(cxlfork_lock);
 static int key_to_slot(u64 key);
 static struct cxlfork_desc *slot_desc(u64 slot);
 static bool cxlfork_slot_has_room(u64 slot, u64 off, u64 bytes);
+static int cxlfork_slot_mark_alloc(struct cxlfork_desc *desc, u64 off, u64 bytes);
 static const struct file_operations cxlfork_fops;
 static const struct vm_operations_struct cxlfork_vm_ops;
 static int cxlfork_find_shared_leaf_pfn(const struct cxlfork_desc *desc,
@@ -250,11 +251,12 @@ static struct cxlfork_pte_desc *cxlfork_desc_ptes(const struct cxlfork_desc *des
 	return cxl_ptr(desc->pte_table_offset);
 }
 
-static int cxlfork_alloc_table(u64 slot, u64 *data_off, u64 entries,
+static int cxlfork_alloc_table(struct cxlfork_desc *desc, u64 slot, u64 *data_off, u64 entries,
 			       u64 elem_size, u64 *offset, u64 *bytes)
 {
 	u64 table_bytes;
 	void *table;
+	int ret;
 
 	if (check_mul_overflow(entries, elem_size, &table_bytes))
 		return -ENOSPC;
@@ -263,6 +265,9 @@ static int cxlfork_alloc_table(u64 slot, u64 *data_off, u64 entries,
 		return -EINVAL;
 	if (!cxlfork_slot_has_room(slot, *data_off, table_bytes))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, table_bytes);
+	if (ret)
+		return ret;
 	table = cxl_ptr(*data_off);
 	if (!table)
 		return -ENOSPC;
@@ -536,6 +541,9 @@ static bool cxlfork_desc_matches_slot(const struct cxlfork_desc *desc,
 	if (READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
 	    READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
 	    READ_ONCE(desc->slot) == slot &&
+	    READ_ONCE(desc->extent_bytes) == CXLFORK_EXTENT_BYTES &&
+	    READ_ONCE(desc->extent_count) == CXLFORK_EXTENTS_PER_SLOT &&
+	    READ_ONCE(desc->extent_bitmap_words) == CXLFORK_EXTENT_BITMAP_WORDS &&
 	    READ_ONCE(desc->data_offset) >= slot_payload_offset(slot) &&
 	    READ_ONCE(desc->data_offset) < slot_offset(slot) + CXLFORK_SLOT_BYTES &&
 	    IS_ALIGNED(READ_ONCE(desc->data_offset), PAGE_SIZE))
@@ -555,6 +563,56 @@ static bool cxlfork_slot_has_room(u64 slot, u64 off, u64 bytes)
 	if (off < start || off >= end || bytes > end - off)
 		return false;
 	return cxl_range_valid(off, bytes);
+}
+
+static bool cxlfork_slot_extent_range(u64 slot, u64 off, u64 bytes,
+				       u64 *first, u64 *count)
+{
+	u64 start;
+	u64 rel;
+	u64 end_rel;
+
+	if (!cxlfork_slot_has_room(slot, off, bytes) ||
+	    !IS_ALIGNED(off, CXLFORK_EXTENT_BYTES))
+		return false;
+	start = slot_offset(slot);
+	rel = off - start;
+	if (check_add_overflow(rel, bytes, &end_rel))
+		return false;
+	*first = rel >> CXLFORK_EXTENT_SHIFT;
+	*count = DIV_ROUND_UP(end_rel, (u64)CXLFORK_EXTENT_BYTES) - *first;
+	if (!*count || *first >= CXLFORK_EXTENTS_PER_SLOT ||
+	    *count > CXLFORK_EXTENTS_PER_SLOT - *first)
+		return false;
+	return true;
+}
+
+static int cxlfork_slot_mark_alloc(struct cxlfork_desc *desc, u64 off, u64 bytes)
+{
+	u64 first;
+	u64 count;
+	u64 i;
+
+	if (!desc || desc->extent_bytes != CXLFORK_EXTENT_BYTES ||
+	    desc->extent_count != CXLFORK_EXTENTS_PER_SLOT ||
+	    desc->extent_bitmap_words != CXLFORK_EXTENT_BITMAP_WORDS)
+		return -EILSEQ;
+	if (!cxlfork_slot_extent_range(desc->slot, off, bytes, &first, &count))
+		return -ENOSPC;
+	for (i = 0; i < count; i++) {
+		u64 bit = first + i;
+		u64 mask = BIT_ULL(bit & 63);
+
+		if (desc->extent_bitmap[bit >> 6] & mask)
+			return -EILSEQ;
+	}
+	for (i = 0; i < count; i++) {
+		u64 bit = first + i;
+
+		desc->extent_bitmap[bit >> 6] |= BIT_ULL(bit & 63);
+	}
+	desc->allocated_extents += count;
+	return 0;
 }
 
 static u64 cxlfork_checksum_bytes(u64 checksum, const void *data, u64 bytes)
@@ -810,11 +868,15 @@ static int cxlfork_pt_tree_alloc_page(struct cxlfork_desc *desc, u64 slot,
 {
 	/* 从当前 slot 的线性 data_off 分配一页，作为页表树或元数据对象。 */
 	void *page;
+	int ret;
 
 	if (!cxlfork_desc_matches_slot(desc, slot))
 		return -EILSEQ;
 	if (!cxlfork_slot_has_room(slot, *data_off, PAGE_SIZE))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, PAGE_SIZE);
+	if (ret)
+		return ret;
 	page = cxl_ptr(*data_off);
 	if (!page)
 		return -ENOSPC;
@@ -1607,6 +1669,7 @@ static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 slot,
 	struct cxlfork_leaf_pte_image *image;
 	u64 image_bytes;
 	u64 i;
+	int ret;
 
 	if (!desc->nr_ptes)
 		return 0;
@@ -1618,6 +1681,9 @@ static int cxlfork_build_leaf_pte_image(struct cxlfork_desc *desc, u64 slot,
 	image_bytes = PAGE_ALIGN(desc->nr_ptes * sizeof(*image));
 	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, image_bytes);
+	if (ret)
+		return ret;
 	image = cxl_ptr(*data_off);
 	if (!image)
 		return -ENOSPC;
@@ -1684,6 +1750,7 @@ static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 slot,
 	u64 nodes_offset;
 	u64 bytes;
 	u64 i;
+	int ret;
 
 	if (!desc->nr_regions)
 		return 0;
@@ -1695,6 +1762,9 @@ static int cxlfork_build_vma_tree_image(struct cxlfork_desc *desc, u64 slot,
 		PAGE_ALIGN(desc->nr_regions * sizeof(*nodes));
 	if (!cxlfork_slot_has_room(slot, *data_off, bytes))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, bytes);
+	if (ret)
+		return ret;
 	tree_offset = *data_off;
 	tree = cxl_ptr(tree_offset);
 	if (!tree)
@@ -1821,6 +1891,7 @@ static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 slot,
 	struct cxlfork_state_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 image_off = *data_off;
+	int ret;
 
 	if (!cxlfork_desc_matches_slot(desc, slot))
 		return -EILSEQ;
@@ -1828,6 +1899,9 @@ static int cxlfork_build_state_image(struct cxlfork_desc *desc, u64 slot,
 		return -EILSEQ;
 	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, image_bytes);
+	if (ret)
+		return ret;
 	image = cxl_ptr(image_off);
 	if (!image)
 		return -ENOSPC;
@@ -2019,6 +2093,9 @@ static int cxlfork_build_pt_page_image(struct cxlfork_desc *desc, u64 slot,
 	if (!cxlfork_slot_has_room(slot, *data_off,
 				   meta_bytes + PAGE_SIZE * 2))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, meta_bytes);
+	if (ret)
+		return ret;
 	meta = cxl_ptr(*data_off);
 	if (!meta)
 		return -ENOSPC;
@@ -2165,11 +2242,15 @@ static int cxlfork_build_private_rebase_image(struct cxlfork_desc *desc,
 	struct cxlfork_private_rebase_image *image;
 	u64 image_bytes = PAGE_ALIGN(sizeof(*image));
 	u64 idx = 0;
+	int ret;
 
 	if (!cxlfork_desc_matches_slot(desc, slot))
 		return -EILSEQ;
 	if (!cxlfork_slot_has_room(slot, *data_off, image_bytes))
 		return -ENOSPC;
+	ret = cxlfork_slot_mark_alloc(desc, *data_off, image_bytes);
+	if (ret)
+		return ret;
 	image = cxl_ptr(*data_off);
 	if (!image)
 		return -ENOSPC;
@@ -2319,6 +2400,13 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	desc->state = CXLFORK_SLOT_WRITING;
 	desc->generation = generation ?: 1;
 	desc->slot = slot;
+	desc->extent_bytes = CXLFORK_EXTENT_BYTES;
+	desc->extent_count = CXLFORK_EXTENTS_PER_SLOT;
+	desc->extent_bitmap_words = CXLFORK_EXTENT_BITMAP_WORDS;
+	ret = cxlfork_slot_mark_alloc(desc, slot_offset(slot),
+				      slot_payload_offset(slot) - slot_offset(slot));
+	if (ret)
+		goto out_unlock;
 	desc->data_offset = slot_payload_offset(slot);
 	}
 	data_off = desc->data_offset;
@@ -2334,21 +2422,21 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	ret = cxlfork_preflight_checkpoint(mm, op, slot, &sizing);
 	if (ret)
 		goto out_mmap_unlock;
-	ret = cxlfork_alloc_table(slot, &data_off, CXLFORK_MAX_FDS,
+	ret = cxlfork_alloc_table(desc, slot, &data_off, CXLFORK_MAX_FDS,
 				  sizeof(struct cxlfork_fd_state),
 				  &desc->fd_table_offset,
 				  &desc->fd_table_bytes);
 	if (ret)
 		goto out_mmap_unlock;
 	desc->fd_table_entries = CXLFORK_MAX_FDS;
-	ret = cxlfork_alloc_table(slot, &data_off, sizing.regions,
+	ret = cxlfork_alloc_table(desc, slot, &data_off, sizing.regions,
 				  sizeof(struct cxlfork_region_desc),
 				  &desc->region_table_offset,
 				  &desc->region_table_bytes);
 	if (ret)
 		goto out_mmap_unlock;
 	desc->region_table_entries = sizing.regions;
-	ret = cxlfork_alloc_table(slot, &data_off, sizing.pages,
+	ret = cxlfork_alloc_table(desc, slot, &data_off, sizing.pages,
 				  sizeof(struct cxlfork_pte_desc),
 				  &desc->pte_table_offset,
 				  &desc->pte_table_bytes);
@@ -2423,6 +2511,9 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 				ret = -ENOSPC;
 				break;
 			}
+			ret = cxlfork_slot_mark_alloc(desc, data_off, PAGE_SIZE);
+			if (ret)
+				break;
 			pte = &ptes[desc->nr_ptes];
 			pte->va = addr;
 			pte->cxl_offset = data_off;
@@ -3728,6 +3819,10 @@ static int cxlfork_ioctl_inspect_v2(struct cxlfork_inspect_v2 __user *uarg)
 	inspect.pte_table_bytes = desc->pte_table_bytes;
 	inspect.page_data_offset = desc->data_offset;
 	inspect.page_data_bytes = desc->total_pages << PAGE_SHIFT;
+	inspect.extent_bytes = desc->extent_bytes;
+	inspect.extent_count = desc->extent_count;
+	inspect.extent_bitmap_words = desc->extent_bitmap_words;
+	inspect.allocated_extents = desc->allocated_extents;
 	if (desc->nr_ptes) {
 		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
 			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;
@@ -3951,6 +4046,10 @@ static int cxlfork_ioctl_inspect_v2_unused(struct cxlfork_inspect_v2 __user *uar
 	inspect.pte_table_bytes = desc->pte_table_bytes;
 	inspect.page_data_offset = desc->data_offset;
 	inspect.page_data_bytes = desc->total_pages << PAGE_SHIFT;
+	inspect.extent_bytes = desc->extent_bytes;
+	inspect.extent_count = desc->extent_count;
+	inspect.extent_bitmap_words = desc->extent_bitmap_words;
+	inspect.allocated_extents = desc->allocated_extents;
 	if (desc->nr_ptes)
 		inspect.flags |= CXLFORK_INSPECT_F_PAGE_CHECKSUM_VALID |
 			CXLFORK_INSPECT_F_LEAF_CHECKSUM_VALID;

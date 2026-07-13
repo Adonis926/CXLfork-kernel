@@ -243,27 +243,34 @@ static int prepare_snapshot(uint64_t key, size_t bytes)
 	    !inspect.pte_table_offset || !inspect.page_data_offset ||
 	    inspect.region_table_entries != inspect.nr_regions ||
 	    inspect.pte_table_entries != inspect.total_pages ||
-	    inspect.page_data_bytes != inspect.total_pages * page) {
+	    inspect.page_data_bytes != inspect.total_pages * page ||
+	    inspect.extent_bytes != page ||
+	    inspect.allocated_extents * inspect.extent_bytes < inspect.image_bytes) {
 		fprintf(stderr, "manifest mismatch regions=%" PRIu64 "/%" PRIu64
 			" ptes=%" PRIu64 "/%" PRIu64
-			" page_data=%" PRIu64 "/%" PRIu64 "\n",
+			" page_data=%" PRIu64 "/%" PRIu64
+			" extent=%" PRIu64 " allocated=%" PRIu64 "\n",
 			(uint64_t)inspect.region_table_entries,
 			(uint64_t)inspect.nr_regions,
 			(uint64_t)inspect.pte_table_entries,
 			(uint64_t)inspect.total_pages,
 			(uint64_t)inspect.page_data_bytes,
-			(uint64_t)inspect.total_pages * page);
+			(uint64_t)inspect.total_pages * page,
+			(uint64_t)inspect.extent_bytes,
+			(uint64_t)inspect.allocated_extents);
 		return 1;
 	}
 	printf("prepare key=%" PRIu64 " slot=%u regions=%" PRIu64
 	       " pages=%" PRIu64 " checksum=%" PRIu64 " image_bytes=%" PRIu64
 	       " region_table_bytes=%" PRIu64 " pte_table_bytes=%" PRIu64
+	       " extents=%" PRIu64
 	       " verify=ok\n", key, inspect.slot,
 	       (uint64_t)inspect.nr_regions,
 	       (uint64_t)inspect.total_pages, hash,
 	       (uint64_t)inspect.image_bytes,
 	       (uint64_t)inspect.region_table_bytes,
-	       (uint64_t)inspect.pte_table_bytes);
+	       (uint64_t)inspect.pte_table_bytes,
+	       (uint64_t)inspect.allocated_extents);
 	close(fd);
 	return 0;
 }
