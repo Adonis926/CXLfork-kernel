@@ -210,6 +210,110 @@ struct cxlfork_litmus_v2 {
 	__u64 reserved1[4];
 };
 
+struct cxlfork_prepare_stats_v2 {
+	__u64 supported_mask;
+	__u64 valid_mask;
+	__u64 path_mask;
+	__u64 total_ns;
+	__u64 lock_wait_ns;
+	__u64 lifecycle_ns;
+	__u64 vma_preflight_ns;
+	__u64 pte_walk_ns;
+	__u64 gup_ns;
+	__u64 page_copy_ns;
+	__u64 pte_recheck_ns;
+	__u64 metadata_build_ns;
+	__u64 checksum_seal_ns;
+	__u64 publish_ns;
+	__u64 other_ns;
+};
+
+struct cxlfork_restore_stats_v2 {
+	__u64 supported_mask;
+	__u64 valid_mask;
+	__u64 path_mask;
+	__u64 total_ns;
+	__u64 lock_wait_ns;
+	__u64 lifecycle_ns;
+	__u64 validation_ns;
+	__u64 vma_create_ns;
+	__u64 upper_pt_alloc_ns;
+	__u64 shared_leaf_attach_ns;
+	__u64 fallback_reconstruct_ns;
+	__u64 dirty_prefault_ns;
+	__u64 global_restore_ns;
+	__u64 rollback_ns;
+	__u64 other_ns;
+	__u64 faults;
+	__u64 fault_dispatch_ns;
+	__u64 leaf_materialize_ns;
+	__u64 data_cow_ns;
+	__u64 cxl_to_local_copy_ns;
+	__u64 shared_leaf_pages;
+	__u64 fallback_pages;
+	__u64 local_copy_pages;
+	__u64 leaf_copy_pages;
+	__u64 dirty_prefault_pages;
+	__u64 validated_ptes;
+};
+
+struct cxlfork_prepare_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 scan_start;
+	__u64 scan_end;
+	__u64 flags;
+	__aligned_u64 regions_ptr;
+	__u32 region_capacity;
+	__u32 region_count;
+	__u64 generation;
+	__u64 slot;
+	__u64 total_pages;
+	__u64 page_checksum;
+	struct cxlfork_prepare_stats_v2 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_resume_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 flags;
+	__aligned_u64 regions_ptr;
+	__u32 region_capacity;
+	__u32 region_count;
+	__u64 restore_id;
+	__u64 total_pages;
+	__u64 page_checksum;
+	struct cxlfork_restore_stats_v2 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_release_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 flags;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_call_stats_v2 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 restore_id;
+	struct cxlfork_restore_stats_v2 stats;
+	__u64 reserved1[4];
+};
+
 struct cxlfork_region {
 	/* 对外暴露的 VMA/region 摘要，便于 benchmark 记录页分类。 */
 	__u64 start;
@@ -454,8 +558,12 @@ struct cxlfork_release {
 #define CXLFORK_FORK_PREPARE _IOWR(CXLFORK_IOC_MAGIC, 5, struct cxlfork_checkpoint)
 #define CXLFORK_FORK_RESUME _IOWR(CXLFORK_IOC_MAGIC, 6, struct cxlfork_restore)
 #define CXLFORK_QUERY_CAPS_V2 _IOWR(CXLFORK_IOC_MAGIC, 7, struct cxlfork_v2_header)
+#define CXLFORK_PREPARE_V2 _IOWR(CXLFORK_IOC_MAGIC, 8, struct cxlfork_v2_header)
+#define CXLFORK_RESUME_V2 _IOWR(CXLFORK_IOC_MAGIC, 9, struct cxlfork_v2_header)
+#define CXLFORK_RELEASE_V2 _IOWR(CXLFORK_IOC_MAGIC, 10, struct cxlfork_v2_header)
 #define CXLFORK_INSPECT_V2 _IOWR(CXLFORK_IOC_MAGIC, 11, struct cxlfork_v2_header)
 #define CXLFORK_PTE_MARK_V2 _IOWR(CXLFORK_IOC_MAGIC, 12, struct cxlfork_v2_header)
 #define CXLFORK_LITMUS_V2 _IOWR(CXLFORK_IOC_MAGIC, 13, struct cxlfork_v2_header)
+#define CXLFORK_GET_CALL_STATS_V2 _IOWR(CXLFORK_IOC_MAGIC, 14, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

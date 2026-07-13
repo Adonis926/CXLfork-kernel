@@ -158,6 +158,7 @@ struct cxlfork_restore_ctx {
 	atomic64_t shared_map_pages;
 	atomic64_t local_copy_pages;
 	atomic64_t leaf_copy_pages;
+	struct cxlfork_restore_stats_v2 stats;
 };
 
 struct cxlfork_file_state {
@@ -2541,10 +2542,12 @@ static int cxlfork_validate_private_rebase_image(const struct cxlfork_desc *desc
 	return 0;
 }
 
-static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
+static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
+				 struct cxlfork_checkpoint __user *legacy_uarg,
+				 struct cxlfork_prepare_v2 *v2,
+				 struct cxlfork_prepare_v2 __user *v2_uarg)
 {
 	/* prepare 主路径：扫描 VMA -> 复制页面 -> 构建 PTE/VMA/state/rebase 镜像 -> ready。 */
-	struct cxlfork_checkpoint *op;
 	struct cxlfork_desc *desc;
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
@@ -2555,37 +2558,30 @@ static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
 	int ret = 0;
 	bool reopen_fds;
 
-	op = kzalloc(sizeof(*op), GFP_KERNEL);
-	if (!op)
-		return -ENOMEM;
-	if (copy_from_user(op, uarg, sizeof(*op))) {
-		ret = -EFAULT;
-		goto out_free;
-	}
 	if (!op->key || (!(op->flags & CXLFORK_F_FULL_PRIVATE_STATE) &&
 			op->scan_start >= op->scan_end)) {
 		ret = -EINVAL;
-		goto out_free;
+		goto out_return;
 	}
 	if (op->flags & CXLFORK_F_FULL_PRIVATE_STATE) {
 		ret = -EOPNOTSUPP;
-		goto out_free;
+		goto out_return;
 	}
 	if (get_nr_threads(current) != 1) {
 		ret = -EBUSY;
-		goto out_free;
+		goto out_return;
 	}
 	reopen_fds = op->flags & CXLFORK_F_REOPEN_FDS;
 	op->flags &= ~CXLFORK_F_REOPEN_FDS;
 
 	ret = key_to_slot(op->key);
 	if (ret < 0)
-		goto out_free;
+		goto out_return;
 	slot = ret;
 	desc = slot_desc(slot);
 	if (!desc) {
 		ret = -ENOSPC;
-		goto out_free;
+		goto out_return;
 	}
 	ret = 0;
 
@@ -2818,9 +2814,34 @@ out_mmap_unlock:
 			op->regions[i].clean_file_pages = regions[i].clean_file_pages;
 			op->regions[i].dirty_file_pages = regions[i].dirty_file_pages;
 		}
-		if (copy_to_user(uarg, op, sizeof(*op))) {
+		if (legacy_uarg && copy_to_user(legacy_uarg, op, sizeof(*op))) {
 			ret = -EFAULT;
 			goto out_unlock;
+		}
+		if (v2) {
+			v2->region_count = nr_out_regions;
+			v2->generation = desc->generation;
+			v2->slot = desc->slot;
+			v2->total_pages = desc->total_pages;
+			v2->page_checksum = desc->page_checksum;
+			v2->stats.total_ns = desc->create_ns;
+			v2->stats.metadata_build_ns =
+				desc->pte_image_build_ns +
+				desc->pt_page_image_build_ns +
+				desc->vma_tree_build_ns +
+				desc->state_image_build_ns +
+				desc->private_rebase_ns;
+			if (nr_out_regions &&
+			    copy_to_user(u64_to_user_ptr(v2->regions_ptr),
+					 op->regions,
+					 nr_out_regions * sizeof(op->regions[0]))) {
+				ret = -EFAULT;
+				goto out_unlock;
+			}
+			if (copy_to_user(v2_uarg, v2, sizeof(*v2))) {
+				ret = -EFAULT;
+				goto out_unlock;
+			}
 		}
 		smp_wmb();
 		WRITE_ONCE(desc->ready, 1);
@@ -2835,7 +2856,19 @@ out_unlock:
 		cxlfork_desc_reset_free(desc, generation);
 	}
 	mutex_unlock(&cxlfork_lock);
-out_free:
+out_return:
+	return ret;
+}
+
+static int cxlfork_ioctl_checkpoint(struct cxlfork_checkpoint __user *uarg)
+{
+	struct cxlfork_checkpoint *op;
+	int ret;
+
+	op = memdup_user(uarg, sizeof(*op));
+	if (IS_ERR(op))
+		return PTR_ERR(op);
+	ret = cxlfork_do_checkpoint(op, uarg, NULL, NULL);
 	kfree(op);
 	return ret;
 }
@@ -3575,11 +3608,12 @@ out_unlock:
 	return ret;
 }
 
-static int cxlfork_ioctl_restore(struct file *file,
-				 struct cxlfork_restore __user *uarg)
+static int cxlfork_do_restore(struct file *file, struct cxlfork_restore *op,
+			      struct cxlfork_restore __user *legacy_uarg,
+			      struct cxlfork_resume_v2 *v2,
+			      struct cxlfork_resume_v2 __user *v2_uarg)
 {
 	/* resume 主路径：校验 CXL 镜像 -> mmap regions -> 可选应用 OS metadata -> 回填 breakdown。 */
-	struct cxlfork_restore *op;
 	struct cxlfork_file_state *state = file->private_data;
 	struct cxlfork_desc *desc = NULL;
 	u64 start_ns;
@@ -3602,22 +3636,15 @@ static int cxlfork_ioctl_restore(struct file *file,
 	int ret = 0;
 	int i;
 
-	op = kzalloc(sizeof(*op), GFP_KERNEL);
-	if (!op)
-		return -ENOMEM;
-	if (copy_from_user(op, uarg, sizeof(*op))) {
-		ret = -EFAULT;
-		goto out_free;
-	}
 	if (!op->key) {
 		ret = -EINVAL;
-		goto out_free;
+		goto out_return;
 	}
 
 	slot = key_to_slot(op->key);
 	if (slot < 0) {
 		ret = slot;
-		goto out_free;
+		goto out_return;
 	}
 
 	mutex_lock(&cxlfork_lock);
@@ -3630,6 +3657,15 @@ static int cxlfork_ioctl_restore(struct file *file,
 		goto out_unlock;
 	}
 	generation = desc->generation;
+	if (v2 && generation != v2->generation) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	if (v2 && v2->region_capacity < desc->nr_regions) {
+		v2->region_count = desc->nr_regions;
+		ret = -ENOSPC;
+		goto out_unlock;
+	}
 	ret = cxlfork_slot_get_reader_locked(desc, op->key, generation);
 	if (ret)
 		goto out_unlock;
@@ -3797,9 +3833,51 @@ static int cxlfork_ioctl_restore(struct file *file,
 		op->regions[i].flags = regions[i].flags;
 		op->regions[i].pages = regions[i].pages;
 	}
-	if (copy_to_user(uarg, op, sizeof(*op))) {
+	if (ctx) {
+		unsigned long stats_flags;
+
+		spin_lock_irqsave(&ctx->lock, stats_flags);
+		ctx->stats.total_ns = op->restore_ns;
+		ctx->stats.validation_ns = bd.pte_image_validate_ns +
+			bd.pt_page_image_validate_ns + bd.vma_tree_validate_ns +
+			bd.state_image_validate_ns +
+			bd.private_rebase_validate_ns;
+		ctx->stats.shared_leaf_attach_ns = bd.shared_leaf_attach_ns;
+		ctx->stats.fallback_reconstruct_ns =
+			bd.pte_image_reconstruct_ns;
+		ctx->stats.dirty_prefault_ns = bd.dirty_prefault_ns;
+		ctx->stats.global_restore_ns = bd.global_restore_ns;
+		ctx->stats.shared_leaf_pages = bd.shared_leaf_attach_pages;
+		ctx->stats.fallback_pages = bd.pte_image_reconstruct_pages;
+		ctx->stats.dirty_prefault_pages = bd.dirty_prefault_pages;
+		spin_unlock_irqrestore(&ctx->lock, stats_flags);
+	}
+	if (legacy_uarg && copy_to_user(legacy_uarg, op, sizeof(*op))) {
 		ret = -EFAULT;
 		goto out_unlock;
+	}
+	if (v2) {
+		v2->region_count = op->nr_regions;
+		v2->restore_id = ctx ? ctx->restore_id : 0;
+		v2->total_pages = op->total_pages;
+		v2->page_checksum = desc->page_checksum;
+		if (ctx) {
+			unsigned long stats_flags;
+
+			spin_lock_irqsave(&ctx->lock, stats_flags);
+			v2->stats = ctx->stats;
+			spin_unlock_irqrestore(&ctx->lock, stats_flags);
+		}
+		if (op->nr_regions &&
+		    copy_to_user(u64_to_user_ptr(v2->regions_ptr), op->regions,
+				 op->nr_regions * sizeof(op->regions[0]))) {
+			ret = -EFAULT;
+			goto out_unlock;
+		}
+		if (copy_to_user(v2_uarg, v2, sizeof(*v2))) {
+			ret = -EFAULT;
+			goto out_unlock;
+		}
 	}
 	if (state) {
 		cxlfork_file_set_restore_ctx(state, ctx);
@@ -3826,12 +3904,25 @@ out_unlock:
 			cxlfork_file_set_restore_ctx(state, NULL);
 		cxlfork_restore_ctx_put(ctx);
 	}
-out_free:
+out_return:
+	return ret;
+}
+
+static int cxlfork_ioctl_restore(struct file *file,
+				 struct cxlfork_restore __user *uarg)
+{
+	struct cxlfork_restore *op;
+	int ret;
+
+	op = memdup_user(uarg, sizeof(*op));
+	if (IS_ERR(op))
+		return PTR_ERR(op);
+	ret = cxlfork_do_restore(file, op, uarg, NULL, NULL);
 	kfree(op);
 	return ret;
 }
 
-static int cxlfork_check_v2_header(const void __user *uarg, size_t min_size)
+static int cxlfork_check_v2_header(const void __user *uarg, size_t expected_size)
 {
 	const struct cxlfork_v2_header __user *header = uarg;
 	u32 size;
@@ -3842,13 +3933,93 @@ static int cxlfork_check_v2_header(const void __user *uarg, size_t min_size)
 	    get_user(version, &header->abi_version) ||
 	    get_user(reserved, &header->reserved))
 		return -EFAULT;
-	if (size < min_size)
+	if (size != expected_size)
 		return -EINVAL;
 	if (version != CXLFORK_ABI_VERSION_V2)
 		return -EPROTONOSUPPORT;
 	if (reserved)
 		return -EINVAL;
 	return 0;
+}
+
+static int cxlfork_ioctl_prepare_v2(struct cxlfork_prepare_v2 __user *uarg)
+{
+	const u64 known_flags = CXLFORK_F_REOPEN_FDS |
+		CXLFORK_F_USER_THREAD_STATE | CXLFORK_F_FULL_PRIVATE_STATE;
+	struct cxlfork_checkpoint *legacy;
+	struct cxlfork_prepare_v2 op;
+	u32 i;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(op));
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (!op.key || !op.regions_ptr ||
+	    op.region_capacity < CXLFORK_MAX_REGIONS ||
+	    (op.flags & ~known_flags))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+
+	legacy = kzalloc(sizeof(*legacy), GFP_KERNEL);
+	if (!legacy)
+		return -ENOMEM;
+	legacy->key = op.key;
+	legacy->scan_start = op.scan_start;
+	legacy->scan_end = op.scan_end;
+	legacy->flags = op.flags;
+	memset(&op.stats, 0, sizeof(op.stats));
+	op.region_count = 0;
+	op.generation = 0;
+	op.slot = 0;
+	op.total_pages = 0;
+	op.page_checksum = 0;
+	ret = cxlfork_do_checkpoint(legacy, NULL, &op, uarg);
+	kfree(legacy);
+	return ret;
+}
+
+static int cxlfork_ioctl_resume_v2(struct file *file,
+				   struct cxlfork_resume_v2 __user *uarg)
+{
+	const u64 known_flags = CXLFORK_F_MAP_READONLY |
+		CXLFORK_F_PRIVATE_COW | CXLFORK_F_SHARED_COW |
+		CXLFORK_F_APPLY_MM_STATE | CXLFORK_F_REOPEN_FDS |
+		CXLFORK_F_APPLY_THREAD_STATE | CXLFORK_F_APPLY_TLS_STATE |
+		CXLFORK_F_APPLY_GLOBAL_STATE | CXLFORK_F_HYBRID_TIERING;
+	struct cxlfork_restore *legacy;
+	struct cxlfork_resume_v2 op;
+	u32 i;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(op));
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (!op.key || !op.generation || !op.regions_ptr ||
+	    !op.region_capacity || (op.flags & ~known_flags))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+
+	legacy = kzalloc(sizeof(*legacy), GFP_KERNEL);
+	if (!legacy)
+		return -ENOMEM;
+	legacy->key = op.key;
+	legacy->flags = op.flags;
+	memset(&op.stats, 0, sizeof(op.stats));
+	op.region_count = 0;
+	op.restore_id = 0;
+	op.total_pages = 0;
+	op.page_checksum = 0;
+	ret = cxlfork_do_restore(file, legacy, NULL, &op, uarg);
+	kfree(legacy);
+	return ret;
 }
 
 static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg)
@@ -3867,7 +4038,6 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
-		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_MOW_DATA_COW |
 		CXLFORK_CAP_MOA_DATA_COPY |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
@@ -4142,41 +4312,129 @@ static int cxlfork_ioctl_stats(struct cxlfork_stats __user *uarg)
 	return copy_to_user(uarg, &st, sizeof(st)) ? -EFAULT : 0;
 }
 
-static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
+static int cxlfork_do_release(u64 key, u64 expected_generation,
+			      bool require_generation)
 {
-	/* 清空指定 key 的 slot，下一次 prepare 会重新写入完整镜像。 */
-	struct cxlfork_release rel;
 	struct cxlfork_desc *desc;
 	int slot;
+	int ret = 0;
 
-	if (copy_from_user(&rel, uarg, sizeof(rel)))
-		return -EFAULT;
-	slot = key_to_slot(rel.key);
+	slot = key_to_slot(key);
 	if (slot < 0)
 		return slot;
 
 	mutex_lock(&cxlfork_lock);
 	desc = slot_desc(slot);
-	if (cxlfork_desc_key_ready(desc, rel.key)) {
+	if (!cxlfork_desc_key_ready(desc, key)) {
+		ret = require_generation ? -ENOENT : 0;
+		goto out_unlock;
+	}
+	if (require_generation && desc->generation != expected_generation) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	{
 		u64 generation = desc->generation;
 		u64 lifecycle = smp_load_acquire(&desc->state);
 
 		if (cxlfork_lifecycle_state(lifecycle) != CXLFORK_SLOT_READY ||
 		    cxlfork_lifecycle_readers(lifecycle)) {
-			mutex_unlock(&cxlfork_lock);
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out_unlock;
 		}
 		if (cmpxchg(&desc->state, lifecycle,
 			    cxlfork_lifecycle_pack(CXLFORK_SLOT_RELEASING, 0)) !=
 		    lifecycle) {
-			mutex_unlock(&cxlfork_lock);
-			return -EBUSY;
+			ret = -EBUSY;
+			goto out_unlock;
 		}
-		cxlfork_restore_ctx_purge(rel.key, generation);
+		cxlfork_restore_ctx_purge(key, generation);
 		cxlfork_desc_reset_free(desc, generation);
 	}
+
+out_unlock:
 	mutex_unlock(&cxlfork_lock);
-	return 0;
+	return ret;
+}
+
+static int cxlfork_ioctl_release(struct cxlfork_release __user *uarg)
+{
+	struct cxlfork_release rel;
+
+	if (copy_from_user(&rel, uarg, sizeof(rel)))
+		return -EFAULT;
+	return cxlfork_do_release(rel.key, 0, false);
+}
+
+static int cxlfork_ioctl_release_v2(struct cxlfork_release_v2 __user *uarg)
+{
+	struct cxlfork_release_v2 op;
+	u32 i;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(op));
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (!op.key || !op.generation || op.flags)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+	return cxlfork_do_release(op.key, op.generation, true);
+}
+
+static int
+cxlfork_ioctl_get_call_stats_v2(struct cxlfork_call_stats_v2 __user *uarg)
+{
+	struct cxlfork_call_stats_v2 op;
+	struct cxlfork_restore_ctx *ctx;
+	unsigned long flags;
+	u32 i;
+	int ret;
+
+	ret = cxlfork_check_v2_header(uarg, sizeof(op));
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	if (!op.key || !op.generation || !op.restore_id)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+
+	xa_lock(&cxlfork_restore_contexts);
+	ctx = xa_load(&cxlfork_restore_contexts,
+		      (unsigned long)op.restore_id);
+	if (ctx && !kref_get_unless_zero(&ctx->ref))
+		ctx = NULL;
+	xa_unlock(&cxlfork_restore_contexts);
+	if (!ctx)
+		return -ENOENT;
+	if (ctx->key != op.key) {
+		ret = -ENOENT;
+		goto out_put;
+	}
+	if (ctx->generation != op.generation) {
+		ret = -ESTALE;
+		goto out_put;
+	}
+
+	spin_lock_irqsave(&ctx->lock, flags);
+	op.stats = ctx->stats;
+	spin_unlock_irqrestore(&ctx->lock, flags);
+	op.stats.faults = atomic64_read(&ctx->faults);
+	op.stats.shared_leaf_pages = atomic64_read(&ctx->shared_map_pages);
+	op.stats.local_copy_pages = atomic64_read(&ctx->local_copy_pages);
+	op.stats.leaf_copy_pages = atomic64_read(&ctx->leaf_copy_pages);
+	memset(op.reserved1, 0, sizeof(op.reserved1));
+	ret = copy_to_user(uarg, &op, sizeof(op)) ? -EFAULT : 0;
+
+out_put:
+	cxlfork_restore_ctx_put(ctx);
+	return ret;
 }
 
 static int cxlfork_open(struct inode *inode, struct file *file)
@@ -4579,6 +4837,12 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		return cxlfork_ioctl_release((void __user *)arg);
 	case CXLFORK_QUERY_CAPS_V2:
 		return cxlfork_ioctl_query_caps_v2((void __user *)arg);
+	case CXLFORK_PREPARE_V2:
+		return cxlfork_ioctl_prepare_v2((void __user *)arg);
+	case CXLFORK_RESUME_V2:
+		return cxlfork_ioctl_resume_v2(file, (void __user *)arg);
+	case CXLFORK_RELEASE_V2:
+		return cxlfork_ioctl_release_v2((void __user *)arg);
 	case CXLFORK_INSPECT_V2:
 		return cxlfork_ioctl_inspect_v2((void __user *)arg);
 	case CXLFORK_PTE_MARK_V2:
@@ -4587,6 +4851,8 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 	case CXLFORK_LITMUS_V2:
 		return cxlfork_ioctl_litmus_v2((void __user *)arg);
 #endif
+	case CXLFORK_GET_CALL_STATS_V2:
+		return cxlfork_ioctl_get_call_stats_v2((void __user *)arg);
 	default:
 		return -ENOTTY;
 	}

@@ -26,6 +26,15 @@
 #define FNV_SEED 1469598103934665603ULL
 #define FNV_PRIME 1099511628211ULL
 
+_Static_assert(sizeof(struct cxlfork_prepare_v2) == 240,
+	       "unexpected cxlfork_prepare_v2 size");
+_Static_assert(sizeof(struct cxlfork_resume_v2) == 312,
+	       "unexpected cxlfork_resume_v2 size");
+_Static_assert(sizeof(struct cxlfork_release_v2) == 64,
+	       "unexpected cxlfork_release_v2 size");
+_Static_assert(sizeof(struct cxlfork_call_stats_v2) == 272,
+	       "unexpected cxlfork_call_stats_v2 size");
+
 static uint64_t fnv_bytes(uint64_t hash, const void *data, size_t bytes)
 {
 	const unsigned char *p = data;
@@ -76,7 +85,7 @@ static int run_abi_tests(void)
 		       CXLFORK_DEVICE, strerror(errno));
 		return KSFT_SKIP;
 	}
-	printf("1..9\n");
+	printf("1..11\n");
 
 	ret = ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps);
 	ok = ret == 0;
@@ -93,7 +102,6 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_REAL_SHARED_PTE_LEAF |
 		CXLFORK_CAP_PTE_LEAF_COW |
 		CXLFORK_CAP_VMA_IMAGE_RECONSTRUCTION |
-		CXLFORK_CAP_REAL_SHARED_VMA_LEAF |
 		CXLFORK_CAP_CONSISTENT_SINGLE_THREAD |
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
@@ -103,10 +111,35 @@ static int run_abi_tests(void)
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
 
-	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE;
+	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE |
+		CXLFORK_CAP_REAL_SHARED_VMA_LEAF;
 	ok = !(caps.capabilities & forbidden);
 	tap(ok, nr++, "unimplemented paper mechanisms are not advertised");
 	failed += !ok;
+
+	bad = caps;
+	bad.size = sizeof(bad) + 8;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_QUERY_CAPS_V2, &bad);
+	ok = ret == -1 && errno == EINVAL;
+	tap(ok, nr++, "oversized v2 structure returns EINVAL");
+	failed += !ok;
+
+	{
+		struct cxlfork_release_v2 release = {
+			.size = sizeof(release),
+			.abi_version = CXLFORK_ABI_VERSION_V2,
+			.key = 1,
+			.generation = 1,
+			.reserved1 = { 1 },
+		};
+
+		errno = 0;
+		ret = ioctl(fd, CXLFORK_RELEASE_V2, &release);
+		ok = ret == -1 && errno == EINVAL;
+		tap(ok, nr++, "v2 operation rejects nonzero reserved tail");
+		failed += !ok;
+	}
 
 	ok = !(caps.capabilities & ~CXLFORK_CAP_KNOWN_MASK) &&
 		caps.page_size == (uint32_t)getpagesize() && caps.max_slots > 0 &&
@@ -1091,6 +1124,173 @@ static int hold_restore_after_close(uint64_t key, unsigned int seconds)
 	return 0;
 }
 
+static int v2_expect_errno(int fd, unsigned long request, void *op,
+			   int expected, const char *name)
+{
+	int ret;
+
+	errno = 0;
+	ret = ioctl(fd, request, op);
+	if (ret != -1 || errno != expected) {
+		fprintf(stderr, "%s: expected errno=%d got ret=%d errno=%d\n",
+			name, expected, ret, errno);
+		return 1;
+	}
+	return 0;
+}
+
+static int run_v2_lifecycle_tests(uint64_t key)
+{
+	struct cxlfork_region regions[CXLFORK_MAX_REGIONS];
+	struct cxlfork_prepare_v2 prepare = {
+		.size = sizeof(prepare),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_resume_v2 resume = {
+		.size = sizeof(resume),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+		.flags = CXLFORK_F_PRIVATE_COW,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
+	struct cxlfork_call_stats_v2 stats = {
+		.size = sizeof(stats),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	struct cxlfork_release_v2 release = {
+		.size = sizeof(release),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	struct cxlfork_inspect_v2 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
+	unsigned char *anon;
+	uint64_t generation1;
+	uint64_t restore_id;
+	size_t page = getpagesize();
+	uint32_t i;
+	int fd;
+	int failed = 0;
+
+	memset(regions, 0, sizeof(regions));
+	anon = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED) {
+		perror("v2 lifecycle mmap");
+		return 1;
+	}
+	fill_region(anon, page, key, 0);
+	prepare.scan_start = (uintptr_t)anon;
+	prepare.scan_end = (uintptr_t)anon + page;
+	fd = open_device();
+	if (fd < 0)
+		return KSFT_SKIP;
+	if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare)) {
+		perror("PREPARE_V2");
+		return 1;
+	}
+	if (!prepare.generation || prepare.region_count != 1 ||
+	    prepare.total_pages != 1 || !prepare.page_checksum) {
+		fprintf(stderr, "PREPARE_V2 outputs invalid\n");
+		return 1;
+	}
+	generation1 = prepare.generation;
+	resume.generation = generation1;
+	if (munmap(anon, page)) {
+		perror("v2 lifecycle source munmap");
+		return 1;
+	}
+	if (ioctl(fd, CXLFORK_RESUME_V2, &resume)) {
+		perror("RESUME_V2");
+		return 1;
+	}
+	if (!resume.restore_id || resume.region_count != 1 ||
+	    resume.total_pages != 1) {
+		fprintf(stderr, "RESUME_V2 outputs invalid\n");
+		return 1;
+	}
+	restore_id = resume.restore_id;
+	close(fd);
+	((volatile unsigned char *)(uintptr_t)regions[0].start)[0] ^= 0x55;
+
+	fd = open_device();
+	if (fd < 0)
+		return 1;
+	stats.generation = generation1;
+	stats.restore_id = restore_id;
+	if (ioctl(fd, CXLFORK_GET_CALL_STATS_V2, &stats)) {
+		perror("GET_CALL_STATS_V2 after fd close");
+		return 1;
+	}
+	if (!stats.stats.faults || !stats.stats.local_copy_pages) {
+		fprintf(stderr, "per-call fault stats missing after fd close\n");
+		failed++;
+	}
+	if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect) ||
+	    inspect.reader_count != 1) {
+		fprintf(stderr, "V2 restore context reader not retained\n");
+		failed++;
+	}
+	release.generation = generation1;
+	failed += v2_expect_errno(fd, CXLFORK_RELEASE_V2, &release, EBUSY,
+				  "active V2 release");
+	for (i = 0; i < resume.region_count; i++)
+		if (munmap((void *)(uintptr_t)regions[i].start, regions[i].length))
+			failed++;
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
+		perror("RELEASE_V2 after unmap");
+		failed++;
+	}
+
+	anon = mmap(TEST_BASE, page, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (anon == MAP_FAILED)
+		return 1;
+	fill_region(anon, page, key, 1);
+	memset(&prepare.stats, 0, sizeof(prepare.stats));
+	prepare.generation = 0;
+	prepare.region_count = 0;
+	prepare.total_pages = 0;
+	prepare.page_checksum = 0;
+	if (ioctl(fd, CXLFORK_PREPARE_V2, &prepare)) {
+		perror("second PREPARE_V2");
+		return 1;
+	}
+	if (prepare.generation == generation1) {
+		fprintf(stderr, "generation did not advance\n");
+		failed++;
+	}
+	resume.generation = generation1;
+	resume.restore_id = 0;
+	resume.region_count = 0;
+	failed += v2_expect_errno(fd, CXLFORK_RESUME_V2, &resume, ESTALE,
+				  "stale V2 resume");
+	release.generation = generation1;
+	failed += v2_expect_errno(fd, CXLFORK_RELEASE_V2, &release, ESTALE,
+				  "stale V2 release");
+	release.generation = prepare.generation;
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
+		perror("current generation RELEASE_V2");
+		failed++;
+	}
+	munmap(anon, page);
+	close(fd);
+	printf("v2-lifecycle key=%" PRIu64 " generation1=%" PRIu64
+	       " generation2=%" PRIu64 " restore_id=%" PRIu64
+	       " verify=%s\n", key, generation1,
+	       (uint64_t)prepare.generation, restore_id,
+	       failed ? "fail" : "ok");
+	return failed ? 1 : 0;
+}
+
 static int run_lifecycle_tests(uint64_t key)
 {
 	unsigned char *anon;
@@ -1359,7 +1559,7 @@ int main(int argc, char **argv)
 			"hybrid-prepare KEY | hybrid-restore KEY | "
 			"inspect KEY [ADDRESS] | release KEY | failures KEY | "
 			"lifecycle KEY | hold KEY SECONDS | hold-close KEY SECONDS | "
-			"conflict KEY POLICY\n",
+			"v2-lifecycle KEY | conflict KEY POLICY\n",
 			argv[0]);
 		return 2;
 	}
@@ -1373,6 +1573,8 @@ int main(int argc, char **argv)
 		return run_failure_tests(key);
 	if (!strcmp(argv[1], "lifecycle") && argc == 3)
 		return run_lifecycle_tests(key);
+	if (!strcmp(argv[1], "v2-lifecycle") && argc == 3)
+		return run_v2_lifecycle_tests(key);
 	if (!strcmp(argv[1], "prepare") && argc == 4)
 		return prepare_snapshot(key, parse_u64(argv[3]));
 	if (!strcmp(argv[1], "threadctx-prepare") && argc == 4)
