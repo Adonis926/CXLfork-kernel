@@ -50,6 +50,7 @@
 #define CXLFORK_COMM_LEN 16
 
 #define CXLFORK_ABI_VERSION_V2 2U
+#define CXLFORK_ABI_VERSION_V3 3U
 
 /* QUERY_CAPS capability bits. Unset bits are deliberately unsupported. */
 #define CXLFORK_CAP_V2_ABI (1ULL << 0)
@@ -67,7 +68,8 @@
 #define CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME (1ULL << 12)
 #define CXLFORK_CAP_GLOBAL_FILE_STATE (1ULL << 13)
 #define CXLFORK_CAP_RESTORE_FAST_PATH (1ULL << 14)
-#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 15) - 1)
+#define CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS (1ULL << 15)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 16) - 1)
 
 /* MM operations rejected by a tested kernel hook on restored VMAs. */
 #define CXLFORK_MM_FAILFAST_MPROTECT (1ULL << 0)
@@ -125,6 +127,32 @@
 #define CXLFORK_RESTORE_STAT_DATA_COW   (1ULL << 12)
 #define CXLFORK_RESTORE_STAT_CXL_COPY   (1ULL << 13)
 #define CXLFORK_RESTORE_STAT_KNOWN_MASK ((1ULL << 14) - 1)
+
+/*
+ * V3 restore statistics are mutually exclusive within total_ns.  Fault
+ * statistics are a separate post-RESUME attribution group and are never
+ * added to the restore-core buckets.
+ */
+#define CXLFORK_RESTORE_V3_LOCK_WAIT       (1ULL << 0)
+#define CXLFORK_RESTORE_V3_LIFECYCLE       (1ULL << 1)
+#define CXLFORK_RESTORE_V3_MANIFEST        (1ULL << 2)
+#define CXLFORK_RESTORE_V3_IMAGE_VALIDATE  (1ULL << 3)
+#define CXLFORK_RESTORE_V3_CHECKSUM         (1ULL << 4)
+#define CXLFORK_RESTORE_V3_ADDR_CONFLICT    (1ULL << 5)
+#define CXLFORK_RESTORE_V3_VMA_CREATE       (1ULL << 6)
+#define CXLFORK_RESTORE_V3_UPPER_PT         (1ULL << 7)
+#define CXLFORK_RESTORE_V3_SHARED_LEAF      (1ULL << 8)
+#define CXLFORK_RESTORE_V3_PTE_VALIDATE     (1ULL << 9)
+#define CXLFORK_RESTORE_V3_PTE_INSTALL      (1ULL << 10)
+#define CXLFORK_RESTORE_V3_FALLBACK_OTHER   (1ULL << 11)
+#define CXLFORK_RESTORE_V3_DIRTY_PREFAULT   (1ULL << 12)
+#define CXLFORK_RESTORE_V3_GLOBAL           (1ULL << 13)
+#define CXLFORK_RESTORE_V3_FAULT_DISPATCH   (1ULL << 14)
+#define CXLFORK_RESTORE_V3_LEAF_MATERIALIZE (1ULL << 15)
+#define CXLFORK_RESTORE_V3_DATA_COW         (1ULL << 16)
+#define CXLFORK_RESTORE_V3_CXL_COPY         (1ULL << 17)
+#define CXLFORK_RESTORE_V3_OTHER            (1ULL << 18)
+#define CXLFORK_RESTORE_V3_KNOWN_MASK       ((1ULL << 19) - 1)
 
 #define CXLFORK_PTE_MARK_CLEAR_ACCESSED (1ULL << 0)
 #define CXLFORK_PTE_MARK_CLEAR_DIRTY (1ULL << 1)
@@ -330,6 +358,42 @@ struct cxlfork_restore_stats_v2 {
 	__u64 validated_ptes;
 };
 
+struct cxlfork_restore_stats_v3 {
+	__u64 supported_mask;
+	__u64 valid_mask;
+	__u64 path_mask;
+	__u64 total_ns;
+	__u64 lock_wait_ns;
+	__u64 lifecycle_ns;
+	__u64 manifest_validate_ns;
+	__u64 image_validate_ns;
+	__u64 checksum_validate_ns;
+	__u64 address_conflict_ns;
+	__u64 vma_create_ns;
+	__u64 upper_pt_alloc_ns;
+	__u64 shared_leaf_attach_ns;
+	__u64 pte_image_validate_ns;
+	__u64 direct_pte_install_ns;
+	__u64 fallback_other_ns;
+	__u64 dirty_prefault_ns;
+	__u64 global_restore_ns;
+	__u64 other_ns;
+	/* Post-RESUME attribution.  These fields are not part of total_ns. */
+	__u64 faults;
+	__u64 fault_dispatch_ns;
+	__u64 leaf_materialize_ns;
+	__u64 data_cow_ns;
+	__u64 cxl_to_local_copy_ns;
+	__u64 shared_leaf_count;
+	__u64 shared_data_pages;
+	__u64 fallback_pages;
+	__u64 direct_pte_install_pages;
+	__u64 local_copy_pages;
+	__u64 leaf_copy_pages;
+	__u64 dirty_prefault_pages;
+	__u64 validated_ptes;
+};
+
 struct cxlfork_prepare_v2 {
 	__u32 size;
 	__u16 abi_version;
@@ -384,6 +448,17 @@ struct cxlfork_call_stats_v2 {
 	__u64 generation;
 	__u64 restore_id;
 	struct cxlfork_restore_stats_v2 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_call_stats_v3 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 restore_id;
+	struct cxlfork_restore_stats_v3 stats;
 	__u64 reserved1[4];
 };
 
@@ -639,5 +714,6 @@ struct cxlfork_release {
 #define CXLFORK_LITMUS_V2 _IOWR(CXLFORK_IOC_MAGIC, 13, struct cxlfork_v2_header)
 #define CXLFORK_GET_CALL_STATS_V2 _IOWR(CXLFORK_IOC_MAGIC, 14, struct cxlfork_v2_header)
 #define CXLFORK_GUP_PROBE_V2 _IOWR(CXLFORK_IOC_MAGIC, 15, struct cxlfork_v2_header)
+#define CXLFORK_GET_CALL_STATS_V3 _IOWR(CXLFORK_IOC_MAGIC, 16, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

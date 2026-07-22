@@ -34,6 +34,8 @@ _Static_assert(sizeof(struct cxlfork_release_v2) == 64,
 	       "unexpected cxlfork_release_v2 size");
 _Static_assert(sizeof(struct cxlfork_call_stats_v2) == 272,
 	       "unexpected cxlfork_call_stats_v2 size");
+_Static_assert(sizeof(struct cxlfork_call_stats_v3) == 320,
+	       "unexpected cxlfork_call_stats_v3 size");
 _Static_assert(sizeof(struct cxlfork_query_caps_v2) == 128,
 	       "unexpected cxlfork_query_caps_v2 size");
 _Static_assert(sizeof(struct cxlfork_gup_probe_v2) == 56,
@@ -74,6 +76,13 @@ static int run_abi_tests(void)
 		.size = sizeof(inspect),
 		.abi_version = CXLFORK_ABI_VERSION_V2,
 	};
+	struct cxlfork_call_stats_v3 stats_v3 = {
+		.size = sizeof(stats_v3),
+		.abi_version = CXLFORK_ABI_VERSION_V3,
+		.key = 1,
+		.generation = 1,
+		.restore_id = 1,
+	};
 	uint64_t required;
 	uint64_t forbidden;
 	unsigned int nr = 1;
@@ -89,7 +98,7 @@ static int run_abi_tests(void)
 		       CXLFORK_DEVICE, strerror(errno));
 		return KSFT_SKIP;
 	}
-	printf("1..11\n");
+	printf("1..14\n");
 
 	ret = ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps);
 	ok = ret == 0;
@@ -110,9 +119,33 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_RELIABLE_SLOT_GENERATION |
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
 		CXLFORK_CAP_GLOBAL_FILE_STATE |
-		CXLFORK_CAP_A_BIT_HYBRID;
+		CXLFORK_CAP_A_BIT_HYBRID |
+		CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
+	failed += !ok;
+
+	stats_v3.size++;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3);
+	ok = ret == -1 && errno == EINVAL;
+	tap(ok, nr++, "GET_CALL_STATS_V3 rejects wrong size");
+	failed += !ok;
+	stats_v3.size = sizeof(stats_v3);
+
+	stats_v3.abi_version = CXLFORK_ABI_VERSION_V2;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3);
+	ok = ret == -1 && errno == EPROTONOSUPPORT;
+	tap(ok, nr++, "GET_CALL_STATS_V3 rejects v2 ABI version");
+	failed += !ok;
+	stats_v3.abi_version = CXLFORK_ABI_VERSION_V3;
+
+	stats_v3.reserved1[0] = 1;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3);
+	ok = ret == -1 && errno == EINVAL;
+	tap(ok, nr++, "GET_CALL_STATS_V3 rejects reserved tail");
 	failed += !ok;
 
 	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE |
@@ -1259,6 +1292,11 @@ static int run_v2_lifecycle_tests(uint64_t key)
 		.abi_version = CXLFORK_ABI_VERSION_V2,
 		.key = key,
 	};
+	struct cxlfork_call_stats_v3 stats_v3 = {
+		.size = sizeof(stats_v3),
+		.abi_version = CXLFORK_ABI_VERSION_V3,
+		.key = key,
+	};
 	struct cxlfork_release_v2 release = {
 		.size = sizeof(release),
 		.abi_version = CXLFORK_ABI_VERSION_V2,
@@ -1272,6 +1310,7 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	unsigned char *anon;
 	uint64_t generation1;
 	uint64_t restore_id;
+	uint64_t exclusive_ns;
 	size_t page = getpagesize();
 	uint32_t i;
 	int fd;
@@ -1349,6 +1388,37 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	    !stats.stats.fault_dispatch_ns ||
 	    !stats.stats.cxl_to_local_copy_ns) {
 		fprintf(stderr, "per-call fault stats missing after fd close\n");
+		failed++;
+	}
+	stats_v3.generation = generation1;
+	stats_v3.restore_id = restore_id;
+	if (ioctl(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3)) {
+		perror("GET_CALL_STATS_V3 after fd close");
+		return 1;
+	}
+	exclusive_ns = stats_v3.stats.lock_wait_ns +
+		stats_v3.stats.lifecycle_ns +
+		stats_v3.stats.manifest_validate_ns +
+		stats_v3.stats.image_validate_ns +
+		stats_v3.stats.checksum_validate_ns +
+		stats_v3.stats.address_conflict_ns +
+		stats_v3.stats.vma_create_ns +
+		stats_v3.stats.upper_pt_alloc_ns +
+		stats_v3.stats.shared_leaf_attach_ns +
+		stats_v3.stats.pte_image_validate_ns +
+		stats_v3.stats.direct_pte_install_ns +
+		stats_v3.stats.fallback_other_ns +
+		stats_v3.stats.dirty_prefault_ns +
+		stats_v3.stats.global_restore_ns +
+		stats_v3.stats.other_ns;
+	if (stats_v3.stats.total_ns == 0 ||
+	    exclusive_ns != stats_v3.stats.total_ns ||
+	    !(stats_v3.stats.valid_mask & CXLFORK_RESTORE_V3_OTHER) ||
+	    !(stats_v3.stats.valid_mask & CXLFORK_RESTORE_V3_FAULT_DISPATCH) ||
+	    !(stats_v3.stats.valid_mask & CXLFORK_RESTORE_V3_CXL_COPY) ||
+	    stats_v3.stats.faults != stats.stats.faults ||
+	    stats_v3.stats.local_copy_pages != stats.stats.local_copy_pages) {
+		fprintf(stderr, "exclusive GET_CALL_STATS_V3 breakdown invalid\n");
 		failed++;
 	}
 	if (ioctl(fd, CXLFORK_INSPECT_V2, &inspect) ||
