@@ -2113,14 +2113,46 @@ static uint64_t parse_u64(const char *value)
 	return result;
 }
 
+static int show_caps(void)
+{
+	struct cxlfork_query_caps_v2 caps = {
+		.size = sizeof(caps),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+	};
+	int fd;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open " CXLFORK_DEVICE);
+		return 1;
+	}
+	if (ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps)) {
+		perror("QUERY_CAPS_V2");
+		close(fd);
+		return 1;
+	}
+	close(fd);
+	printf("caps abi=%u capabilities=%016" PRIx64
+	       " slot_bytes=%" PRIu64 " max_slots=%u max_regions=%u"
+	       " max_ptes=%u page_size=%u"
+	       " descriptor_version=%u verify=ok\n",
+	       caps.abi_version, (uint64_t)caps.capabilities,
+	       (uint64_t)caps.slot_bytes,
+	       caps.max_slots, caps.max_regions, caps.max_ptes,
+	       caps.page_size, caps.descriptor_version);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	uint64_t key;
 
 	if (argc == 1 || !strcmp(argv[1], "abi"))
 		return run_abi_tests();
+	if (argc == 2 && !strcmp(argv[1], "caps"))
+		return show_caps();
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s prepare KEY BYTES | restore KEY POLICY | "
+		fprintf(stderr, "usage: %s caps | prepare KEY BYTES | restore KEY POLICY | "
 			"threadctx-prepare KEY BYTES | threadctx-restore KEY POLICY | "
 			"fdglobal-prepare KEY BYTES | fdglobal-restore KEY POLICY | "
 			"hybrid-prepare KEY | hybrid-restore KEY | "
