@@ -16,6 +16,10 @@
 #define CXLFORK_DESC_VERSION 2
 #define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
 #define CXLFORK_LITMUS_OFFSET PAGE_SIZE    /* 预留区内的独立跨 VM memory-order test page。 */
+#define CXLFORK_CATALOG_OFFSET (2 * PAGE_SIZE)
+#define CXLFORK_CATALOG_MAGIC_INIT 0x43584c4341544900ULL
+#define CXLFORK_CATALOG_MAGIC_READY 0x43584c4341545634ULL /* "CXLCATV4" */
+#define CXLFORK_CATALOG_VERSION 1ULL
 #define CXLFORK_LITMUS_MAGIC 0x43584c4c49544d32ULL /* "CXLLITM2" */
 #define CXLFORK_MAX_SLOTS 7                /* key%MAX_SLOTS 选择 slot，4G CXL window 下保留 7 个大 slot。 */
 #define CXLFORK_SLOT_BYTES SZ_512M         /* 单个 checkpoint slot 的最大容量。 */
@@ -174,6 +178,26 @@ struct cxlfork_private_rebase_image {
 	u64 state_image_offset;
 	u64 nr_ptrs;
 	struct cxlfork_private_ptr ptrs[CXLFORK_MAX_PRIVATE_PTRS];
+};
+
+enum cxlfork_catalog_entry_state {
+	CXLFORK_CATALOG_ENTRY_FREE = 0,
+	CXLFORK_CATALOG_ENTRY_WRITING = 1,
+	CXLFORK_CATALOG_ENTRY_READY = 2,
+};
+
+struct cxlfork_catalog_entry {
+	u64 state;
+	u64 identity_hash;
+	struct cxlfork_catalog_record_v4 record;
+};
+
+struct cxlfork_catalog_shared {
+	u64 magic;
+	u64 version;
+	u64 next_generation;
+	u64 reserved;
+	struct cxlfork_catalog_entry entries[CXLFORK_CATALOG_MAX_ENTRIES];
 };
 
 struct cxlfork_desc {

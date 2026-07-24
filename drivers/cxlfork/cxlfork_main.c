@@ -4343,6 +4343,187 @@ out_unlock:
 	return ret;
 }
 
+static bool cxlfork_catalog_name_valid(const u8 *name, size_t size)
+{
+	size_t length;
+	size_t i;
+
+	length = strnlen((const char *)name, size);
+	if (!length || length == size)
+		return false;
+	for (i = length + 1; i < size; i++)
+		if (name[i])
+			return false;
+	return true;
+}
+
+static u64 cxlfork_catalog_identity_hash(
+	const struct cxlfork_catalog_record_v4 *record)
+{
+	const u64 fnv_offset = 1469598103934665603ULL;
+	const u64 fnv_prime = 1099511628211ULL;
+	const u8 *parts[] = {
+		record->owner,
+		record->function,
+		record->version,
+	};
+	const size_t sizes[] = {
+		CXLFORK_CATALOG_OWNER_LEN,
+		CXLFORK_CATALOG_FUNCTION_LEN,
+		CXLFORK_CATALOG_VERSION_LEN,
+	};
+	u64 hash = fnv_offset;
+	u32 part;
+	size_t i;
+
+	for (part = 0; part < ARRAY_SIZE(parts); part++)
+		for (i = 0; i < sizes[part]; i++) {
+			hash ^= parts[part][i];
+			hash *= fnv_prime;
+		}
+	return hash ?: 1;
+}
+
+static bool cxlfork_catalog_identity_equal(
+	const struct cxlfork_catalog_record_v4 *left,
+	const struct cxlfork_catalog_record_v4 *right)
+{
+	return !memcmp(left->owner, right->owner,
+		       CXLFORK_CATALOG_OWNER_LEN) &&
+		!memcmp(left->function, right->function,
+			CXLFORK_CATALOG_FUNCTION_LEN) &&
+		!memcmp(left->version, right->version,
+			CXLFORK_CATALOG_VERSION_LEN);
+}
+
+static int cxlfork_catalog_validate_identity(
+	const struct cxlfork_catalog_record_v4 *record)
+{
+	if (!cxlfork_catalog_name_valid(record->owner,
+					 CXLFORK_CATALOG_OWNER_LEN) ||
+	    !cxlfork_catalog_name_valid(record->function,
+					 CXLFORK_CATALOG_FUNCTION_LEN) ||
+	    !cxlfork_catalog_name_valid(record->version,
+					 CXLFORK_CATALOG_VERSION_LEN))
+		return -EINVAL;
+	return 0;
+}
+
+static struct cxlfork_catalog_shared *cxlfork_catalog_get(void)
+{
+	struct cxlfork_catalog_shared *catalog;
+	u64 magic;
+	u64 deadline;
+
+	if (!cxl_range_valid(CXLFORK_CATALOG_OFFSET, sizeof(*catalog)))
+		return ERR_PTR(-ENOSPC);
+	catalog = cxl_ptr(CXLFORK_CATALOG_OFFSET);
+	magic = smp_load_acquire(&catalog->magic);
+	if (magic == CXLFORK_CATALOG_MAGIC_READY) {
+		if (READ_ONCE(catalog->version) != CXLFORK_CATALOG_VERSION)
+			return ERR_PTR(-EPROTONOSUPPORT);
+		return catalog;
+	}
+	if (!magic &&
+	    cmpxchg(&catalog->magic, 0, CXLFORK_CATALOG_MAGIC_INIT) == 0) {
+		memset((u8 *)catalog + sizeof(catalog->magic), 0,
+		       sizeof(*catalog) - sizeof(catalog->magic));
+		WRITE_ONCE(catalog->version, CXLFORK_CATALOG_VERSION);
+		smp_store_release(&catalog->magic,
+				  CXLFORK_CATALOG_MAGIC_READY);
+		return catalog;
+	}
+	deadline = ktime_get_ns() + NSEC_PER_SEC;
+	do {
+		magic = smp_load_acquire(&catalog->magic);
+		if (magic == CXLFORK_CATALOG_MAGIC_READY) {
+			if (READ_ONCE(catalog->version) !=
+			    CXLFORK_CATALOG_VERSION)
+				return ERR_PTR(-EPROTONOSUPPORT);
+			return catalog;
+		}
+		if (magic != CXLFORK_CATALOG_MAGIC_INIT)
+			return ERR_PTR(-EILSEQ);
+		cpu_relax();
+		cond_resched();
+	} while (ktime_get_ns() < deadline);
+	return ERR_PTR(-ETIMEDOUT);
+}
+
+static u64
+cxlfork_catalog_next_generation(struct cxlfork_catalog_shared *catalog)
+{
+	u64 old;
+	u64 next;
+
+	do {
+		old = READ_ONCE(catalog->next_generation);
+		next = old + 1;
+		if (!next)
+			next = 1;
+	} while (cmpxchg(&catalog->next_generation, old, next) != old);
+	return next;
+}
+
+static int cxlfork_catalog_wait_entry(
+	struct cxlfork_catalog_entry *entry, u64 *state)
+{
+	u64 deadline = ktime_get_ns() + NSEC_PER_SEC;
+
+	do {
+		*state = smp_load_acquire(&entry->state);
+		if (*state != CXLFORK_CATALOG_ENTRY_WRITING)
+			return 0;
+		cpu_relax();
+		cond_resched();
+	} while (ktime_get_ns() < deadline);
+	return -ETIMEDOUT;
+}
+
+static int cxlfork_catalog_validate_slot(
+	struct cxlfork_catalog_record_v4 *record, bool fill)
+{
+	struct cxlfork_desc *desc;
+	int slot;
+	int ret = 0;
+
+	slot = key_to_slot(record->key);
+	if (slot < 0)
+		return slot;
+	mutex_lock(&cxlfork_lock);
+	desc = slot_desc(slot);
+	if (!cxlfork_desc_key_ready(desc, record->key) ||
+	    desc->generation != record->slot_generation) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+	if (!desc->capsule_manifest_valid) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+	if (memcmp(desc->capsule_manifest.runtime_sha256,
+		   record->runtime_sha256, CXLFORK_CAPSULE_DIGEST_BYTES) ||
+	    memcmp(desc->capsule_manifest.image_sha256,
+		   record->image_sha256, CXLFORK_CAPSULE_DIGEST_BYTES) ||
+	    desc->capsule_manifest.state_checksum !=
+		    record->state_checksum ||
+	    (record->image_bytes &&
+	     record->image_bytes != desc->image_bytes) ||
+	    (record->page_checksum &&
+	     record->page_checksum != desc->page_checksum)) {
+		ret = -EILSEQ;
+		goto out_unlock;
+	}
+	if (fill) {
+		record->image_bytes = desc->image_bytes;
+		record->page_checksum = desc->page_checksum;
+	}
+
+out_unlock:
+	mutex_unlock(&cxlfork_lock);
+	return ret;
+}
+
 static int cxlfork_ioctl_prepare_v2(struct cxlfork_prepare_v2 __user *uarg)
 {
 	const u64 known_flags = CXLFORK_F_REOPEN_FDS |
@@ -4636,6 +4817,265 @@ out_unlock:
 	return copy_to_user(uarg, &op, sizeof(op)) ? -EFAULT : 0;
 }
 
+static int cxlfork_catalog_record_reserved_zero(
+	const struct cxlfork_catalog_record_v4 *record)
+{
+	u32 i;
+
+	for (i = 0; i < ARRAY_SIZE(record->reserved); i++)
+		if (record->reserved[i])
+			return -EINVAL;
+	return 0;
+}
+
+static int
+cxlfork_ioctl_catalog_register_v4(
+	struct cxlfork_catalog_register_v4 __user *uarg)
+{
+	const u64 policy_mask = CXLFORK_F_MAP_READONLY |
+		CXLFORK_F_PRIVATE_COW | CXLFORK_F_SHARED_COW |
+		CXLFORK_F_HYBRID_TIERING;
+	struct cxlfork_catalog_register_v4 op;
+	struct cxlfork_catalog_shared *catalog;
+	struct cxlfork_catalog_entry *entry;
+	struct cxlfork_catalog_record_v4 record;
+	u64 hash;
+	u64 state;
+	u32 probe;
+	u32 index;
+	int free_index;
+	int ret;
+
+	ret = cxlfork_check_header(uarg, sizeof(op),
+				   CXLFORK_ABI_VERSION_V4);
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	record = op.record;
+	ret = cxlfork_catalog_validate_identity(&record);
+	if (ret)
+		return ret;
+	if (!record.key || !record.slot_generation ||
+	    !record.state_checksum ||
+	    cxlfork_digest_is_zero(record.runtime_sha256) ||
+	    cxlfork_digest_is_zero(record.image_sha256) ||
+	    hweight64(record.policy & policy_mask) != 1 ||
+	    (record.policy & ~policy_mask) ||
+	    record.catalog_generation || record.index || record.flags)
+		return -EINVAL;
+	ret = cxlfork_catalog_record_reserved_zero(&record);
+	if (ret)
+		return ret;
+	ret = cxlfork_catalog_validate_slot(&record, true);
+	if (ret)
+		return ret;
+	catalog = cxlfork_catalog_get();
+	if (IS_ERR(catalog))
+		return PTR_ERR(catalog);
+	hash = cxlfork_catalog_identity_hash(&record);
+
+rescan:
+	free_index = -1;
+	for (probe = 0; probe < CXLFORK_CATALOG_MAX_ENTRIES; probe++) {
+		index = (hash + probe) % CXLFORK_CATALOG_MAX_ENTRIES;
+		entry = &catalog->entries[index];
+retry:
+		state = smp_load_acquire(&entry->state);
+		if (state == CXLFORK_CATALOG_ENTRY_WRITING) {
+			ret = cxlfork_catalog_wait_entry(entry, &state);
+			if (ret)
+				return ret;
+			goto retry;
+		}
+		if (state == CXLFORK_CATALOG_ENTRY_READY) {
+			if (READ_ONCE(entry->identity_hash) == hash &&
+			    cxlfork_catalog_identity_equal(&entry->record,
+							   &record))
+				return -EEXIST;
+			continue;
+		}
+		if (state != CXLFORK_CATALOG_ENTRY_FREE)
+			return -EILSEQ;
+		if (free_index < 0)
+			free_index = index;
+	}
+	if (free_index < 0)
+		return -ENOSPC;
+	entry = &catalog->entries[free_index];
+	if (cmpxchg(&entry->state, CXLFORK_CATALOG_ENTRY_FREE,
+		    CXLFORK_CATALOG_ENTRY_WRITING) !=
+	    CXLFORK_CATALOG_ENTRY_FREE)
+		goto rescan;
+
+	record.catalog_generation = cxlfork_catalog_next_generation(catalog);
+	record.index = free_index;
+	record.flags = CXLFORK_CATALOG_RECORD_F_READY;
+	memset(record.reserved, 0, sizeof(record.reserved));
+	WRITE_ONCE(entry->identity_hash, hash);
+	memcpy(&entry->record, &record, sizeof(record));
+	smp_store_release(&entry->state, CXLFORK_CATALOG_ENTRY_READY);
+	op.record = record;
+	if (copy_to_user(uarg, &op, sizeof(op))) {
+		if (cmpxchg(&entry->state, CXLFORK_CATALOG_ENTRY_READY,
+			    CXLFORK_CATALOG_ENTRY_WRITING) ==
+		    CXLFORK_CATALOG_ENTRY_READY) {
+			memset(&entry->record, 0, sizeof(entry->record));
+			WRITE_ONCE(entry->identity_hash, 0);
+			smp_store_release(&entry->state,
+					  CXLFORK_CATALOG_ENTRY_FREE);
+		}
+		return -EFAULT;
+	}
+	return 0;
+}
+
+static int
+cxlfork_ioctl_catalog_lookup_v4(
+	struct cxlfork_catalog_lookup_v4 __user *uarg)
+{
+	struct cxlfork_catalog_lookup_v4 op;
+	struct cxlfork_catalog_shared *catalog;
+	struct cxlfork_catalog_entry *entry;
+	struct cxlfork_catalog_record_v4 identity;
+	struct cxlfork_catalog_record_v4 record;
+	u64 hash;
+	u64 state;
+	u32 probe;
+	u32 index;
+	int ret;
+
+	ret = cxlfork_check_header(uarg, sizeof(op),
+				   CXLFORK_ABI_VERSION_V4);
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	identity = op.record;
+	ret = cxlfork_catalog_validate_identity(&identity);
+	if (ret)
+		return ret;
+	if (identity.key || identity.slot_generation || identity.image_bytes ||
+	    identity.page_checksum || identity.state_checksum ||
+	    identity.policy || identity.catalog_generation || identity.index ||
+	    identity.flags || !cxlfork_digest_is_zero(identity.runtime_sha256) ||
+	    !cxlfork_digest_is_zero(identity.image_sha256))
+		return -EINVAL;
+	ret = cxlfork_catalog_record_reserved_zero(&identity);
+	if (ret)
+		return ret;
+	catalog = cxlfork_catalog_get();
+	if (IS_ERR(catalog))
+		return PTR_ERR(catalog);
+	hash = cxlfork_catalog_identity_hash(&identity);
+
+	for (probe = 0; probe < CXLFORK_CATALOG_MAX_ENTRIES; probe++) {
+		index = (hash + probe) % CXLFORK_CATALOG_MAX_ENTRIES;
+		entry = &catalog->entries[index];
+retry:
+		state = smp_load_acquire(&entry->state);
+		if (state == CXLFORK_CATALOG_ENTRY_WRITING) {
+			ret = cxlfork_catalog_wait_entry(entry, &state);
+			if (ret)
+				return ret;
+			goto retry;
+		}
+		if (state == CXLFORK_CATALOG_ENTRY_FREE)
+			continue;
+		if (state != CXLFORK_CATALOG_ENTRY_READY)
+			return -EILSEQ;
+		if (READ_ONCE(entry->identity_hash) != hash)
+			continue;
+		memcpy(&record, &entry->record, sizeof(record));
+		smp_rmb();
+		if (smp_load_acquire(&entry->state) !=
+			    CXLFORK_CATALOG_ENTRY_READY ||
+		    READ_ONCE(entry->record.catalog_generation) !=
+			    record.catalog_generation)
+			goto retry;
+		if (!cxlfork_catalog_identity_equal(&record, &identity))
+			continue;
+		ret = cxlfork_catalog_validate_slot(&record, false);
+		if (ret)
+			return ret;
+		op.record = record;
+		return copy_to_user(uarg, &op, sizeof(op)) ?
+			-EFAULT : 0;
+	}
+	return -ENOENT;
+}
+
+static int
+cxlfork_ioctl_catalog_evict_v4(
+	struct cxlfork_catalog_evict_v4 __user *uarg)
+{
+	struct cxlfork_catalog_evict_v4 op;
+	struct cxlfork_catalog_record_v4 identity = {};
+	struct cxlfork_catalog_shared *catalog;
+	struct cxlfork_catalog_entry *entry;
+	u64 hash;
+	u64 state;
+	u32 probe;
+	u32 index;
+	u32 i;
+	int ret;
+
+	ret = cxlfork_check_header(uarg, sizeof(op),
+				   CXLFORK_ABI_VERSION_V4);
+	if (ret)
+		return ret;
+	if (copy_from_user(&op, uarg, sizeof(op)))
+		return -EFAULT;
+	memcpy(identity.owner, op.owner, sizeof(identity.owner));
+	memcpy(identity.function, op.function, sizeof(identity.function));
+	memcpy(identity.version, op.version, sizeof(identity.version));
+	ret = cxlfork_catalog_validate_identity(&identity);
+	if (ret)
+		return ret;
+	if (!op.catalog_generation)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(op.reserved1); i++)
+		if (op.reserved1[i])
+			return -EINVAL;
+	catalog = cxlfork_catalog_get();
+	if (IS_ERR(catalog))
+		return PTR_ERR(catalog);
+	hash = cxlfork_catalog_identity_hash(&identity);
+
+	for (probe = 0; probe < CXLFORK_CATALOG_MAX_ENTRIES; probe++) {
+		index = (hash + probe) % CXLFORK_CATALOG_MAX_ENTRIES;
+		entry = &catalog->entries[index];
+retry:
+		state = smp_load_acquire(&entry->state);
+		if (state == CXLFORK_CATALOG_ENTRY_WRITING) {
+			ret = cxlfork_catalog_wait_entry(entry, &state);
+			if (ret)
+				return ret;
+			goto retry;
+		}
+		if (state == CXLFORK_CATALOG_ENTRY_FREE)
+			continue;
+		if (state != CXLFORK_CATALOG_ENTRY_READY)
+			return -EILSEQ;
+		if (READ_ONCE(entry->identity_hash) != hash ||
+		    !cxlfork_catalog_identity_equal(&entry->record, &identity))
+			continue;
+		if (READ_ONCE(entry->record.catalog_generation) !=
+		    op.catalog_generation)
+			return -ESTALE;
+		if (cmpxchg(&entry->state, CXLFORK_CATALOG_ENTRY_READY,
+			    CXLFORK_CATALOG_ENTRY_WRITING) !=
+		    CXLFORK_CATALOG_ENTRY_READY)
+			goto retry;
+		memset(&entry->record, 0, sizeof(entry->record));
+		WRITE_ONCE(entry->identity_hash, 0);
+		smp_store_release(&entry->state,
+				  CXLFORK_CATALOG_ENTRY_FREE);
+		return 0;
+	}
+	return -ENOENT;
+}
+
 static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg)
 {
 	struct cxlfork_query_caps_v2 caps;
@@ -4661,7 +5101,8 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 		CXLFORK_CAP_RESTORE_FAST_PATH |
 		CXLFORK_CAP_A_BIT_HYBRID |
 		CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS |
-		CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION;
+		CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION |
+		CXLFORK_CAP_SHARED_CAPSULE_CATALOG;
 	caps.cxl_phys = cxl_phys;
 	caps.cxl_size = cxl_size;
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;
@@ -5668,6 +6109,12 @@ static long cxlfork_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		return cxlfork_ioctl_inspect_capsule_v4((void __user *)arg);
 	case CXLFORK_GET_CALL_STATS_V4:
 		return cxlfork_ioctl_get_call_stats_v4((void __user *)arg);
+	case CXLFORK_CATALOG_REGISTER_V4:
+		return cxlfork_ioctl_catalog_register_v4((void __user *)arg);
+	case CXLFORK_CATALOG_LOOKUP_V4:
+		return cxlfork_ioctl_catalog_lookup_v4((void __user *)arg);
+	case CXLFORK_CATALOG_EVICT_V4:
+		return cxlfork_ioctl_catalog_evict_v4((void __user *)arg);
 	default:
 		return -ENOTTY;
 	}

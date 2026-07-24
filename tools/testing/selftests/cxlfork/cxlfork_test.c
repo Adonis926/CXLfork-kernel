@@ -50,6 +50,14 @@ _Static_assert(sizeof(struct cxlfork_inspect_capsule_v4) == 224,
 	       "unexpected cxlfork_inspect_capsule_v4 size");
 _Static_assert(sizeof(struct cxlfork_call_stats_v4) == 368,
 	       "unexpected cxlfork_call_stats_v4 size");
+_Static_assert(sizeof(struct cxlfork_catalog_record_v4) == 288,
+	       "unexpected cxlfork_catalog_record_v4 size");
+_Static_assert(sizeof(struct cxlfork_catalog_register_v4) == 296,
+	       "unexpected cxlfork_catalog_register_v4 size");
+_Static_assert(sizeof(struct cxlfork_catalog_lookup_v4) == 296,
+	       "unexpected cxlfork_catalog_lookup_v4 size");
+_Static_assert(sizeof(struct cxlfork_catalog_evict_v4) == 176,
+	       "unexpected cxlfork_catalog_evict_v4 size");
 
 static uint64_t fnv_bytes(uint64_t hash, const void *data, size_t bytes)
 {
@@ -136,7 +144,8 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_GLOBAL_FILE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID |
 		CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS |
-		CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION;
+		CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION |
+		CXLFORK_CAP_SHARED_CAPSULE_CATALOG;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;

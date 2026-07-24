@@ -632,6 +632,200 @@ static int release_capsule(uint64_t key)
 	return 0;
 }
 
+static void catalog_identity(struct cxlfork_catalog_record_v4 *record)
+{
+	memset(record, 0, sizeof(*record));
+	snprintf((char *)record->owner, sizeof(record->owner), "paper");
+	snprintf((char *)record->function, sizeof(record->function),
+		 "capsule-k0");
+	snprintf((char *)record->version, sizeof(record->version), "v1");
+}
+
+static int catalog_lookup_fd(int fd,
+			     struct cxlfork_catalog_record_v4 *record)
+{
+	struct cxlfork_catalog_lookup_v4 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+	};
+
+	catalog_identity(&op.record);
+	if (ioctl(fd, CXLFORK_CATALOG_LOOKUP_V4, &op))
+		return -1;
+	*record = op.record;
+	return 0;
+}
+
+static int catalog_register(uint64_t key, bool expect_duplicate)
+{
+	struct cxlfork_inspect_capsule_v4 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.key = key,
+	};
+	struct cxlfork_catalog_register_v4 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+	};
+	int fd;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open " CXLFORK_DEVICE);
+		return 4;
+	}
+	if (ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect)) {
+		perror("INSPECT_CAPSULE_V4 catalog");
+		close(fd);
+		return 1;
+	}
+	catalog_identity(&op.record);
+	memcpy(op.record.runtime_sha256, inspect.manifest.runtime_sha256,
+	       sizeof(op.record.runtime_sha256));
+	memcpy(op.record.image_sha256, inspect.manifest.image_sha256,
+	       sizeof(op.record.image_sha256));
+	op.record.key = key;
+	op.record.slot_generation = inspect.generation;
+	op.record.state_checksum = inspect.manifest.state_checksum;
+	op.record.policy = CXLFORK_F_SHARED_COW;
+	if (ioctl(fd, CXLFORK_CATALOG_REGISTER_V4, &op)) {
+		if (expect_duplicate && errno == EEXIST) {
+			log_line("capsule-k0 event=catalog-duplicate key=%" PRIu64
+				 " errno=EEXIST verify=ok\n", key);
+			close(fd);
+			return 0;
+		}
+		perror("CATALOG_REGISTER_V4");
+		close(fd);
+		return 1;
+	}
+	if (expect_duplicate) {
+		fprintf(stderr, "catalog duplicate registration succeeded\n");
+		close(fd);
+		return 1;
+	}
+	log_line("capsule-k0 event=catalog-register key=%" PRIu64
+		 " slot_generation=%" PRIu64
+		 " catalog_generation=%" PRIu64 " index=%u"
+		 " image_bytes=%" PRIu64 " page_checksum=%016" PRIx64
+		 " verify=ok\n",
+		 op.record.key, op.record.slot_generation,
+		 op.record.catalog_generation, op.record.index,
+		 op.record.image_bytes, op.record.page_checksum);
+	close(fd);
+	return 0;
+}
+
+static int catalog_lookup(uint64_t expected_key, int expected_errno)
+{
+	struct cxlfork_catalog_record_v4 record;
+	int fd;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open " CXLFORK_DEVICE);
+		return 4;
+	}
+	if (catalog_lookup_fd(fd, &record)) {
+		if (expected_errno && errno == expected_errno) {
+			log_line("capsule-k0 event=catalog-negative errno=%s"
+				 " verify=ok\n",
+				 expected_errno == ENOENT ? "ENOENT" : "ESTALE");
+			close(fd);
+			return 0;
+		}
+		perror("CATALOG_LOOKUP_V4");
+		close(fd);
+		return 1;
+	}
+	if (expected_errno || record.key != expected_key ||
+	    record.policy != CXLFORK_F_SHARED_COW ||
+	    !(record.flags & CXLFORK_CATALOG_RECORD_F_READY)) {
+		fprintf(stderr, "catalog lookup returned unexpected record\n");
+		close(fd);
+		return 1;
+	}
+	log_line("capsule-k0 event=catalog-lookup key=%" PRIu64
+		 " slot_generation=%" PRIu64
+		 " catalog_generation=%" PRIu64 " index=%u"
+		 " verify=ok\n",
+		 record.key, record.slot_generation,
+		 record.catalog_generation, record.index);
+	close(fd);
+	return 0;
+}
+
+static int catalog_evict_generation(uint64_t catalog_generation)
+{
+	struct cxlfork_catalog_record_v4 identity;
+	struct cxlfork_catalog_evict_v4 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.catalog_generation = catalog_generation,
+	};
+	int fd;
+
+	catalog_identity(&identity);
+	memcpy(op.owner, identity.owner, sizeof(op.owner));
+	memcpy(op.function, identity.function, sizeof(op.function));
+	memcpy(op.version, identity.version, sizeof(op.version));
+	fd = open_device();
+	if (fd < 0) {
+		perror("open " CXLFORK_DEVICE);
+		return 4;
+	}
+	if (ioctl(fd, CXLFORK_CATALOG_EVICT_V4, &op)) {
+		perror("CATALOG_EVICT_V4 generation");
+		close(fd);
+		return 1;
+	}
+	log_line("capsule-k0 event=catalog-evict-generation"
+		 " catalog_generation=%" PRIu64 " verify=ok\n",
+		 catalog_generation);
+	close(fd);
+	return 0;
+}
+
+static int catalog_evict(uint64_t expected_key)
+{
+	struct cxlfork_catalog_record_v4 record;
+	struct cxlfork_catalog_evict_v4 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+	};
+	int fd;
+
+	fd = open_device();
+	if (fd < 0) {
+		perror("open " CXLFORK_DEVICE);
+		return 4;
+	}
+	if (catalog_lookup_fd(fd, &record)) {
+		perror("CATALOG_LOOKUP_V4 before evict");
+		close(fd);
+		return 1;
+	}
+	if (record.key != expected_key) {
+		fprintf(stderr, "catalog evict key mismatch\n");
+		close(fd);
+		return 1;
+	}
+	memcpy(op.owner, record.owner, sizeof(op.owner));
+	memcpy(op.function, record.function, sizeof(op.function));
+	memcpy(op.version, record.version, sizeof(op.version));
+	op.catalog_generation = record.catalog_generation;
+	if (ioctl(fd, CXLFORK_CATALOG_EVICT_V4, &op)) {
+		perror("CATALOG_EVICT_V4");
+		close(fd);
+		return 1;
+	}
+	log_line("capsule-k0 event=catalog-evict key=%" PRIu64
+		 " catalog_generation=%" PRIu64 " verify=ok\n",
+		 expected_key, record.catalog_generation);
+	close(fd);
+	return 0;
+}
+
 static int parse_key(const char *text, uint64_t *key)
 {
 	char *end;
@@ -653,7 +847,10 @@ int main(int argc, char **argv)
 		fprintf(stderr,
 			"usage: %s prepare|prepare-corrupt|restore|"
 			"restore-full|restore-conflict|"
-			"restore-runtime-mismatch|release KEY\n",
+			"restore-runtime-mismatch|release|catalog-register|"
+			"catalog-register-duplicate|catalog-lookup|"
+			"catalog-expect-missing|catalog-expect-stale|"
+			"catalog-evict|catalog-evict-generation KEY_OR_GENERATION\n",
 			argv[0]);
 		return 2;
 	}
@@ -671,6 +868,20 @@ int main(int argc, char **argv)
 		return restore_capsule(key, false, true, false);
 	if (!strcmp(argv[1], "release"))
 		return release_capsule(key);
+	if (!strcmp(argv[1], "catalog-register"))
+		return catalog_register(key, false);
+	if (!strcmp(argv[1], "catalog-register-duplicate"))
+		return catalog_register(key, true);
+	if (!strcmp(argv[1], "catalog-lookup"))
+		return catalog_lookup(key, 0);
+	if (!strcmp(argv[1], "catalog-expect-missing"))
+		return catalog_lookup(key, ENOENT);
+	if (!strcmp(argv[1], "catalog-expect-stale"))
+		return catalog_lookup(key, ESTALE);
+	if (!strcmp(argv[1], "catalog-evict"))
+		return catalog_evict(key);
+	if (!strcmp(argv[1], "catalog-evict-generation"))
+		return catalog_evict_generation(key);
 	fprintf(stderr, "unknown operation: %s\n", argv[1]);
 	return 2;
 }

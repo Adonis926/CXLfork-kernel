@@ -71,7 +71,8 @@
 #define CXLFORK_CAP_RESTORE_FAST_PATH (1ULL << 14)
 #define CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS (1ULL << 15)
 #define CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION (1ULL << 16)
-#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 17) - 1)
+#define CXLFORK_CAP_SHARED_CAPSULE_CATALOG (1ULL << 17)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 18) - 1)
 
 /* MM operations rejected by a tested kernel hook on restored VMAs. */
 #define CXLFORK_MM_FAILFAST_MPROTECT (1ULL << 0)
@@ -167,6 +168,13 @@
 #define CXLFORK_CAPSULE_F_FIXED_ARENA (1U << 1)
 #define CXLFORK_CAPSULE_F_COOPERATIVE_YIELD (1U << 2)
 #define CXLFORK_CAPSULE_F_KNOWN_MASK ((1U << 3) - 1)
+
+#define CXLFORK_CATALOG_MAX_ENTRIES 64U
+#define CXLFORK_CATALOG_OWNER_LEN 32U
+#define CXLFORK_CATALOG_FUNCTION_LEN 64U
+#define CXLFORK_CATALOG_VERSION_LEN 32U
+#define CXLFORK_CATALOG_RECORD_F_READY (1U << 0)
+#define CXLFORK_CATALOG_RECORD_F_KNOWN_MASK ((1U << 1) - 1)
 
 /*
  * A sealed identity and activation record for the supported capsule subset.
@@ -572,6 +580,49 @@ struct cxlfork_call_stats_v4 {
 	__u64 reserved1[4];
 };
 
+struct cxlfork_catalog_record_v4 {
+	__u8 owner[CXLFORK_CATALOG_OWNER_LEN];
+	__u8 function[CXLFORK_CATALOG_FUNCTION_LEN];
+	__u8 version[CXLFORK_CATALOG_VERSION_LEN];
+	__u8 runtime_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u8 image_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u64 key;
+	__u64 slot_generation;
+	__u64 image_bytes;
+	__u64 page_checksum;
+	__u64 state_checksum;
+	__u64 policy;
+	__u64 catalog_generation;
+	__u32 index;
+	__u32 flags;
+	__u64 reserved[4];
+};
+
+struct cxlfork_catalog_register_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	struct cxlfork_catalog_record_v4 record;
+};
+
+struct cxlfork_catalog_lookup_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	struct cxlfork_catalog_record_v4 record;
+};
+
+struct cxlfork_catalog_evict_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u8 owner[CXLFORK_CATALOG_OWNER_LEN];
+	__u8 function[CXLFORK_CATALOG_FUNCTION_LEN];
+	__u8 version[CXLFORK_CATALOG_VERSION_LEN];
+	__u64 catalog_generation;
+	__u64 reserved1[4];
+};
+
 struct cxlfork_region {
 	/* 对外暴露的 VMA/region 摘要，便于 benchmark 记录页分类。 */
 	__u64 start;
@@ -829,5 +880,8 @@ struct cxlfork_release {
 #define CXLFORK_RESUME_CAPSULE_V4 _IOWR(CXLFORK_IOC_MAGIC, 18, struct cxlfork_v2_header)
 #define CXLFORK_INSPECT_CAPSULE_V4 _IOWR(CXLFORK_IOC_MAGIC, 19, struct cxlfork_v2_header)
 #define CXLFORK_GET_CALL_STATS_V4 _IOWR(CXLFORK_IOC_MAGIC, 20, struct cxlfork_v2_header)
+#define CXLFORK_CATALOG_REGISTER_V4 _IOWR(CXLFORK_IOC_MAGIC, 21, struct cxlfork_v2_header)
+#define CXLFORK_CATALOG_LOOKUP_V4 _IOWR(CXLFORK_IOC_MAGIC, 22, struct cxlfork_v2_header)
+#define CXLFORK_CATALOG_EVICT_V4 _IOWR(CXLFORK_IOC_MAGIC, 23, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */
