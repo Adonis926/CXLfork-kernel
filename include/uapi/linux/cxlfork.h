@@ -51,6 +51,7 @@
 
 #define CXLFORK_ABI_VERSION_V2 2U
 #define CXLFORK_ABI_VERSION_V3 3U
+#define CXLFORK_ABI_VERSION_V4 4U
 
 /* QUERY_CAPS capability bits. Unset bits are deliberately unsupported. */
 #define CXLFORK_CAP_V2_ABI (1ULL << 0)
@@ -69,7 +70,8 @@
 #define CXLFORK_CAP_GLOBAL_FILE_STATE (1ULL << 13)
 #define CXLFORK_CAP_RESTORE_FAST_PATH (1ULL << 14)
 #define CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS (1ULL << 15)
-#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 16) - 1)
+#define CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION (1ULL << 16)
+#define CXLFORK_CAP_KNOWN_MASK ((1ULL << 17) - 1)
 
 /* MM operations rejected by a tested kernel hook on restored VMAs. */
 #define CXLFORK_MM_FAILFAST_MPROTECT (1ULL << 0)
@@ -153,6 +155,36 @@
 #define CXLFORK_RESTORE_V3_CXL_COPY         (1ULL << 17)
 #define CXLFORK_RESTORE_V3_OTHER            (1ULL << 18)
 #define CXLFORK_RESTORE_V3_KNOWN_MASK       ((1ULL << 19) - 1)
+
+/* V4 adds two exclusive buckets around the V3 restore core. */
+#define CXLFORK_RESTORE_V4_CAPSULE_VALIDATE  (1ULL << 0)
+#define CXLFORK_RESTORE_V4_ACTIVATION_COMMIT (1ULL << 1)
+#define CXLFORK_RESTORE_V4_KNOWN_MASK        ((1ULL << 2) - 1)
+
+#define CXLFORK_CAPSULE_DIGEST_BYTES 32U
+#define CXLFORK_CAPSULE_MANIFEST_VERSION 1U
+#define CXLFORK_CAPSULE_F_FIXED_CODE (1U << 0)
+#define CXLFORK_CAPSULE_F_FIXED_ARENA (1U << 1)
+#define CXLFORK_CAPSULE_F_COOPERATIVE_YIELD (1U << 2)
+#define CXLFORK_CAPSULE_F_KNOWN_MASK ((1U << 3) - 1)
+
+/*
+ * A sealed identity and activation record for the supported capsule subset.
+ * It describes a cooperative userspace continuation, not arbitrary process
+ * state and not FULL_PRIVATE_STATE.
+ */
+struct cxlfork_capsule_manifest_v4 {
+	__u32 manifest_version;
+	__u32 flags;
+	__u8 runtime_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u8 image_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u64 context_va;
+	__u64 trampoline_ip;
+	__u64 activation_sp;
+	__u64 continuation_cookie;
+	__u64 state_checksum;
+	__u64 reserved[4];
+};
 
 #define CXLFORK_PTE_MARK_CLEAR_ACCESSED (1ULL << 0)
 #define CXLFORK_PTE_MARK_CLEAR_DIRTY (1ULL << 1)
@@ -394,6 +426,20 @@ struct cxlfork_restore_stats_v3 {
 	__u64 validated_ptes;
 };
 
+/*
+ * total_ns is exactly core.total_ns + capsule_validate_ns +
+ * activation_commit_ns.  The nested V3 buckets remain mutually exclusive.
+ */
+struct cxlfork_restore_stats_v4 {
+	__u64 supported_mask;
+	__u64 valid_mask;
+	__u64 path_mask;
+	__u64 total_ns;
+	__u64 capsule_validate_ns;
+	__u64 activation_commit_ns;
+	struct cxlfork_restore_stats_v3 core;
+};
+
 struct cxlfork_prepare_v2 {
 	__u32 size;
 	__u16 abi_version;
@@ -459,6 +505,70 @@ struct cxlfork_call_stats_v3 {
 	__u64 generation;
 	__u64 restore_id;
 	struct cxlfork_restore_stats_v3 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_prepare_capsule_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 scan_start;
+	__u64 scan_end;
+	__u64 flags;
+	__aligned_u64 regions_ptr;
+	__u32 region_capacity;
+	__u32 region_count;
+	struct cxlfork_capsule_manifest_v4 manifest;
+	__u64 generation;
+	__u64 slot;
+	__u64 total_pages;
+	__u64 page_checksum;
+	struct cxlfork_prepare_stats_v2 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_resume_capsule_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 flags;
+	__aligned_u64 regions_ptr;
+	__u32 region_capacity;
+	__u32 region_count;
+	__u8 runtime_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u8 image_sha256[CXLFORK_CAPSULE_DIGEST_BYTES];
+	__u64 restore_id;
+	__u64 total_pages;
+	__u64 page_checksum;
+	struct cxlfork_restore_stats_v4 stats;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_inspect_capsule_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u32 state;
+	__u32 reader_count;
+	__u64 total_pages;
+	__u64 page_checksum;
+	struct cxlfork_capsule_manifest_v4 manifest;
+	__u64 reserved1[4];
+};
+
+struct cxlfork_call_stats_v4 {
+	__u32 size;
+	__u16 abi_version;
+	__u16 reserved0;
+	__u64 key;
+	__u64 generation;
+	__u64 restore_id;
+	struct cxlfork_restore_stats_v4 stats;
 	__u64 reserved1[4];
 };
 
@@ -715,5 +825,9 @@ struct cxlfork_release {
 #define CXLFORK_GET_CALL_STATS_V2 _IOWR(CXLFORK_IOC_MAGIC, 14, struct cxlfork_v2_header)
 #define CXLFORK_GUP_PROBE_V2 _IOWR(CXLFORK_IOC_MAGIC, 15, struct cxlfork_v2_header)
 #define CXLFORK_GET_CALL_STATS_V3 _IOWR(CXLFORK_IOC_MAGIC, 16, struct cxlfork_v2_header)
+#define CXLFORK_PREPARE_CAPSULE_V4 _IOWR(CXLFORK_IOC_MAGIC, 17, struct cxlfork_v2_header)
+#define CXLFORK_RESUME_CAPSULE_V4 _IOWR(CXLFORK_IOC_MAGIC, 18, struct cxlfork_v2_header)
+#define CXLFORK_INSPECT_CAPSULE_V4 _IOWR(CXLFORK_IOC_MAGIC, 19, struct cxlfork_v2_header)
+#define CXLFORK_GET_CALL_STATS_V4 _IOWR(CXLFORK_IOC_MAGIC, 20, struct cxlfork_v2_header)
 
 #endif /* _UAPI_LINUX_CXLFORK_H */

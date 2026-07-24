@@ -40,6 +40,16 @@ _Static_assert(sizeof(struct cxlfork_query_caps_v2) == 128,
 	       "unexpected cxlfork_query_caps_v2 size");
 _Static_assert(sizeof(struct cxlfork_gup_probe_v2) == 56,
 	       "unexpected cxlfork_gup_probe_v2 size");
+_Static_assert(sizeof(struct cxlfork_capsule_manifest_v4) == 144,
+	       "unexpected cxlfork_capsule_manifest_v4 size");
+_Static_assert(sizeof(struct cxlfork_prepare_capsule_v4) == 384,
+	       "unexpected cxlfork_prepare_capsule_v4 size");
+_Static_assert(sizeof(struct cxlfork_resume_capsule_v4) == 472,
+	       "unexpected cxlfork_resume_capsule_v4 size");
+_Static_assert(sizeof(struct cxlfork_inspect_capsule_v4) == 224,
+	       "unexpected cxlfork_inspect_capsule_v4 size");
+_Static_assert(sizeof(struct cxlfork_call_stats_v4) == 368,
+	       "unexpected cxlfork_call_stats_v4 size");
 
 static uint64_t fnv_bytes(uint64_t hash, const void *data, size_t bytes)
 {
@@ -83,6 +93,11 @@ static int run_abi_tests(void)
 		.generation = 1,
 		.restore_id = 1,
 	};
+	struct cxlfork_inspect_capsule_v4 inspect_v4 = {
+		.size = sizeof(inspect_v4),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.key = 1,
+	};
 	uint64_t required;
 	uint64_t forbidden;
 	unsigned int nr = 1;
@@ -98,7 +113,7 @@ static int run_abi_tests(void)
 		       CXLFORK_DEVICE, strerror(errno));
 		return KSFT_SKIP;
 	}
-	printf("1..14\n");
+	printf("1..17\n");
 
 	ret = ioctl(fd, CXLFORK_QUERY_CAPS_V2, &caps);
 	ok = ret == 0;
@@ -120,7 +135,8 @@ static int run_abi_tests(void)
 		CXLFORK_CAP_USER_THREAD_CONTEXT_RESUME |
 		CXLFORK_CAP_GLOBAL_FILE_STATE |
 		CXLFORK_CAP_A_BIT_HYBRID |
-		CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS;
+		CXLFORK_CAP_EXCLUSIVE_RESTORE_STATS |
+		CXLFORK_CAP_COOPERATIVE_FUNCTION_CONTINUATION;
 	ok = (caps.capabilities & required) == required;
 	tap(ok, nr++, "image reconstruction capabilities are explicit");
 	failed += !ok;
@@ -146,6 +162,29 @@ static int run_abi_tests(void)
 	ret = ioctl(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3);
 	ok = ret == -1 && errno == EINVAL;
 	tap(ok, nr++, "GET_CALL_STATS_V3 rejects reserved tail");
+	failed += !ok;
+
+	inspect_v4.size++;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect_v4);
+	ok = ret == -1 && errno == EINVAL;
+	tap(ok, nr++, "INSPECT_CAPSULE_V4 rejects wrong size");
+	failed += !ok;
+	inspect_v4.size = sizeof(inspect_v4);
+
+	inspect_v4.abi_version = CXLFORK_ABI_VERSION_V3;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect_v4);
+	ok = ret == -1 && errno == EPROTONOSUPPORT;
+	tap(ok, nr++, "INSPECT_CAPSULE_V4 rejects v3 version");
+	failed += !ok;
+	inspect_v4.abi_version = CXLFORK_ABI_VERSION_V4;
+
+	inspect_v4.reserved1[0] = 1;
+	errno = 0;
+	ret = ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect_v4);
+	ok = ret == -1 && errno == EINVAL;
+	tap(ok, nr++, "INSPECT_CAPSULE_V4 rejects reserved tail");
 	failed += !ok;
 
 	forbidden = CXLFORK_CAP_FULL_PRIVATE_STATE |

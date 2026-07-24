@@ -13,7 +13,7 @@
  */
 #define CXLFORK_NAME "cxlfork"
 #define CXLFORK_DESC_MAGIC 0x43584c464f524b31ULL /* "CXLFORK1" */
-#define CXLFORK_DESC_VERSION 1
+#define CXLFORK_DESC_VERSION 2
 #define CXLFORK_DATA_OFFSET SZ_2M          /* CXL window 前 2MB 预留，slot 从这里开始。 */
 #define CXLFORK_LITMUS_OFFSET PAGE_SIZE    /* 预留区内的独立跨 VM memory-order test page。 */
 #define CXLFORK_LITMUS_MAGIC 0x43584c4c49544d32ULL /* "CXLLITM2" */
@@ -261,6 +261,8 @@ struct cxlfork_desc {
 	u64 extent_count;
 	u64 extent_bitmap_words;
 	u64 allocated_extents;
+	u64 capsule_manifest_valid;
+	struct cxlfork_capsule_manifest_v4 capsule_manifest;
 	u64 extent_bitmap[CXLFORK_EXTENT_BITMAP_WORDS];
 	struct cxlfork_task_state task_state;
 	struct cxlfork_mm_state mm_state;

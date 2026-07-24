@@ -88,6 +88,21 @@ _Static_assert(sizeof(struct capsule_state) < CAPSULE_BYTES -
 
 static struct capsule_ctx control_ctx;
 static struct capsule_ctx activation_ctx;
+static struct cxlfork_resume_capsule_v4 resume_result;
+static struct cxlfork_region resume_regions[CXLFORK_MAX_REGIONS];
+static int restore_device_fd = -1;
+static const uint8_t runtime_sha256[CXLFORK_CAPSULE_DIGEST_BYTES] = {
+	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+	0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+	0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+};
+static const uint8_t image_sha256[CXLFORK_CAPSULE_DIGEST_BYTES] = {
+	0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+	0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+	0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+	0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+};
 
 static struct capsule_state *capsule(void)
 {
@@ -344,6 +359,10 @@ static void capsule_restore_trampoline(void)
 		.abi_version = CXLFORK_ABI_VERSION_V2,
 		.address = (uintptr_t)CAPSULE_BASE,
 	};
+	struct cxlfork_call_stats_v4 call_stats = {
+		.size = sizeof(call_stats),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+	};
 	int fd;
 
 	if (state->magic != CAPSULE_MAGIC ||
@@ -352,6 +371,10 @@ static void capsule_restore_trampoline(void)
 	    state->continuation_cookie != continuation_cookie(state)) {
 		log_line("capsule-k0 event=trampoline-validate verify=fail\n");
 		_exit(93);
+	}
+	if (restore_device_fd >= 0) {
+		close(restore_device_fd);
+		restore_device_fd = -1;
 	}
 	inspect.key = state->key;
 	fd = open_device();
@@ -372,7 +395,6 @@ static void capsule_restore_trampoline(void)
 			close(fd);
 		_exit(95);
 	}
-	close(fd);
 	log_line("capsule-k0 event=shared-leaf-proof key=%" PRIu64
 		 " generation=%" PRIu64 " shared_leaf_pfn=%" PRIu64
 		 " current_pmd_pfn=%" PRIu64 " shared_pfn=%" PRIu64
@@ -380,6 +402,44 @@ static void capsule_restore_trampoline(void)
 		 state->key, inspect.generation, inspect.shared_leaf_pfn,
 		 inspect.current_pmd_pfn, inspect.shared_pfn,
 		 inspect.current_pfn);
+	call_stats.key = state->key;
+	call_stats.generation = resume_result.generation;
+	call_stats.restore_id = resume_result.restore_id;
+	if (ioctl(fd, CXLFORK_GET_CALL_STATS_V4, &call_stats) ||
+	    call_stats.stats.total_ns != resume_result.stats.total_ns) {
+		log_line("capsule-k0 event=context-after-fd-close key=%" PRIu64
+			 " restore_id=%" PRIu64 " verify=fail\n",
+			 state->key, resume_result.restore_id);
+		close(fd);
+		_exit(97);
+	}
+	log_line("capsule-k0 event=context-after-fd-close key=%" PRIu64
+		 " restore_id=%" PRIu64 " total_ns=%" PRIu64
+		 " verify=ok\n",
+		 state->key, resume_result.restore_id,
+		 call_stats.stats.total_ns);
+	close(fd);
+	if (resume_result.stats.total_ns !=
+	    resume_result.stats.core.total_ns +
+	    resume_result.stats.capsule_validate_ns +
+	    resume_result.stats.activation_commit_ns) {
+		log_line("capsule-k0 event=v4-stats total_ns=%" PRIu64
+			 " core_ns=%" PRIu64 " capsule_validate_ns=%" PRIu64
+			 " activation_commit_ns=%" PRIu64 " verify=fail\n",
+			 resume_result.stats.total_ns,
+			 resume_result.stats.core.total_ns,
+			 resume_result.stats.capsule_validate_ns,
+			 resume_result.stats.activation_commit_ns);
+		_exit(96);
+	}
+	log_line("capsule-k0 event=v4-stats restore_id=%" PRIu64
+		 " total_ns=%" PRIu64 " core_ns=%" PRIu64
+		 " capsule_validate_ns=%" PRIu64
+		 " activation_commit_ns=%" PRIu64 " verify=ok\n",
+		 resume_result.restore_id, resume_result.stats.total_ns,
+		 resume_result.stats.core.total_ns,
+		 resume_result.stats.capsule_validate_ns,
+		 resume_result.stats.activation_commit_ns);
 	capsule_swap(&activation_ctx, &state->continuation);
 	log_line("capsule-k0 event=trampoline-returned verify=fail\n");
 	_exit(94);
@@ -387,7 +447,13 @@ static void capsule_restore_trampoline(void)
 
 static int prepare_capsule(uint64_t key, bool corrupt_cookie)
 {
-	struct cxlfork_checkpoint op = { 0 };
+	struct cxlfork_region regions[CXLFORK_MAX_REGIONS];
+	struct cxlfork_prepare_capsule_v4 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.regions_ptr = (uintptr_t)regions,
+		.region_capacity = CXLFORK_MAX_REGIONS,
+	};
 	struct capsule_state *state;
 	uintptr_t stack_top;
 	int fd;
@@ -426,12 +492,22 @@ static int prepare_capsule(uint64_t key, bool corrupt_cookie)
 	op.key = key;
 	op.scan_start = (uintptr_t)CAPSULE_BASE;
 	op.scan_end = (uintptr_t)CAPSULE_BASE + CAPSULE_BYTES;
-	op.flags = CXLFORK_F_USER_THREAD_STATE;
-	op.thread_state.ip = (uintptr_t)capsule_restore_trampoline;
-	op.thread_state.sp = (uintptr_t)ACTIVATION_BASE + ACTIVATION_BYTES - 8;
-	op.thread_state.flags = 0x202;
-	if (ioctl(fd, CXLFORK_FORK_PREPARE, &op)) {
-		perror("FORK_PREPARE capsule");
+	op.manifest.manifest_version = CXLFORK_CAPSULE_MANIFEST_VERSION;
+	op.manifest.flags = CXLFORK_CAPSULE_F_FIXED_CODE |
+		CXLFORK_CAPSULE_F_FIXED_ARENA |
+		CXLFORK_CAPSULE_F_COOPERATIVE_YIELD;
+	memcpy(op.manifest.runtime_sha256, runtime_sha256,
+	       sizeof(runtime_sha256));
+	memcpy(op.manifest.image_sha256, image_sha256, sizeof(image_sha256));
+	op.manifest.context_va = (uintptr_t)&state->continuation;
+	op.manifest.trampoline_ip =
+		(uintptr_t)capsule_restore_trampoline;
+	op.manifest.activation_sp =
+		(uintptr_t)ACTIVATION_BASE + ACTIVATION_BYTES - 8;
+	op.manifest.continuation_cookie = state->continuation_cookie;
+	op.manifest.state_checksum = state->business_checksum;
+	if (ioctl(fd, CXLFORK_PREPARE_CAPSULE_V4, &op)) {
+		perror("PREPARE_CAPSULE_V4");
 		close(fd);
 		return 1;
 	}
@@ -439,24 +515,28 @@ static int prepare_capsule(uint64_t key, bool corrupt_cookie)
 		 " source_pid=%" PRIu64 " source_inits=%" PRIu64
 		 " invocation=%" PRIu64 " continuation_sp=%016" PRIx64
 		 " continuation_ip=%016" PRIx64 " cookie=%016" PRIx64
-		 " checksum=%016" PRIx64 " pages=%" PRIu64
+		 " checksum=%016" PRIx64 " generation=%" PRIu64
+		 " pages=%" PRIu64
 		 " cookie_state=%s verify=ok\n",
 		 key, state->source_pid, state->source_initializations,
 		 state->invocation, state->continuation.rsp,
 		 state->continuation.rip, state->continuation_cookie,
-		 state->business_checksum, (uint64_t)op.total_pages,
+		 state->business_checksum, op.generation, op.total_pages,
 		 corrupt_cookie ? "corrupt-for-negative-test" : "valid");
 	close(fd);
 	return 0;
 }
 
-static int restore_capsule(uint64_t key, bool expect_conflict)
+static int restore_capsule(uint64_t key, bool expect_conflict,
+			   bool runtime_mismatch, bool validate_full)
 {
-	struct cxlfork_restore op = { 0 };
+	struct cxlfork_inspect_capsule_v4 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.key = key,
+	};
 	int fd;
 
-	if (expect_conflict && map_capsule_arena())
-		return 1;
 	if (map_activation_stack())
 		return 1;
 	fd = open_device();
@@ -464,22 +544,52 @@ static int restore_capsule(uint64_t key, bool expect_conflict)
 		perror("open " CXLFORK_DEVICE);
 		return 4;
 	}
-	op.key = key;
-	op.flags = CXLFORK_F_SHARED_COW |
-		CXLFORK_F_APPLY_THREAD_STATE;
-	if (ioctl(fd, CXLFORK_FORK_RESUME, &op)) {
+	if (ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect)) {
+		perror("INSPECT_CAPSULE_V4");
+		close(fd);
+		return 1;
+	}
+	if (expect_conflict && map_capsule_arena()) {
+		close(fd);
+		return 1;
+	}
+	memset(&resume_result, 0, sizeof(resume_result));
+	resume_result.size = sizeof(resume_result);
+	resume_result.abi_version = CXLFORK_ABI_VERSION_V4;
+	resume_result.key = key;
+	resume_result.generation = inspect.generation;
+	resume_result.flags = CXLFORK_F_SHARED_COW;
+	if (validate_full)
+		resume_result.flags |= CXLFORK_F_VALIDATE_FULL;
+	resume_result.regions_ptr = (uintptr_t)resume_regions;
+	resume_result.region_capacity = CXLFORK_MAX_REGIONS;
+	memcpy(resume_result.runtime_sha256, runtime_sha256,
+	       sizeof(runtime_sha256));
+	memcpy(resume_result.image_sha256, image_sha256,
+	       sizeof(image_sha256));
+	if (runtime_mismatch)
+		resume_result.runtime_sha256[0] ^= 0xff;
+	restore_device_fd = fd;
+	if (ioctl(fd, CXLFORK_RESUME_CAPSULE_V4, &resume_result)) {
+		restore_device_fd = -1;
 		if (expect_conflict && errno == EEXIST) {
 			log_line("capsule-k0 event=address-conflict key=%" PRIu64
 				 " errno=EEXIST verify=ok\n", key);
 			close(fd);
 			return 0;
 		}
-		perror("FORK_RESUME capsule");
+		if (runtime_mismatch && errno == ENOEXEC) {
+			log_line("capsule-k0 event=runtime-mismatch key=%" PRIu64
+				 " errno=ENOEXEC verify=ok\n", key);
+			close(fd);
+			return 0;
+		}
+		perror("RESUME_CAPSULE_V4");
 		close(fd);
 		return 1;
 	}
-	if (expect_conflict) {
-		fprintf(stderr, "capsule restore ignored an address conflict\n");
+	if (expect_conflict || runtime_mismatch) {
+		fprintf(stderr, "capsule restore ignored a negative test\n");
 		return 1;
 	}
 	fprintf(stderr, "capsule restore returned without entering trampoline\n");
@@ -488,7 +598,16 @@ static int restore_capsule(uint64_t key, bool expect_conflict)
 
 static int release_capsule(uint64_t key)
 {
-	struct cxlfork_release op = { .key = key };
+	struct cxlfork_inspect_capsule_v4 inspect = {
+		.size = sizeof(inspect),
+		.abi_version = CXLFORK_ABI_VERSION_V4,
+		.key = key,
+	};
+	struct cxlfork_release_v2 op = {
+		.size = sizeof(op),
+		.abi_version = CXLFORK_ABI_VERSION_V2,
+		.key = key,
+	};
 	int fd;
 
 	fd = open_device();
@@ -496,8 +615,14 @@ static int release_capsule(uint64_t key)
 		perror("open " CXLFORK_DEVICE);
 		return 4;
 	}
-	if (ioctl(fd, CXLFORK_RELEASE, &op)) {
-		perror("CXLFORK_RELEASE capsule");
+	if (ioctl(fd, CXLFORK_INSPECT_CAPSULE_V4, &inspect)) {
+		perror("INSPECT_CAPSULE_V4 release");
+		close(fd);
+		return 1;
+	}
+	op.generation = inspect.generation;
+	if (ioctl(fd, CXLFORK_RELEASE_V2, &op)) {
+		perror("RELEASE_V2 capsule");
 		close(fd);
 		return 1;
 	}
@@ -527,7 +652,8 @@ int main(int argc, char **argv)
 	if (argc != 3 || parse_key(argv[2], &key)) {
 		fprintf(stderr,
 			"usage: %s prepare|prepare-corrupt|restore|"
-			"restore-conflict|release KEY\n",
+			"restore-full|restore-conflict|"
+			"restore-runtime-mismatch|release KEY\n",
 			argv[0]);
 		return 2;
 	}
@@ -536,9 +662,13 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "prepare-corrupt"))
 		return prepare_capsule(key, true);
 	if (!strcmp(argv[1], "restore"))
-		return restore_capsule(key, false);
+		return restore_capsule(key, false, false, false);
+	if (!strcmp(argv[1], "restore-full"))
+		return restore_capsule(key, false, false, true);
 	if (!strcmp(argv[1], "restore-conflict"))
-		return restore_capsule(key, true);
+		return restore_capsule(key, true, false, false);
+	if (!strcmp(argv[1], "restore-runtime-mismatch"))
+		return restore_capsule(key, false, true, false);
 	if (!strcmp(argv[1], "release"))
 		return release_capsule(key);
 	fprintf(stderr, "unknown operation: %s\n", argv[1]);
