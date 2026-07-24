@@ -21,14 +21,14 @@
 #define CXLFORK_CATALOG_MAGIC_READY 0x43584c4341545634ULL /* "CXLCATV4" */
 #define CXLFORK_CATALOG_VERSION 1ULL
 #define CXLFORK_LITMUS_MAGIC 0x43584c4c49544d32ULL /* "CXLLITM2" */
-#define CXLFORK_MAX_SLOTS 7                /* key%MAX_SLOTS 选择 slot，4G CXL window 下保留 7 个大 slot。 */
-#define CXLFORK_SLOT_BYTES SZ_512M         /* 单个 checkpoint slot 的最大容量。 */
+#define CXLFORK_MAX_SLOTS 14               /* 16 GiB paper profile 的有界 slot 上限。 */
+#define CXLFORK_SLOT_BYTES SZ_1G           /* 支持约 630 MiB 的论文形状 workload。 */
 #define CXLFORK_EXTENT_SHIFT PAGE_SHIFT    /* Phase 12: slot 内 4KiB extent bitmap。 */
 #define CXLFORK_EXTENT_BYTES (1UL << CXLFORK_EXTENT_SHIFT)
 #define CXLFORK_EXTENTS_PER_SLOT (CXLFORK_SLOT_BYTES >> CXLFORK_EXTENT_SHIFT)
 #define CXLFORK_EXTENT_BITMAP_WORDS (CXLFORK_EXTENTS_PER_SLOT / 64)
 #define CXLFORK_MAX_REGIONS 64             /* legacy ioctl 当前最多回填的 VMA/region 数。 */
-#define CXLFORK_MAX_PTES 131072            /* 一次 checkpoint 最多记录的叶子 PTE 数。 */
+#define CXLFORK_MAX_PTES 262144            /* 单 slot 最多记录 1 GiB/4 KiB 页。 */
 #define CXLFORK_MAX_PRIVATE_PTRS 12        /* rebase image 中可跟踪的内部指针数量。 */
 #define CXLFORK_MAX_PT_PAGE_IMAGES 4096    /* 页表页镜像上限，用于直接 PTE attach 实验。 */
 #define CXLFORK_PT_TREE_MAGIC 0x43584c5054545245ULL /* "CXLPTTRE" */

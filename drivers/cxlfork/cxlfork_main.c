@@ -586,6 +586,18 @@ static u64 slot_offset(u64 slot)
 	return CXLFORK_DATA_OFFSET + slot * CXLFORK_SLOT_BYTES;
 }
 
+static u32 cxlfork_nr_slots(void)
+{
+	u64 available;
+	u64 slots;
+
+	if (cxl_size <= CXLFORK_DATA_OFFSET)
+		return 0;
+	available = cxl_size - CXLFORK_DATA_OFFSET;
+	slots = available / CXLFORK_SLOT_BYTES;
+	return min_t(u64, slots, CXLFORK_MAX_SLOTS);
+}
+
 static u64 slot_payload_offset(u64 slot)
 {
 	return slot_offset(slot) + PAGE_ALIGN(sizeof(struct cxlfork_desc));
@@ -599,9 +611,14 @@ static struct cxlfork_desc *slot_desc(u64 slot)
 static int key_to_slot(u64 key)
 {
 	/* 当前原型用 key 取模选择 slot，实验脚本需避免活跃 key 复用。 */
-	u64 slot = key % CXLFORK_MAX_SLOTS;
-	u64 off = slot_offset(slot);
+	u32 nr_slots = cxlfork_nr_slots();
+	u64 slot;
+	u64 off;
 
+	if (!nr_slots)
+		return -ENOSPC;
+	slot = key % nr_slots;
+	off = slot_offset(slot);
 	if (off + CXLFORK_SLOT_BYTES > cxl_size)
 		return -ENOSPC;
 	return slot;
@@ -616,7 +633,7 @@ static bool cxlfork_slot_range_valid(const struct cxlfork_desc *desc,
 	u64 start;
 	u64 end;
 
-	if (!desc || desc->slot >= CXLFORK_MAX_SLOTS || !bytes)
+	if (!desc || desc->slot >= cxlfork_nr_slots() || !bytes)
 		return false;
 	start = slot_offset(desc->slot);
 	end = start + CXLFORK_SLOT_BYTES;
@@ -628,7 +645,7 @@ static bool cxlfork_slot_range_valid(const struct cxlfork_desc *desc,
 static bool cxlfork_desc_matches_slot(const struct cxlfork_desc *desc,
 				      u64 slot)
 {
-	if (!desc || slot >= CXLFORK_MAX_SLOTS)
+	if (!desc || slot >= cxlfork_nr_slots())
 		return false;
 	if (READ_ONCE(desc->magic) == CXLFORK_DESC_MAGIC &&
 	    READ_ONCE(desc->version) == CXLFORK_DESC_VERSION &&
@@ -648,7 +665,7 @@ static bool cxlfork_slot_has_room(u64 slot, u64 off, u64 bytes)
 	u64 start;
 	u64 end;
 
-	if (slot >= CXLFORK_MAX_SLOTS || !bytes)
+	if (slot >= cxlfork_nr_slots() || !bytes)
 		return false;
 	start = slot_offset(slot);
 	end = start + CXLFORK_SLOT_BYTES;
@@ -729,7 +746,7 @@ static int cxlfork_compute_checksums(const struct cxlfork_desc *desc,
 	u64 leaf_bytes;
 	u64 i;
 
-	if (!desc || desc->slot >= CXLFORK_MAX_SLOTS ||
+	if (!desc || desc->slot >= cxlfork_nr_slots() ||
 	    desc->nr_regions > desc->region_table_entries ||
 	    desc->nr_ptes > desc->pte_table_entries ||
 	    desc->total_pages != desc->nr_ptes)
@@ -5108,7 +5125,7 @@ static int cxlfork_ioctl_query_caps_v2(struct cxlfork_query_caps_v2 __user *uarg
 	caps.slot_bytes = CXLFORK_SLOT_BYTES;
 	caps.data_offset = CXLFORK_DATA_OFFSET;
 	caps.page_size = PAGE_SIZE;
-	caps.max_slots = CXLFORK_MAX_SLOTS;
+	caps.max_slots = cxlfork_nr_slots();
 	caps.max_regions = CXLFORK_MAX_REGIONS;
 	caps.max_ptes = CXLFORK_MAX_PTES;
 	caps.descriptor_version = CXLFORK_DESC_VERSION;
@@ -6134,8 +6151,7 @@ static int __init cxlfork_init(void)
 	/* 模块初始化：映射共享 CXL window，并注册 /dev/cxlfork 字符设备。 */
 	int ret;
 
-	if (cxl_size < (u64)CXLFORK_DATA_OFFSET +
-		       (u64)CXLFORK_MAX_SLOTS * (u64)CXLFORK_SLOT_BYTES)
+	if (!cxlfork_nr_slots())
 		return -EINVAL;
 
 	cxlfork_cxl = ioremap_cache(cxl_phys, cxl_size);
