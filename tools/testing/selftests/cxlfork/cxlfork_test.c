@@ -1358,6 +1358,7 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	unsigned char *anon;
 	uint64_t generation1;
 	uint64_t restore_id;
+	uint64_t prepare_exclusive_ns;
 	uint64_t exclusive_ns;
 	size_t page = getpagesize();
 	uint32_t i;
@@ -1393,6 +1394,17 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	    !prepare.stats.metadata_build_ns || !prepare.stats.checksum_seal_ns ||
 	    !prepare.stats.publish_ns) {
 		fprintf(stderr, "PREPARE_V2 measurement breakdown invalid\n");
+		failed++;
+	}
+	prepare_exclusive_ns = prepare.stats.lock_wait_ns +
+		prepare.stats.lifecycle_ns + prepare.stats.vma_preflight_ns +
+		prepare.stats.pte_walk_ns + prepare.stats.gup_ns +
+		prepare.stats.page_copy_ns + prepare.stats.pte_recheck_ns +
+		prepare.stats.metadata_build_ns + prepare.stats.checksum_seal_ns +
+		prepare.stats.publish_ns + prepare.stats.other_ns;
+	if (prepare_exclusive_ns != prepare.stats.total_ns) {
+		fprintf(stderr,
+			"PREPARE_V2 exclusive breakdown does not equal total\n");
 		failed++;
 	}
 	generation1 = prepare.generation;

@@ -2543,6 +2543,7 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	u64 slot;
 	u64 start_ns;
 	u64 lock_start;
+	u64 lock_wait_ns;
 	u64 lifecycle_start;
 	int ret = 0;
 	bool reopen_fds;
@@ -2577,6 +2578,7 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	start_ns = ktime_get_ns();
 	lock_start = ktime_get_ns();
 	mutex_lock(&cxlfork_lock);
+	lock_wait_ns = ktime_get_ns() - lock_start;
 	/* The checkpoint slot transition and descriptor initialization are the
 	 * lifecycle portion; lock wait is kept separate. */
 	lifecycle_start = ktime_get_ns();
@@ -2612,7 +2614,7 @@ static int cxlfork_do_checkpoint(struct cxlfork_checkpoint *op,
 	desc->data_offset = slot_payload_offset(slot);
 	}
 	data_off = desc->data_offset;
-	desc->lock_wait_ns = ktime_get_ns() - lock_start;
+	desc->lock_wait_ns = lock_wait_ns;
 	desc->lifecycle_ns = ktime_get_ns() - lifecycle_start;
 
 	mm = get_task_mm(current);
@@ -2879,7 +2881,27 @@ out_mmap_unlock:
 				  cxlfork_lifecycle_pack(CXLFORK_SLOT_READY, 0));
 			desc->publish_ns = ktime_get_ns() - publish_start;
 			if (v2) {
+				u64 accounted;
+
 				v2->stats.publish_ns = desc->publish_ns;
+				/* Complete the top-level interval only after the slot is
+				 * visible.  Everything not covered by an explicitly timed,
+				 * exclusive stage is reported as other_ns instead of being
+				 * silently dropped from the breakdown. */
+				v2->stats.total_ns = ktime_get_ns() - start_ns;
+				accounted = v2->stats.lock_wait_ns +
+					v2->stats.lifecycle_ns +
+					v2->stats.vma_preflight_ns +
+					v2->stats.pte_walk_ns +
+					v2->stats.gup_ns +
+					v2->stats.page_copy_ns +
+					v2->stats.pte_recheck_ns +
+					v2->stats.metadata_build_ns +
+					v2->stats.checksum_seal_ns +
+					v2->stats.publish_ns;
+				v2->stats.other_ns = v2->stats.total_ns > accounted ?
+					v2->stats.total_ns - accounted : 0;
+				desc->create_ns = v2->stats.total_ns;
 				if (v2_uarg &&
 				    copy_to_user(v2_uarg, v2, sizeof(*v2)))
 					pr_warn("cxlfork: prepare stats publish copy failed\n");
