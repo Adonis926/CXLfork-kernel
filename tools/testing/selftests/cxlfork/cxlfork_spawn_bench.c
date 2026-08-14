@@ -916,7 +916,8 @@ static void csv_header(FILE *file)
 	fputs("mode,lane,request_id,rtt_ns,vm0_residual_ns,target_total_ns,"
 	      "request_dispatch_ns,activation_ns,exit_wait_ns,"
 	      "fork_parent_return_ns,fork_to_child_ns,child_setup_ns,"
-	      "restore_wall_ns,kernel_restore_ns,continuation_ns,"
+	      "restore_wall_ns,kernel_restore_ns,kernel_supported_mask,"
+	      "kernel_valid_mask,kernel_path_mask,continuation_ns,"
 	      "child_pid,source_pid,restore_id,input_checksum,output_checksum,"
 	      "shared_leaf_pfn,current_pmd_pfn,shared_data_pfn,current_data_pfn,"
 	      "kernel_core_ns,capsule_validate_ns,activation_commit_ns,"
@@ -950,6 +951,7 @@ static int write_samples(const char *prefix, uint16_t mode, unsigned int lane,
 		fprintf(file,
 			"%s,%u,%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%016" PRIx64 ",%016" PRIx64
@@ -966,7 +968,9 @@ static int write_samples(const char *prefix, uint16_t mode, unsigned int lane,
 			r->activation_ns, r->exit_wait_ns,
 			r->fork_parent_return_ns, r->fork_to_child_ns,
 			r->child_setup_ns, r->restore_wall_ns, U64(s->total_ns),
-			r->continuation_ns, r->child.child_pid,
+			U64(s->core.supported_mask), U64(s->core.valid_mask),
+			U64(s->core.path_mask), r->continuation_ns,
+			r->child.child_pid,
 			r->child.source_pid, r->child.restore_id,
 			r->child.input_checksum, r->child.output_checksum,
 			r->child.shared_leaf_pfn, r->child.current_pmd_pfn,
