@@ -1492,6 +1492,8 @@ static int run_v2_lifecycle_tests(uint64_t key)
 	for (i = 0; i < resume.region_count; i++)
 		if (munmap((void *)(uintptr_t)regions[i].start, regions[i].length))
 			failed++;
+	failed += v2_expect_errno(fd, CXLFORK_GET_CALL_STATS_V3, &stats_v3,
+				  ENOENT, "retired V2 restore context");
 	if (ioctl(fd, CXLFORK_RELEASE_V2, &release)) {
 		perror("RELEASE_V2 after unmap");
 		failed++;

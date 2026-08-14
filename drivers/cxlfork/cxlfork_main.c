@@ -405,8 +405,17 @@ static void cxlfork_restore_ctx_mapping_get(struct cxlfork_restore_ctx *ctx)
 
 static void cxlfork_restore_ctx_mapping_put(struct cxlfork_restore_ctx *ctx)
 {
-	if (atomic_dec_and_test(&ctx->mappings))
+	if (atomic_dec_and_test(&ctx->mappings)) {
 		cxlfork_restore_ctx_release_reader(ctx);
+		/*
+		 * Once the final restored VMA is gone, no future page fault can
+		 * need this context.  Keeping the xarray reference until slot
+		 * release makes restore-many workloads accumulate one context per
+		 * completed child, even though their slot reader is already gone.
+		 * Existing GET_CALL_STATS users are protected by their own kref.
+		 */
+		cxlfork_restore_ctx_unregister(ctx);
+	}
 	cxlfork_restore_ctx_put(ctx);
 }
 
