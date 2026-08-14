@@ -1018,18 +1018,24 @@ static int client_lane(const struct client_config *config, unsigned int lane)
 	char byte = 'R';
 	int fd;
 
-	if (!samples)
+	if (!samples) {
+		(void)write_full(config->ready_write, "F", 1);
 		return 1;
+	}
 	fd = connect_server(config->address, config->port);
-	if (fd < 0)
+	if (fd < 0) {
+		(void)write_full(config->ready_write, "F", 1);
 		return 1;
+	}
 	for (unsigned int i = 0; i < config->warmup; i++) {
 		struct sample ignored;
 
 		if (one_client_request(fd, config->mode, ++request_id,
 				       config->key, config->generation,
-				       config->checksum, i == 0, &ignored))
+				       config->checksum, i == 0, &ignored)) {
+			(void)write_full(config->ready_write, "F", 1);
 			return 1;
+		}
 		if (i == 0 && config->mode == MODE_CXLFORK) {
 			printf("event=shared-pfn-proof lane=%u shared_leaf_pfn=%" PRIu64
 			       " current_pmd_pfn=%" PRIu64
@@ -1094,9 +1100,12 @@ static int run_client(struct client_config *config)
 	}
 	close(ready_pipe[1]);
 	close(gate_pipe[0]);
-	for (unsigned int lane = 0; lane < config->lanes; lane++)
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
 		if (read_full(ready_pipe[0], &byte, 1))
 			return 1;
+		if (byte != 'R')
+			failed = 1;
+	}
 	close(ready_pipe[0]);
 	for (unsigned int lane = 0; lane < config->lanes; lane++)
 		if (write_full(gate_pipe[1], "G", 1))
