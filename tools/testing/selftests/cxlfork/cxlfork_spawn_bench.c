@@ -21,6 +21,7 @@
 #include <linux/cxlfork.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -62,9 +63,25 @@
 #define WIRE_VERSION 1U
 #define MODE_LOCAL 1U
 #define MODE_CXLFORK 2U
+#define MODE_CONTROL 3U
 #define REQ_DEBUG_PROOF (1U << 0)
+#define REQ_MINIMAL (1U << 1)
+#define REQ_DETAILED (1U << 2)
 #define MAX_OPS_PER_SECOND_PER_LANE 20000ULL
 #define U64(value) ((uint64_t)(value))
+
+#define SHM_MAGIC 0x4358534dU
+#define SHM_VERSION 1U
+#define SHM_STATE_READY 1U
+#define SHM_STATE_STOPPING 2U
+#define SHM_CACHELINE 64U
+#define SHM_MAX_LANES 1024U
+#define SHM_READY_TIMEOUT_NS (30ULL * 1000000000ULL)
+#define SHM_COMPLETION_DETAILED (1U << 0)
+#define SHM_LITMUS_MAGIC 0x43584c4dU
+#define SHM_LITMUS_READY 1U
+#define SHM_LITMUS_RMW 2U
+#define SHM_LITMUS_COMPLETE 3U
 
 struct capsule_ctx {
 	uint64_t r15, r14, r13, r12, rbx, rbp, rsp, rip;
@@ -145,8 +162,87 @@ struct sample {
 	struct wire_response response;
 };
 
+/*
+ * Each lane is single-producer/single-consumer in each direction.  The
+ * request and completion sequence counters deliberately occupy different
+ * cache lines.  A producer fills the payload first and publishes the new
+ * sequence with release ordering; the consumer observes it with acquire
+ * ordering before reading the payload.
+ */
+struct shm_request_slot {
+	uint64_t sequence;
+	struct wire_request request;
+	uint8_t padding[SHM_CACHELINE - sizeof(uint64_t) -
+			sizeof(struct wire_request)];
+} __attribute__((aligned(SHM_CACHELINE)));
+
+struct shm_completion_line {
+	uint64_t sequence;
+	uint64_t request_id;
+	int32_t status;
+	int32_t error_no;
+	uint32_t flags;
+	uint32_t reserved;
+	uint64_t target_total_ns;
+	uint8_t padding[SHM_CACHELINE - 40];
+} __attribute__((aligned(SHM_CACHELINE)));
+
+struct shm_lane {
+	struct shm_request_slot request;
+	struct shm_completion_line completion;
+	struct wire_response detail __attribute__((aligned(SHM_CACHELINE)));
+} __attribute__((aligned(SHM_CACHELINE)));
+
+struct shm_header {
+	uint32_t magic;
+	uint16_t version;
+	uint16_t mode;
+	uint32_t lanes;
+	uint32_t state;
+	uint64_t epoch;
+	uint64_t key;
+	uint64_t generation;
+	uint64_t checksum;
+	uint64_t stop;
+	uint8_t padding[SHM_CACHELINE - 56];
+} __attribute__((aligned(SHM_CACHELINE)));
+
+struct shm_layout {
+	struct shm_header header;
+	struct shm_lane lane[];
+};
+
+struct shm_mapping {
+	int fd;
+	void *address;
+	size_t bytes;
+	struct shm_layout *layout;
+};
+
+struct shm_litmus {
+	uint32_t magic;
+	uint32_t version;
+	uint64_t iterations;
+	uint64_t phase;
+	uint64_t sequence;
+	uint64_t payload;
+	uint64_t counter;
+	uint64_t server_done;
+	uint64_t client_done;
+	uint8_t padding[4096 - 64];
+};
+
+_Static_assert(sizeof(struct shm_litmus) == 4096,
+	       "shared-memory litmus must occupy one page");
+
 _Static_assert(sizeof(struct capsule_state) < CAPSULE_BYTES -
 	       CAPSULE_STACK_BYTES, "capsule state overlaps function stack");
+_Static_assert(sizeof(struct wire_request) == 48,
+	       "shared request cache-line layout changed");
+_Static_assert(sizeof(struct shm_request_slot) == SHM_CACHELINE,
+	       "shared request slot is not one cache line");
+_Static_assert(sizeof(struct shm_completion_line) == SHM_CACHELINE,
+	       "shared completion line is not one cache line");
 
 static struct capsule_ctx control_ctx;
 static struct capsule_ctx activation_ctx;
@@ -156,7 +252,10 @@ static struct child_result current_child;
 static int restore_device_fd = -1;
 static int child_result_fd = -1;
 static bool child_debug_proof;
+static bool child_minimal;
+static bool activation_stack_ready;
 static volatile sig_atomic_t server_stop;
+static volatile sig_atomic_t client_stop;
 
 /* Equality tokens for the fixed benchmark binary/configuration. */
 static const uint8_t runtime_sha256[CXLFORK_CAPSULE_DIGEST_BYTES] = {
@@ -179,6 +278,101 @@ static uint64_t now_ns(void)
 	if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts))
 		_exit(120);
 	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static const char *mode_name(uint16_t mode)
+{
+	switch (mode) {
+	case MODE_LOCAL:
+		return "local";
+	case MODE_CXLFORK:
+		return "cxlfork";
+	case MODE_CONTROL:
+		return "control";
+	default:
+		return "invalid";
+	}
+}
+
+static uint64_t load_acquire_u64(const uint64_t *value)
+{
+	return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+}
+
+static void store_release_u64(uint64_t *value, uint64_t new_value)
+{
+	__atomic_store_n(value, new_value, __ATOMIC_RELEASE);
+}
+
+static uint32_t load_acquire_u32(const uint32_t *value)
+{
+	return __atomic_load_n(value, __ATOMIC_ACQUIRE);
+}
+
+static void store_release_u32(uint32_t *value, uint32_t new_value)
+{
+	__atomic_store_n(value, new_value, __ATOMIC_RELEASE);
+}
+
+static void cpu_relax(void)
+{
+	__asm__ volatile("pause" ::: "memory");
+}
+
+static size_t shm_layout_bytes(unsigned int lanes)
+{
+	size_t bytes = offsetof(struct shm_layout, lane) +
+		lanes * sizeof(struct shm_lane);
+	long page_size = sysconf(_SC_PAGESIZE);
+
+	if (page_size <= 0)
+		page_size = 4096;
+	return (bytes + page_size - 1) & ~((size_t)page_size - 1);
+}
+
+static int map_shm(const char *path, uint64_t offset, unsigned int lanes,
+		   struct shm_mapping *mapping)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+
+	memset(mapping, 0, sizeof(*mapping));
+	mapping->fd = -1;
+	if (!lanes || lanes > SHM_MAX_LANES || page_size <= 0 ||
+	    offset % (uint64_t)page_size) {
+		errno = EINVAL;
+		return -1;
+	}
+	mapping->bytes = shm_layout_bytes(lanes);
+	mapping->fd = open(path, O_RDWR | O_CLOEXEC | O_SYNC);
+	if (mapping->fd < 0)
+		return -1;
+	mapping->address = mmap(NULL, mapping->bytes, PROT_READ | PROT_WRITE,
+				MAP_SHARED, mapping->fd, (off_t)offset);
+	if (mapping->address == MAP_FAILED) {
+		close(mapping->fd);
+		mapping->fd = -1;
+		return -1;
+	}
+	mapping->layout = mapping->address;
+	return 0;
+}
+
+static void unmap_shm(struct shm_mapping *mapping)
+{
+	if (mapping->address && mapping->address != MAP_FAILED)
+		munmap(mapping->address, mapping->bytes);
+	if (mapping->fd >= 0)
+		close(mapping->fd);
+	memset(mapping, 0, sizeof(*mapping));
+	mapping->fd = -1;
+}
+
+__attribute__((noreturn))
+static void benchmark_child_exit(int code)
+{
+	if (child_minimal)
+		exit(code);
+	_exit(code);
 }
 
 static struct capsule_state *capsule(void)
@@ -352,7 +546,7 @@ static void send_child_and_exit(int code)
 	if (child_result_fd >= 0)
 		(void)write_full(child_result_fd, &current_child,
 				 sizeof(current_child));
-	_exit(code);
+	benchmark_child_exit(code);
 }
 
 __attribute__((noreturn))
@@ -384,6 +578,35 @@ static void capsule_entry(void)
 	read_markers(state);
 	expected_cookie = continuation_cookie(state);
 	input_checksum = state->business_checksum;
+	if (child_minimal) {
+		if (state->magic != CAPSULE_MAGIC ||
+		    state->version != CAPSULE_VERSION ||
+		    state->stage != CAPSULE_QUIESCENT ||
+		    state->source_initializations != 1 ||
+		    state->invocation != SOURCE_INVOCATIONS ||
+		    state->continuation_cookie != expected_cookie ||
+		    state->marker_r12 != MARKER_R12 ||
+		    state->marker_r13 != MARKER_R13 ||
+		    state->marker_r14 != MARKER_R14 ||
+		    state->marker_r15 != MARKER_R15) {
+			current_child.status = -1;
+			current_child.error_no = EILSEQ;
+			if (child_result_fd >= 0)
+				current_child.proof_end_ns = now_ns();
+			send_child_and_exit(92);
+		}
+		if (child_result_fd >= 0) {
+			current_child.child_pid = getpid();
+			current_child.source_pid = state->source_pid;
+			current_child.restore_id = resume_result.restore_id;
+			current_child.input_checksum = input_checksum;
+			current_child.output_checksum = input_checksum;
+			current_child.stats = resume_result.stats;
+			current_child.proof_end_ns = now_ns();
+			current_child.status = 0;
+		}
+		send_child_and_exit(0);
+	}
 	if (state->magic != CAPSULE_MAGIC || state->version != CAPSULE_VERSION ||
 	    state->stage != CAPSULE_QUIESCENT ||
 	    state->source_initializations != 1 ||
@@ -417,7 +640,8 @@ static void capsule_restore_trampoline(void)
 {
 	struct capsule_state *state = capsule();
 
-	current_child.restore_end_ns = now_ns();
+	if (child_result_fd >= 0)
+		current_child.restore_end_ns = now_ns();
 	if (state->magic != CAPSULE_MAGIC || state->version != CAPSULE_VERSION ||
 	    state->stage != CAPSULE_QUIESCENT ||
 	    state->continuation_cookie != continuation_cookie(state)) {
@@ -458,7 +682,7 @@ static void capsule_restore_trampoline(void)
 		current_child.current_data_pfn = inspect.current_pfn;
 		close(fd);
 	}
-	if (resume_result.stats.total_ns !=
+	if (!child_minimal && resume_result.stats.total_ns !=
 	    resume_result.stats.core.total_ns +
 	    resume_result.stats.capsule_validate_ns +
 	    resume_result.stats.activation_commit_ns) {
@@ -589,18 +813,58 @@ static int init_local_state(uint64_t key, uint64_t expected_checksum)
 	return 0;
 }
 
-static void local_child(uint64_t expected_checksum, int output_fd)
+static void control_child(uint64_t expected_checksum, int output_fd,
+			  bool minimal)
+{
+	memset(&current_child, 0, sizeof(current_child));
+	child_result_fd = output_fd;
+	child_minimal = minimal;
+	if (output_fd >= 0) {
+		current_child.child_begin_ns = now_ns();
+		current_child.restore_begin_ns = current_child.child_begin_ns;
+		current_child.restore_end_ns = current_child.child_begin_ns;
+		current_child.proof_end_ns = current_child.child_begin_ns;
+		current_child.child_pid = getpid();
+		current_child.source_pid = getppid();
+		current_child.input_checksum = expected_checksum;
+		current_child.output_checksum = expected_checksum;
+		current_child.status = 0;
+	}
+	send_child_and_exit(0);
+}
+
+static void local_child(uint64_t expected_checksum, int output_fd,
+			bool minimal)
 {
 	struct capsule_state *state = capsule();
 
 	memset(&current_child, 0, sizeof(current_child));
 	child_result_fd = output_fd;
-	current_child.child_begin_ns = now_ns();
+	child_minimal = minimal;
+	if (output_fd >= 0)
+		current_child.child_begin_ns = now_ns();
 	current_child.restore_begin_ns = current_child.child_begin_ns;
 	current_child.restore_end_ns = current_child.child_begin_ns;
 	current_child.child_pid = getpid();
 	current_child.source_pid = state->source_pid;
 	current_child.input_checksum = state->business_checksum;
+	if (minimal) {
+		if (state->magic != CAPSULE_MAGIC ||
+		    state->stage != CAPSULE_QUIESCENT ||
+		    state->business_checksum != expected_checksum) {
+			current_child.status = -1;
+			current_child.error_no = EILSEQ;
+			if (output_fd >= 0)
+				current_child.proof_end_ns = now_ns();
+			send_child_and_exit(101);
+		}
+		if (output_fd >= 0) {
+			current_child.output_checksum = state->business_checksum;
+			current_child.proof_end_ns = now_ns();
+			current_child.status = 0;
+		}
+		send_child_and_exit(0);
+	}
 	if (state->magic != CAPSULE_MAGIC ||
 	    state->stage != CAPSULE_QUIESCENT ||
 	    state->business_checksum != expected_checksum ||
@@ -624,8 +888,10 @@ static void cxlfork_child(const struct wire_request *request, int output_fd)
 	memset(resume_regions, 0, sizeof(resume_regions));
 	child_result_fd = output_fd;
 	child_debug_proof = request->flags & REQ_DEBUG_PROOF;
-	current_child.child_begin_ns = now_ns();
-	if (map_activation_stack()) {
+	child_minimal = request->flags & REQ_MINIMAL;
+	if (output_fd >= 0)
+		current_child.child_begin_ns = now_ns();
+	if (!activation_stack_ready && map_activation_stack()) {
 		current_child.status = -1;
 		current_child.error_no = errno;
 		current_child.proof_end_ns = now_ns();
@@ -649,12 +915,14 @@ static void cxlfork_child(const struct wire_request *request, int output_fd)
 	       sizeof(runtime_sha256));
 	memcpy(resume_result.image_sha256, image_sha256,
 	       sizeof(image_sha256));
-	current_child.restore_begin_ns = now_ns();
+	if (output_fd >= 0)
+		current_child.restore_begin_ns = now_ns();
 	if (ioctl(restore_device_fd, CXLFORK_RESUME_CAPSULE_V4,
 		  &resume_result)) {
 		current_child.status = -1;
 		current_child.error_no = errno;
-		current_child.restore_end_ns = now_ns();
+		if (output_fd >= 0)
+			current_child.restore_end_ns = now_ns();
 		current_child.proof_end_ns = current_child.restore_end_ns;
 		close(restore_device_fd);
 		restore_device_fd = -1;
@@ -671,12 +939,11 @@ static uint64_t delta(uint64_t end, uint64_t begin)
 	return end >= begin ? end - begin : 0;
 }
 
-static int process_request(int socket_fd, uint16_t mode,
-			   uint64_t key, uint64_t generation,
-			   uint64_t checksum,
-			   const struct wire_request *request)
+static int build_detailed_response(struct wire_response *response,
+				   uint16_t mode, uint64_t key,
+				   uint64_t generation, uint64_t checksum,
+				   const struct wire_request *request)
 {
-	struct wire_response response;
 	int pipe_fd[2];
 	uint64_t begin_ns, fork_begin_ns, fork_return_ns, wait_end_ns;
 	pid_t child;
@@ -684,79 +951,89 @@ static int process_request(int socket_fd, uint16_t mode,
 	int status;
 	int read_status;
 
-	memset(&response, 0, sizeof(response));
-	response.magic = WIRE_MAGIC;
-	response.version = WIRE_VERSION;
-	response.mode = mode;
-	response.request_id = request->request_id;
+	memset(response, 0, sizeof(*response));
+	response->magic = WIRE_MAGIC;
+	response->version = WIRE_VERSION;
+	response->mode = mode;
+	response->request_id = request->request_id;
 	if (request->magic != WIRE_MAGIC || request->version != WIRE_VERSION ||
 	    request->mode != mode || request->key != key ||
 	    request->generation != generation ||
 	    request->expected_checksum != checksum) {
-		response.status = -1;
-		response.error_no = EINVAL;
-		return write_full(socket_fd, &response, sizeof(response));
+		response->status = -1;
+		response->error_no = EINVAL;
+		return 0;
 	}
 	begin_ns = now_ns();
 	if (pipe2(pipe_fd, O_CLOEXEC)) {
-		response.status = -1;
-		response.error_no = errno;
-		return write_full(socket_fd, &response, sizeof(response));
+		response->status = -1;
+		response->error_no = errno;
+		return 0;
 	}
 	fork_begin_ns = now_ns();
 	child = fork();
 	if (child == 0) {
 		close(pipe_fd[0]);
 		if (mode == MODE_LOCAL)
-			local_child(checksum, pipe_fd[1]);
+			local_child(checksum, pipe_fd[1],
+				    request->flags & REQ_MINIMAL);
+		else if (mode == MODE_CONTROL)
+			control_child(checksum, pipe_fd[1],
+				      request->flags & REQ_MINIMAL);
 		else
 			cxlfork_child(request, pipe_fd[1]);
 	}
 	fork_return_ns = now_ns();
 	close(pipe_fd[1]);
 	if (child < 0) {
-		response.status = -1;
-		response.error_no = errno;
+		response->status = -1;
+		response->error_no = errno;
 		close(pipe_fd[0]);
-		return write_full(socket_fd, &response, sizeof(response));
+		return 0;
 	}
-	read_status = read_full(pipe_fd[0], &response.child,
-				sizeof(response.child));
+	read_status = read_full(pipe_fd[0], &response->child,
+				sizeof(response->child));
 	close(pipe_fd[0]);
 	do {
 		waited = waitpid(child, &status, 0);
 	} while (waited < 0 && errno == EINTR);
 	wait_end_ns = now_ns();
-	response.target_total_ns = delta(wait_end_ns, begin_ns);
-	response.request_dispatch_ns = delta(fork_begin_ns, begin_ns);
-	response.fork_parent_return_ns = delta(fork_return_ns, fork_begin_ns);
-	response.fork_to_child_ns =
-		delta(response.child.child_begin_ns, fork_begin_ns);
-	response.child_setup_ns = delta(response.child.restore_begin_ns,
-					response.child.child_begin_ns);
-	response.restore_wall_ns = delta(response.child.restore_end_ns,
-					response.child.restore_begin_ns);
-	response.continuation_ns = delta(response.child.proof_end_ns,
-					response.child.restore_end_ns);
-	response.activation_ns = delta(response.child.proof_end_ns,
+	response->target_total_ns = delta(wait_end_ns, begin_ns);
+	response->request_dispatch_ns = delta(fork_begin_ns, begin_ns);
+	response->fork_parent_return_ns = delta(fork_return_ns, fork_begin_ns);
+	response->fork_to_child_ns =
+		delta(response->child.child_begin_ns, fork_begin_ns);
+	response->child_setup_ns = delta(response->child.restore_begin_ns,
+					 response->child.child_begin_ns);
+	response->restore_wall_ns = delta(response->child.restore_end_ns,
+					 response->child.restore_begin_ns);
+	response->continuation_ns = delta(response->child.proof_end_ns,
+					 response->child.restore_end_ns);
+	response->activation_ns = delta(response->child.proof_end_ns,
 					fork_begin_ns);
-	response.exit_wait_ns = delta(wait_end_ns, response.child.proof_end_ns);
+	response->exit_wait_ns = delta(wait_end_ns,
+				       response->child.proof_end_ns);
 	if (read_status || waited != child || !WIFEXITED(status) ||
 	    WEXITSTATUS(status) ||
-	    response.child.status ||
-	    response.child.input_checksum != checksum) {
-		response.status = -1;
-		response.error_no = response.child.error_no ?
-			response.child.error_no : ECHILD;
+	    response->child.status ||
+	    response->child.input_checksum != checksum) {
+		response->status = -1;
+		response->error_no = response->child.error_no ?
+			response->child.error_no : ECHILD;
 	} else {
-		response.status = 0;
+		response->status = 0;
 	}
-	return write_full(socket_fd, &response, sizeof(response));
+	return 0;
 }
 
 static void signal_stop(int signal_number __attribute__((unused)))
 {
 	server_stop = 1;
+}
+
+static void signal_client_stop(int signal_number __attribute__((unused)))
+{
+	client_stop = 1;
 }
 
 static int lane_handler(int socket_fd, uint16_t mode, uint64_t key,
@@ -771,8 +1048,11 @@ static int lane_handler(int socket_fd, uint16_t mode, uint64_t key,
 			return 0;
 		if (result < 0)
 			return 1;
-		if (process_request(socket_fd, mode, key, generation,
-				    checksum, &request))
+		struct wire_response response;
+
+		build_detailed_response(&response, mode, key, generation,
+					checksum, &request);
+		if (write_full(socket_fd, &response, sizeof(response)))
 			return 1;
 	}
 }
@@ -783,8 +1063,319 @@ static int parse_mode(const char *text, uint16_t *mode)
 		*mode = MODE_LOCAL;
 	else if (!strcmp(text, "cxlfork"))
 		*mode = MODE_CXLFORK;
+	else if (!strcmp(text, "control"))
+		*mode = MODE_CONTROL;
 	else
 		return -1;
+	return 0;
+}
+
+static bool request_matches(const struct wire_request *request,
+			    uint16_t mode, uint64_t key,
+			    uint64_t generation, uint64_t checksum)
+{
+	return request->magic == WIRE_MAGIC &&
+		request->version == WIRE_VERSION && request->mode == mode &&
+		request->key == key && request->generation == generation &&
+		request->expected_checksum == checksum;
+}
+
+static void build_minimal_completion(struct shm_completion_line *completion,
+				     uint16_t mode, uint64_t key,
+				     uint64_t generation, uint64_t checksum,
+				     const struct wire_request *request)
+{
+	pid_t child, waited;
+	int status;
+
+	completion->request_id = request->request_id;
+	completion->status = -1;
+	completion->error_no = 0;
+	completion->flags = 0;
+	completion->target_total_ns = 0;
+	if (!request_matches(request, mode, key, generation, checksum) ||
+	    !(request->flags & REQ_MINIMAL)) {
+		completion->error_no = EINVAL;
+		return;
+	}
+	child = fork();
+	if (child == 0) {
+		if (mode == MODE_CONTROL)
+			control_child(checksum, -1, true);
+		else if (mode == MODE_LOCAL)
+			local_child(checksum, -1, true);
+		else
+			cxlfork_child(request, -1);
+	}
+	if (child < 0) {
+		completion->error_no = errno;
+		return;
+	}
+	do {
+		waited = waitpid(child, &status, 0);
+	} while (waited < 0 && errno == EINTR);
+	if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status)) {
+		completion->error_no = ECHILD;
+		return;
+	}
+	completion->status = 0;
+}
+
+static int shm_lane_handler(struct shm_layout *layout, unsigned int lane,
+			    uint16_t mode, uint64_t key,
+			    uint64_t generation, uint64_t checksum)
+{
+	struct shm_lane *slot = &layout->lane[lane];
+	uint64_t seen = 0;
+
+	if (mode == MODE_CXLFORK) {
+		if (map_activation_stack())
+			return 1;
+		activation_stack_ready = true;
+	}
+	while (!load_acquire_u64(&layout->header.stop)) {
+		struct wire_request request;
+		struct wire_response response;
+		uint64_t sequence;
+
+		do {
+			sequence = load_acquire_u64(&slot->request.sequence);
+			if (sequence != seen)
+				break;
+			cpu_relax();
+		} while (!load_acquire_u64(&layout->header.stop));
+		if (load_acquire_u64(&layout->header.stop))
+			break;
+		if (sequence != seen + 1) {
+			slot->completion.request_id = 0;
+			slot->completion.status = -1;
+			slot->completion.error_no = EPROTO;
+			slot->completion.flags = 0;
+			store_release_u64(&slot->completion.sequence, sequence);
+			return 1;
+		}
+		memcpy(&request, &slot->request.request, sizeof(request));
+		if (request.flags & REQ_DETAILED) {
+			build_detailed_response(&response, mode, key, generation,
+						checksum, &request);
+			memcpy(&slot->detail, &response, sizeof(response));
+			slot->completion.request_id = request.request_id;
+			slot->completion.status = response.status;
+			slot->completion.error_no = response.error_no;
+			slot->completion.flags = SHM_COMPLETION_DETAILED;
+			slot->completion.target_total_ns = response.target_total_ns;
+		} else {
+			build_minimal_completion(&slot->completion, mode, key,
+						 generation, checksum, &request);
+		}
+		store_release_u64(&slot->completion.sequence, sequence);
+		seen = sequence;
+	}
+	return 0;
+}
+
+static int run_shm_server(uint16_t mode, const char *path, uint64_t offset,
+			  unsigned int lanes, uint64_t key,
+			  uint64_t generation, uint64_t checksum)
+{
+	struct sigaction action = { .sa_handler = signal_stop };
+	struct shm_mapping mapping;
+	pid_t *children;
+	unsigned int started = 0;
+	int failed = 0;
+
+	if (mode == MODE_LOCAL && init_local_state(key, checksum)) {
+		perror("initialize local state");
+		return 1;
+	}
+	if (map_shm(path, offset, lanes, &mapping)) {
+		perror("map shared mailbox");
+		return 1;
+	}
+	children = calloc(lanes, sizeof(*children));
+	if (!children) {
+		unmap_shm(&mapping);
+		return 1;
+	}
+	memset(mapping.address, 0, mapping.bytes);
+	mapping.layout->header.magic = SHM_MAGIC;
+	mapping.layout->header.version = SHM_VERSION;
+	mapping.layout->header.mode = mode;
+	mapping.layout->header.lanes = lanes;
+	mapping.layout->header.epoch = now_ns() ^ (uint64_t)getpid();
+	mapping.layout->header.key = key;
+	mapping.layout->header.generation = generation;
+	mapping.layout->header.checksum = checksum;
+	store_release_u64(&mapping.layout->header.stop, 0);
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGTERM, &action, NULL);
+	sigaction(SIGINT, &action, NULL);
+	for (unsigned int lane = 0; lane < lanes; lane++) {
+		children[lane] = fork();
+		if (children[lane] == 0)
+			_exit(shm_lane_handler(mapping.layout, lane, mode, key,
+					       generation, checksum));
+		if (children[lane] < 0) {
+			failed = 1;
+			break;
+		}
+		started++;
+	}
+	if (failed) {
+		store_release_u64(&mapping.layout->header.stop, 1);
+	} else {
+		store_release_u32(&mapping.layout->header.state,
+				  SHM_STATE_READY);
+		printf("event=shm-server-ready mode=%s path=%s offset=%" PRIu64
+		       " lanes=%u key=%" PRIu64 " generation=%" PRIu64
+		       " checksum=%016" PRIx64 " bytes=%zu\n",
+		       mode_name(mode), path, offset, lanes, key, generation,
+		       checksum, mapping.bytes);
+		fflush(stdout);
+		while (!server_stop)
+			pause();
+		store_release_u32(&mapping.layout->header.state,
+				  SHM_STATE_STOPPING);
+		store_release_u64(&mapping.layout->header.stop, 1);
+	}
+	for (unsigned int lane = 0; lane < started; lane++) {
+		int status;
+
+		if (waitpid(children[lane], &status, 0) < 0 ||
+		    !WIFEXITED(status) || WEXITSTATUS(status))
+			failed = 1;
+	}
+	free(children);
+	unmap_shm(&mapping);
+	return failed;
+}
+
+static uint64_t litmus_payload(uint64_t iteration)
+{
+	return 0x9e3779b97f4a7c15ULL * iteration ^
+		0xd6e8feb86659fd93ULL;
+}
+
+static int wait_for_u64(const uint64_t *value, uint64_t expected,
+			uint64_t timeout_ns)
+{
+	uint64_t begin_ns = now_ns();
+
+	while (load_acquire_u64(value) != expected) {
+		if (now_ns() - begin_ns > timeout_ns) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		cpu_relax();
+	}
+	return 0;
+}
+
+static int run_shm_litmus_server(const char *path, uint64_t offset,
+				 uint64_t iterations)
+{
+	struct shm_mapping mapping;
+	struct shm_litmus *shared;
+	uint64_t expected;
+
+	if (map_shm(path, offset, 1, &mapping)) {
+		perror("map shared-memory litmus");
+		return 1;
+	}
+	shared = mapping.address;
+	memset(shared, 0, sizeof(*shared));
+	shared->magic = SHM_LITMUS_MAGIC;
+	shared->version = SHM_VERSION;
+	shared->iterations = iterations;
+	store_release_u64(&shared->phase, SHM_LITMUS_READY);
+	for (uint64_t i = 1; i <= iterations; i++) {
+		expected = litmus_payload(i);
+		shared->payload = expected;
+		store_release_u64(&shared->sequence, i * 2 - 1);
+		if (wait_for_u64(&shared->sequence, i * 2,
+				  120ULL * 1000000000ULL) ||
+		    shared->payload != ~expected) {
+			perror("shared-memory release/acquire litmus");
+			unmap_shm(&mapping);
+			return 1;
+		}
+	}
+	store_release_u64(&shared->phase, SHM_LITMUS_RMW);
+	for (uint64_t i = 0; i < iterations; i++)
+		__atomic_fetch_add(&shared->counter, 1, __ATOMIC_SEQ_CST);
+	store_release_u64(&shared->server_done, 1);
+	if (wait_for_u64(&shared->client_done, 1,
+			 120ULL * 1000000000ULL) ||
+	    load_acquire_u64(&shared->counter) != iterations * 2) {
+		perror("shared-memory atomic RMW litmus");
+		unmap_shm(&mapping);
+		return 1;
+	}
+	store_release_u64(&shared->phase, SHM_LITMUS_COMPLETE);
+	printf("event=shm-litmus role=server iterations=%" PRIu64
+	       " counter=%" PRIu64 " release_acquire=ok atomic_rmw=ok "
+	       "verify=ok\n", iterations,
+	       load_acquire_u64(&shared->counter));
+	unmap_shm(&mapping);
+	return 0;
+}
+
+static int run_shm_litmus_client(const char *path, uint64_t offset,
+				 uint64_t iterations)
+{
+	struct shm_mapping mapping;
+	struct shm_litmus *shared;
+	uint64_t expected;
+
+	if (map_shm(path, offset, 1, &mapping)) {
+		perror("map shared-memory litmus");
+		return 1;
+	}
+	shared = mapping.address;
+	if (wait_for_u64(&shared->phase, SHM_LITMUS_READY,
+			 120ULL * 1000000000ULL) ||
+	    shared->magic != SHM_LITMUS_MAGIC ||
+	    shared->version != SHM_VERSION ||
+	    shared->iterations != iterations) {
+		perror("shared-memory litmus header");
+		unmap_shm(&mapping);
+		return 1;
+	}
+	for (uint64_t i = 1; i <= iterations; i++) {
+		expected = litmus_payload(i);
+		if (wait_for_u64(&shared->sequence, i * 2 - 1,
+				  120ULL * 1000000000ULL) ||
+		    shared->payload != expected) {
+			perror("shared-memory release/acquire litmus");
+			unmap_shm(&mapping);
+			return 1;
+		}
+		shared->payload = ~expected;
+		store_release_u64(&shared->sequence, i * 2);
+	}
+	if (wait_for_u64(&shared->phase, SHM_LITMUS_RMW,
+			 120ULL * 1000000000ULL)) {
+		perror("shared-memory RMW phase");
+		unmap_shm(&mapping);
+		return 1;
+	}
+	for (uint64_t i = 0; i < iterations; i++)
+		__atomic_fetch_add(&shared->counter, 1, __ATOMIC_SEQ_CST);
+	store_release_u64(&shared->client_done, 1);
+	if (wait_for_u64(&shared->server_done, 1,
+			 120ULL * 1000000000ULL) ||
+	    wait_for_u64(&shared->phase, SHM_LITMUS_COMPLETE,
+			 120ULL * 1000000000ULL) ||
+	    load_acquire_u64(&shared->counter) != iterations * 2) {
+		perror("shared-memory atomic RMW litmus");
+		unmap_shm(&mapping);
+		return 1;
+	}
+	printf("event=shm-litmus role=client iterations=%" PRIu64
+	       " counter=%" PRIu64 " release_acquire=ok atomic_rmw=ok "
+	       "verify=ok\n", iterations,
+	       load_acquire_u64(&shared->counter));
+	unmap_shm(&mapping);
 	return 0;
 }
 
@@ -818,7 +1409,7 @@ static int run_server(uint16_t mode, const char *address, uint16_t port,
 	signal(SIGCHLD, SIG_IGN);
 	printf("event=server-ready mode=%s address=%s port=%u key=%" PRIu64
 	       " generation=%" PRIu64 " checksum=%016" PRIx64 "\n",
-	       mode == MODE_LOCAL ? "local" : "cxlfork", address, port,
+	       mode_name(mode), address, port,
 	       key, generation, checksum);
 	fflush(stdout);
 	while (!server_stop) {
@@ -913,7 +1504,7 @@ static int one_client_request(int fd, uint16_t mode, uint64_t request_id,
 
 static void csv_header(FILE *file)
 {
-	fputs("mode,lane,request_id,rtt_ns,vm0_residual_ns,target_total_ns,"
+	fputs("mode,lane,request_id,rtt_ns,cross_vm_residual_ns,target_total_ns,"
 	      "request_dispatch_ns,activation_ns,exit_wait_ns,"
 	      "fork_parent_return_ns,fork_to_child_ns,child_setup_ns,"
 	      "restore_wall_ns,kernel_restore_ns,kernel_supported_mask,"
@@ -962,7 +1553,7 @@ static int write_samples(const char *prefix, uint16_t mode, unsigned int lane,
 			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
 			",%" PRIu64 ",%" PRIu64 "\n",
-			mode == MODE_LOCAL ? "local" : "cxlfork", lane,
+			mode_name(mode), lane,
 			samples[i].request_id, samples[i].rtt_ns, residual,
 			r->target_total_ns, r->request_dispatch_ns,
 			r->activation_ns, r->exit_wait_ns,
@@ -991,6 +1582,405 @@ static int write_samples(const char *prefix, uint16_t mode, unsigned int lane,
 	if (fclose(file))
 		return -1;
 	return 0;
+}
+
+struct shm_client_config {
+	uint16_t mode;
+	const char *path;
+	uint64_t offset;
+	unsigned int lanes;
+	unsigned int warmup;
+	unsigned int duration_seconds;
+	uint64_t count;
+	uint64_t key;
+	uint64_t generation;
+	uint64_t checksum;
+	const char *prefix;
+	bool detailed;
+	int ready_write;
+	int gate_read;
+	uint64_t *counts;
+};
+
+static int shm_one_request(struct shm_layout *layout, unsigned int lane,
+			   uint16_t mode, uint64_t *sequence,
+			   uint64_t request_id, uint64_t key,
+			   uint64_t generation, uint64_t checksum,
+			   uint32_t flags, struct sample *sample)
+{
+	struct shm_lane *slot = &layout->lane[lane];
+	struct wire_request request = {
+		.magic = WIRE_MAGIC,
+		.version = WIRE_VERSION,
+		.mode = mode,
+		.flags = flags,
+		.request_id = request_id,
+		.key = key,
+		.generation = generation,
+		.expected_checksum = checksum,
+	};
+	uint64_t begin_ns = sample ? now_ns() : 0;
+	uint64_t expected = ++*sequence;
+	uint64_t observed;
+	uint64_t spin_begin_ns = begin_ns;
+	unsigned int spins = 0;
+
+	memcpy(&slot->request.request, &request, sizeof(request));
+	store_release_u64(&slot->request.sequence, expected);
+	for (;;) {
+		observed = load_acquire_u64(&slot->completion.sequence);
+		if (observed == expected)
+			break;
+		if (observed > expected ||
+		    load_acquire_u64(&layout->header.stop)) {
+			errno = EPROTO;
+			return -1;
+		}
+		cpu_relax();
+		if (!(++spins & ((1U << 20) - 1))) {
+			uint64_t current = now_ns();
+
+			if (!spin_begin_ns)
+				spin_begin_ns = current;
+			else if (current - spin_begin_ns > 10ULL * 1000000000ULL) {
+				errno = ETIMEDOUT;
+				return -1;
+			}
+		}
+	}
+	if (slot->completion.request_id != request_id ||
+	    slot->completion.status) {
+		errno = slot->completion.error_no ?
+			slot->completion.error_no : EPROTO;
+		return -1;
+	}
+	if (flags & REQ_DETAILED) {
+		if (!(slot->completion.flags & SHM_COMPLETION_DETAILED) || !sample) {
+			errno = EPROTO;
+			return -1;
+		}
+		memcpy(&sample->response, &slot->detail,
+		       sizeof(sample->response));
+		sample->rtt_ns = delta(now_ns(), begin_ns);
+		sample->request_id = request_id;
+		if (sample->response.magic != WIRE_MAGIC ||
+		    sample->response.version != WIRE_VERSION ||
+		    sample->response.mode != mode ||
+		    sample->response.request_id != request_id ||
+		    sample->response.status ||
+		    sample->response.child.input_checksum != checksum ||
+		    !sample->response.child.output_checksum) {
+			errno = EPROTO;
+			return -1;
+		}
+		if ((flags & REQ_DEBUG_PROOF) && mode == MODE_CXLFORK &&
+		    (!sample->response.child.shared_leaf_pfn ||
+		     sample->response.child.shared_leaf_pfn !=
+			 sample->response.child.current_pmd_pfn ||
+		     !sample->response.child.shared_data_pfn ||
+		     sample->response.child.shared_data_pfn !=
+			 sample->response.child.current_data_pfn)) {
+			errno = EUCLEAN;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int validate_shm_header(const struct shm_header *header,
+			       const struct shm_client_config *config)
+{
+	uint64_t begin_ns = now_ns();
+
+	while (load_acquire_u32(&header->state) != SHM_STATE_READY) {
+		if (now_ns() - begin_ns > SHM_READY_TIMEOUT_NS) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		cpu_relax();
+	}
+	if (header->magic != SHM_MAGIC || header->version != SHM_VERSION ||
+	    header->mode != config->mode || header->lanes != config->lanes ||
+	    header->key != config->key ||
+	    header->generation != config->generation ||
+	    header->checksum != config->checksum ||
+	    load_acquire_u64(&header->stop)) {
+		errno = EPROTO;
+		return -1;
+	}
+	return 0;
+}
+
+static int shm_client_lane(const struct shm_client_config *config,
+			   unsigned int lane)
+{
+	struct sigaction action = { .sa_handler = signal_client_stop };
+	struct shm_mapping mapping;
+	struct sample *samples = NULL;
+	uint64_t request_id = ((uint64_t)getpid() << 32) | lane;
+	uint64_t sequence;
+	uint64_t count = 0;
+	char byte = 'R';
+
+	if (map_shm(config->path, config->offset, config->lanes, &mapping) ||
+	    validate_shm_header(&mapping.layout->header, config)) {
+		perror("map/validate shared mailbox");
+		(void)write_full(config->ready_write, "F", 1);
+		return 1;
+	}
+	sequence = load_acquire_u64(
+		&mapping.layout->lane[lane].completion.sequence);
+	if (config->detailed) {
+		samples = calloc(config->count, sizeof(*samples));
+		if (!samples) {
+			(void)write_full(config->ready_write, "F", 1);
+			unmap_shm(&mapping);
+			return 1;
+		}
+	}
+	for (unsigned int i = 0; i < config->warmup; i++) {
+		struct sample proof;
+		uint32_t flags = REQ_MINIMAL;
+
+		if (i == 0)
+			flags |= REQ_DETAILED |
+				(config->mode == MODE_CXLFORK ? REQ_DEBUG_PROOF : 0);
+		if (shm_one_request(mapping.layout, lane, config->mode,
+				    &sequence, ++request_id, config->key,
+				    config->generation, config->checksum,
+				    flags, i == 0 ? &proof : NULL)) {
+			perror("shared mailbox warmup request");
+			(void)write_full(config->ready_write, "F", 1);
+			free(samples);
+			unmap_shm(&mapping);
+			return 1;
+		}
+		if (i == 0 && config->mode == MODE_CXLFORK) {
+			printf("event=shared-pfn-proof transport=shm lane=%u "
+			       "shared_leaf_pfn=%" PRIu64
+			       " current_pmd_pfn=%" PRIu64
+			       " shared_data_pfn=%" PRIu64
+			       " current_data_pfn=%" PRIu64 " verify=ok\n",
+			       lane, proof.response.child.shared_leaf_pfn,
+			       proof.response.child.current_pmd_pfn,
+			       proof.response.child.shared_data_pfn,
+			       proof.response.child.current_data_pfn);
+			fflush(stdout);
+		}
+	}
+	if (write_full(config->ready_write, &byte, 1) ||
+	    read_full(config->gate_read, &byte, 1)) {
+		free(samples);
+		unmap_shm(&mapping);
+		return 1;
+	}
+	client_stop = 0;
+	if (!config->detailed) {
+		sigemptyset(&action.sa_mask);
+		sigaction(SIGALRM, &action, NULL);
+		alarm(config->duration_seconds);
+	}
+	while (config->detailed ? count < config->count : !client_stop) {
+		uint32_t flags = REQ_MINIMAL |
+			(config->detailed ? REQ_DETAILED : 0);
+		struct sample *sample = config->detailed ? &samples[count] : NULL;
+
+		if (shm_one_request(mapping.layout, lane, config->mode,
+				    &sequence, ++request_id, config->key,
+				    config->generation, config->checksum,
+				    flags, sample)) {
+			perror("shared mailbox request");
+			free(samples);
+			unmap_shm(&mapping);
+			return 1;
+		}
+		count++;
+	}
+	alarm(0);
+	config->counts[lane] = count;
+	if (config->detailed &&
+	    write_samples(config->prefix, config->mode, lane, samples, count)) {
+		free(samples);
+		unmap_shm(&mapping);
+		return 1;
+	}
+	free(samples);
+	unmap_shm(&mapping);
+	return 0;
+}
+
+static int run_shm_client(struct shm_client_config *config)
+{
+	int ready_pipe[2], gate_pipe[2];
+	pid_t *children;
+	uint64_t total = 0;
+	int failed = 0;
+	char byte;
+
+	children = calloc(config->lanes, sizeof(*children));
+	config->counts = mmap(NULL, config->lanes * sizeof(*config->counts),
+		PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (!children || config->counts == MAP_FAILED || pipe(ready_pipe) ||
+	    pipe(gate_pipe))
+		return 1;
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		children[lane] = fork();
+		if (children[lane] == 0) {
+			close(ready_pipe[0]);
+			close(gate_pipe[1]);
+			config->ready_write = ready_pipe[1];
+			config->gate_read = gate_pipe[0];
+			_exit(shm_client_lane(config, lane));
+		}
+		if (children[lane] < 0)
+			return 1;
+	}
+	close(ready_pipe[1]);
+	close(gate_pipe[0]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		if (read_full(ready_pipe[0], &byte, 1))
+			return 1;
+		if (byte != 'R')
+			failed = 1;
+	}
+	close(ready_pipe[0]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++)
+		if (write_full(gate_pipe[1], "G", 1))
+			return 1;
+	close(gate_pipe[1]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		int status;
+
+		if (waitpid(children[lane], &status, 0) < 0 ||
+		    !WIFEXITED(status) || WEXITSTATUS(status))
+			failed = 1;
+		total += config->counts[lane];
+	}
+	printf("event=client-complete transport=shm mode=%s lanes=%u "
+	       "operations=%" PRIu64 " duration_s=%u throughput_ops_s=%.3f "
+	       "detailed=%s verify=%s\n",
+	       mode_name(config->mode), config->lanes, total,
+	       config->detailed ? 0 : config->duration_seconds,
+	       config->detailed || !config->duration_seconds ? 0.0 :
+		(double)total / config->duration_seconds,
+	       config->detailed ? "yes" : "no", failed ? "fail" : "ok");
+	munmap(config->counts, config->lanes * sizeof(*config->counts));
+	free(children);
+	return failed;
+}
+
+struct local_spawn_config {
+	unsigned int lanes;
+	unsigned int warmup;
+	unsigned int duration_seconds;
+	int ready_write;
+	int gate_read;
+	uint64_t *counts;
+};
+
+static int local_spawn_once(void)
+{
+	pid_t child, waited;
+	int status;
+
+	child = fork();
+	if (child == 0)
+		exit(0);
+	if (child < 0)
+		return -1;
+	do {
+		waited = waitpid(child, &status, 0);
+	} while (waited < 0 && errno == EINTR);
+	return waited == child && WIFEXITED(status) && !WEXITSTATUS(status) ?
+		0 : -1;
+}
+
+static int local_spawn_lane(const struct local_spawn_config *config,
+			    unsigned int lane)
+{
+	struct sigaction action = { .sa_handler = signal_client_stop };
+	uint64_t count = 0;
+	char byte = 'R';
+
+	for (unsigned int i = 0; i < config->warmup; i++) {
+		if (local_spawn_once()) {
+			(void)write_full(config->ready_write, "F", 1);
+			return 1;
+		}
+	}
+	if (write_full(config->ready_write, &byte, 1) ||
+	    read_full(config->gate_read, &byte, 1))
+		return 1;
+	client_stop = 0;
+	sigemptyset(&action.sa_mask);
+	sigaction(SIGALRM, &action, NULL);
+	alarm(config->duration_seconds);
+	while (!client_stop) {
+		if (local_spawn_once())
+			return 1;
+		count++;
+	}
+	alarm(0);
+	config->counts[lane] = count;
+	return 0;
+}
+
+static int run_local_spawn(struct local_spawn_config *config)
+{
+	int ready_pipe[2], gate_pipe[2];
+	pid_t *children;
+	uint64_t total = 0;
+	int failed = 0;
+	char byte;
+
+	children = calloc(config->lanes, sizeof(*children));
+	config->counts = mmap(NULL, config->lanes * sizeof(*config->counts),
+		PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (!children || config->counts == MAP_FAILED || pipe(ready_pipe) ||
+	    pipe(gate_pipe))
+		return 1;
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		children[lane] = fork();
+		if (children[lane] == 0) {
+			close(ready_pipe[0]);
+			close(gate_pipe[1]);
+			config->ready_write = ready_pipe[1];
+			config->gate_read = gate_pipe[0];
+			_exit(local_spawn_lane(config, lane));
+		}
+		if (children[lane] < 0)
+			return 1;
+	}
+	close(ready_pipe[1]);
+	close(gate_pipe[0]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		if (read_full(ready_pipe[0], &byte, 1))
+			return 1;
+		if (byte != 'R')
+			failed = 1;
+	}
+	close(ready_pipe[0]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++)
+		if (write_full(gate_pipe[1], "G", 1))
+			return 1;
+	close(gate_pipe[1]);
+	for (unsigned int lane = 0; lane < config->lanes; lane++) {
+		int status;
+
+		if (waitpid(children[lane], &status, 0) < 0 ||
+		    !WIFEXITED(status) || WEXITSTATUS(status))
+			failed = 1;
+		total += config->counts[lane];
+	}
+	printf("event=client-complete transport=local mode=spawn lanes=%u "
+	       "operations=%" PRIu64 " duration_s=%u throughput_ops_s=%.3f "
+	       "verify=%s\n",
+	       config->lanes, total, config->duration_seconds,
+	       (double)total / config->duration_seconds,
+	       failed ? "fail" : "ok");
+	munmap(config->counts, config->lanes * sizeof(*config->counts));
+	free(children);
+	return failed;
 }
 
 struct client_config {
@@ -1125,7 +2115,7 @@ static int run_client(struct client_config *config)
 	}
 	printf("event=client-complete mode=%s lanes=%u operations=%" PRIu64
 	       " duration_s=%.3f throughput_ops_s=%.3f verify=%s\n",
-	       config->mode == MODE_LOCAL ? "local" : "cxlfork",
+	       mode_name(config->mode),
 	       config->lanes, total, config->duration_ns / 1e9,
 	       config->duration_ns ? total * 1e9 / config->duration_ns : 0.0,
 	       failed ? "fail" : "ok");
@@ -1153,18 +2143,30 @@ static void usage(const char *program)
 		"usage:\n"
 		"  %s prepare KEY\n"
 		"  %s release KEY GENERATION\n"
-		"  %s server local|cxlfork IP PORT KEY GENERATION CHECKSUM\n"
-		"  %s client local|cxlfork IP PORT LANES WARMUP DURATION_S "
+		"  %s server local|cxlfork|control IP PORT KEY GENERATION CHECKSUM\n"
+		"  %s client local|cxlfork|control IP PORT LANES WARMUP DURATION_S "
 		"KEY GENERATION CHECKSUM OUTPUT_PREFIX\n"
-		"  %s client-count local|cxlfork IP PORT LANES REQUESTS "
-		"KEY GENERATION CHECKSUM OUTPUT_PREFIX\n",
-		program, program, program, program, program);
+		"  %s client-count local|cxlfork|control IP PORT LANES REQUESTS "
+		"KEY GENERATION CHECKSUM OUTPUT_PREFIX\n"
+		"  %s shm-server control|cxlfork PATH OFFSET LANES KEY "
+		"GENERATION CHECKSUM\n"
+		"  %s shm-client control|cxlfork PATH OFFSET LANES WARMUP "
+		"DURATION_S KEY GENERATION CHECKSUM\n"
+		"  %s shm-client-count control|cxlfork PATH OFFSET LANES "
+		"REQUESTS KEY GENERATION CHECKSUM OUTPUT_PREFIX\n"
+		"  %s shm-litmus-server PATH OFFSET ITERATIONS\n"
+		"  %s shm-litmus-client PATH OFFSET ITERATIONS\n"
+		"  %s local-spawn LANES WARMUP DURATION_S\n",
+		program, program, program, program, program, program, program,
+		program, program, program, program);
 }
 
 int main(int argc, char **argv)
 {
 	struct client_config config = { 0 };
-	uint64_t key, generation, checksum, temporary;
+	struct shm_client_config shm_config = { 0 };
+	struct local_spawn_config local_config = { 0 };
+	uint64_t key, generation, checksum, temporary, offset, lanes;
 	uint16_t mode, port;
 
 	if (argc == 3 && !strcmp(argv[1], "prepare") &&
@@ -1182,6 +2184,66 @@ int main(int argc, char **argv)
 		port = temporary;
 		return run_server(mode, argv[3], port, key, generation, checksum);
 	}
+	if (argc == 9 && !strcmp(argv[1], "shm-server") &&
+	    !parse_mode(argv[2], &mode) && mode != MODE_LOCAL &&
+	    !parse_u64(argv[4], &offset) &&
+	    !parse_u64(argv[5], &lanes) && lanes &&
+	    lanes <= SHM_MAX_LANES && !parse_u64(argv[6], &key) && key &&
+	    !parse_u64(argv[7], &generation) &&
+	    !parse_u64(argv[8], &checksum) && checksum) {
+		return run_shm_server(mode, argv[3], offset, lanes, key,
+				      generation, checksum);
+	}
+	if (argc == 11 && !strcmp(argv[1], "shm-client") &&
+	    !parse_mode(argv[2], &shm_config.mode) &&
+	    shm_config.mode != MODE_LOCAL &&
+	    !parse_u64(argv[4], &shm_config.offset) &&
+	    !parse_u64(argv[5], &temporary) && temporary &&
+	    temporary <= SHM_MAX_LANES && (shm_config.lanes = temporary) &&
+	    !parse_u64(argv[6], &temporary) && temporary <= 1000 &&
+	    (shm_config.warmup = temporary, true) &&
+	    !parse_u64(argv[7], &temporary) && temporary &&
+	    temporary <= 3600 && (shm_config.duration_seconds = temporary) &&
+	    !parse_u64(argv[8], &shm_config.key) && shm_config.key &&
+	    !parse_u64(argv[9], &shm_config.generation) &&
+	    !parse_u64(argv[10], &shm_config.checksum) &&
+	    shm_config.checksum) {
+		shm_config.path = argv[3];
+		return run_shm_client(&shm_config);
+	}
+	if (argc == 11 && !strcmp(argv[1], "shm-client-count") &&
+	    !parse_mode(argv[2], &shm_config.mode) &&
+	    shm_config.mode != MODE_LOCAL &&
+	    !parse_u64(argv[4], &shm_config.offset) &&
+	    !parse_u64(argv[5], &temporary) && temporary &&
+	    temporary <= SHM_MAX_LANES && (shm_config.lanes = temporary) &&
+	    !parse_u64(argv[6], &shm_config.count) && shm_config.count &&
+	    !parse_u64(argv[7], &shm_config.key) && shm_config.key &&
+	    !parse_u64(argv[8], &shm_config.generation) &&
+	    !parse_u64(argv[9], &shm_config.checksum) &&
+	    shm_config.checksum) {
+		shm_config.path = argv[3];
+		shm_config.prefix = argv[10];
+		shm_config.warmup = 1;
+		shm_config.detailed = true;
+		return run_shm_client(&shm_config);
+	}
+	if (argc == 5 && !strcmp(argv[1], "shm-litmus-server") &&
+	    !parse_u64(argv[3], &offset) &&
+	    !parse_u64(argv[4], &temporary) && temporary)
+		return run_shm_litmus_server(argv[2], offset, temporary);
+	if (argc == 5 && !strcmp(argv[1], "shm-litmus-client") &&
+	    !parse_u64(argv[3], &offset) &&
+	    !parse_u64(argv[4], &temporary) && temporary)
+		return run_shm_litmus_client(argv[2], offset, temporary);
+	if (argc == 5 && !strcmp(argv[1], "local-spawn") &&
+	    !parse_u64(argv[2], &temporary) && temporary &&
+	    temporary <= SHM_MAX_LANES && (local_config.lanes = temporary) &&
+	    !parse_u64(argv[3], &temporary) && temporary <= 1000 &&
+	    (local_config.warmup = temporary, true) &&
+	    !parse_u64(argv[4], &temporary) && temporary &&
+	    temporary <= 3600 && (local_config.duration_seconds = temporary))
+		return run_local_spawn(&local_config);
 	if (argc == 12 && !strcmp(argv[1], "client") &&
 	    !parse_mode(argv[2], &config.mode) &&
 	    !parse_u64(argv[4], &temporary) && temporary <= UINT16_MAX &&
