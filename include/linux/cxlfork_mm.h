@@ -12,8 +12,9 @@ int cxlfork_gup_check_range(struct mm_struct *mm, unsigned long start,
 int cxlfork_fork_check_mm(struct mm_struct *mm);
 void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
 				 unsigned long addr);
-int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm, pmd_t *pmd,
-					unsigned long addr);
+int cxlfork_materialize_shared_leaf_pmd(struct vm_area_struct *vma,
+					pmd_t *pmd, unsigned long addr);
+void cxlfork_account_data_cow(struct vm_area_struct *vma, u64 start_ns);
 #else
 static inline bool cxlfork_pmd_is_shared_leaf(pmd_t pmd)
 {
@@ -42,11 +43,16 @@ static inline void cxlfork_zap_shared_leaf_pmd(struct mm_struct *mm,
 {
 }
 
-static inline int cxlfork_materialize_shared_leaf_pmd(struct mm_struct *mm,
+static inline int cxlfork_materialize_shared_leaf_pmd(struct vm_area_struct *vma,
 						      pmd_t *pmd,
 						      unsigned long addr)
 {
 	return 0;
+}
+
+static inline void cxlfork_account_data_cow(struct vm_area_struct *vma,
+					     u64 start_ns)
+{
 }
 #endif
 

@@ -3066,6 +3066,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 	const bool unshare = vmf->flags & FAULT_FLAG_UNSHARE;
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
+	u64 cxlfork_cow_start = cxlfork_vma_is_restored(vma) ?
+		ktime_get_ns() : 0;
 	struct folio *old_folio = NULL;
 	struct folio *new_folio = NULL;
 	pte_t entry;
@@ -3208,6 +3210,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 			free_swap_cache(&old_folio->page);
 		folio_put(old_folio);
 	}
+	if (page_copied && cxlfork_cow_start)
+		cxlfork_account_data_cow(vma, cxlfork_cow_start);
 
 	delayacct_wpcopy_end();
 	return 0;
@@ -4994,7 +4998,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 
 			if (!(vmf->flags & (FAULT_FLAG_WRITE | FAULT_FLAG_UNSHARE)))
 				return 0;
-			ret = cxlfork_materialize_shared_leaf_pmd(vmf->vma->vm_mm,
+			ret = cxlfork_materialize_shared_leaf_pmd(vmf->vma,
 								  vmf->pmd,
 								  vmf->address);
 			if (ret == -ENOMEM)
