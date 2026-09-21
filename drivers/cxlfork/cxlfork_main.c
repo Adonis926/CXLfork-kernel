@@ -3146,7 +3146,14 @@ static int cxlfork_map_region_shared_leaf(struct cxlfork_desc *desc,
 		ret = -EFAULT;
 		goto out_unlock;
 	}
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	/*
+	 * Leaf materialization may send an individual entry through
+	 * cxlfork_fault() after the shared PMD has been replaced.  Keep the VMA
+	 * legal for vmf_insert_mixed() on that fallback, just like the ordinary
+	 * driver-mmap MoW path.
+	 */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_MIXEDMAP |
+		     VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_ops = &cxlfork_vm_ops;
 	vma->vm_private_data = mapping;
 	attached = true;
