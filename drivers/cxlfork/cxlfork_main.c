@@ -3724,10 +3724,19 @@ static int cxlfork_mmap(struct file *file, struct vm_area_struct *vma)
 	mapping->ctx = state->mmap_ctx;
 	cxlfork_restore_ctx_mapping_get(mapping->ctx);
 
+	/*
+	 * The prefaulted MoW image normally satisfies reads without invoking
+	 * ->fault.  A later shared-leaf materialization can nevertheless leave a
+	 * previously untouched entry to be installed by cxlfork_fault().  Mark
+	 * every driver-backed COW VMA mixed up front so vmf_insert_mixed() is
+	 * valid on that fallback path as well.  Previously only MoA/Hybrid did
+	 * this, which made a legitimate MoW fault hit the core-MM BUG_ON in
+	 * __vm_insert_mixed().
+	 */
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 	if (mapping->flags & CXLFORK_F_SHARED_COW)
 		ret = cxlfork_prefault_shared_cxl(vma, desc, r, state);
 	else {
-		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_MIXEDMAP);
 		if (mapping->flags & CXLFORK_F_HYBRID_TIERING)
 			ret = cxlfork_prefault_dirty_local(vma, desc, r, state);
 	}
